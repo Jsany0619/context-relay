@@ -11,3 +11,6 @@ archived_sessions/
 telemetry/
 work/
 *.log
+tasks.sqlite3*
+manager.lock
+checkpoints/
