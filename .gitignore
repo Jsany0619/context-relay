@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+!.env.example
+.codex/
+context-handoffs/
+sessions/
+archived_sessions/
+telemetry/
+work/
+*.log

@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "source_thread_id": "",
+  "cwd": "",
+  "mode": "execute",
+  "task": {
+    "goal": "",
+    "latest_user_request": "",
+    "success_criteria": [],
+    "scope": "",
+    "status": "ongoing"
+  },
+  "authorization": {
+    "approved": [
+      {
+        "action": "",
+        "evidence": "",
+        "evidence_ref": {
+          "thread_id": "",
+          "line": null,
+          "sha256": ""
+        }
+      }
+    ],
+    "pending": [],
+    "prohibited": [],
+    "limits": []
+  },
+  "decisions": [],
+  "evidence": [],
+  "artifacts": [],
+  "environment": {
+    "project_root": "",
+    "branch": "",
+    "worktree": "",
+    "uncommitted_changes": [],
+    "dependencies": [],
+    "required_tools": [],
+    "access_requirements": [],
+    "unrecoverable_session_state": []
+  },
+  "operations": [],
+  "resources": [],
+  "next_step": {
+    "action": "",
+    "inputs": [],
+    "checks": [],
+    "stop_conditions": []
+  },
+  "unknowns": [],
+  "verification": {
+    "machine": [],
+    "human": [],
+    "platform": [],
+    "commercial": [],
+    "release": [],
+    "content_continuity": [],
+    "source_licensing": []
+  }
+}

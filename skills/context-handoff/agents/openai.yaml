@@ -1,0 +1,6 @@
+interface:
+  display_name: "上下文检查与任务交接"
+  short_description: "检查上下文压力与压缩记录，保存证据和授权，核验后安全交接长期任务"
+  default_prompt: "使用 $context-handoff 检查当前任务的上下文与接管状态，在需要且获授权时准备并完成新聊天交接。"
+policy:
+  allow_implicit_invocation: true
