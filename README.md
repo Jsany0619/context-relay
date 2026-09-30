@@ -17,6 +17,8 @@ python -m relay
 
 You can also double-click `start-manager.cmd`. The Chinese interface provides task creation, start/continue, pause, recovery checks, preparatory snapshots, handoff, one-time approvals, and export. Automatic handoff is opt-in for each task. Read-only and workspace-write are the two permission ceilings; budgets are soft limits and may be exceeded by an in-flight call.
 
+Find tasks by title, goal or directory, filter their status, and move completed tasks into a reversible local archive. Archiving preserves the task, files, permissions and conversation ownership; restoring it does not resume work. The operation-history window shows the latest 100 recorded events, distinguishing requests, native starts and confirmed results. These local management actions do not start Codex inference or archive native conversations.
+
 With automatic handoff enabled, the manager saves a preparatory snapshot after a completed work turn becomes idle and fresh context telemetry reaches 70%. At 80% with at least two compactions, it can initiate the full handoff instead. You can also request a snapshot while idle or paused. Snapshots copy known local state and file hashes without extra model inference or a new conversation; only the latest `drafts/<task-id>.json` is retained. They contain recorded requirements and answers, the last reply, up to 20 source-turn references, and explicit unknowns, with `ready=false`. They are not complete decision summaries or project backups.
 
 Formal handoff always regenerates the summary and checks current files and READY; an old draft is never accepted as a final checkpoint. Summary preparation and the receiver's READY verification intentionally run read-only, even for a workspace-write task. Continuation may restore only the original permission ceiling after checking the original task instructions, permission record, checkpoint, and effective session configuration.
@@ -102,7 +104,7 @@ The installer has **6 passing tests** covering previews, backups, configuration 
 python -m unittest -v test_install.py
 ```
 
-The current reliability follow-up passed **76 manager tests** (38 controller, 5 transport, 14 Tk, 7 snapshot, 12 recovery). The 71 standalone runtime and 6 installer tests were also rerun successfully: **153 tests total**. Manager tests use simulated controllers or servers and real Tk widgets. The first-version validation on 2026-09-30 used Windows, Python 3.13.2, Tk 8.6.15, and Codex 0.153.4. Run the manager suite separately:
+The task-organization follow-up passed **90 manager tests** (38 controller, 5 transport, 22 Tk, 7 snapshot, 12 recovery, 6 local organization). The 71 standalone runtime and 6 installer tests were also rerun successfully: **167 tests total**. Manager tests use simulated controllers or servers and real Tk widgets. The first-version validation on 2026-09-30 used Windows, Python 3.13.2, Tk 8.6.15, and Codex 0.153.4. Run the manager suite separately:
 
 ```shell
 python -m unittest discover -s tests -v
@@ -112,7 +114,9 @@ The real Tk window was also inspected with synthetic tasks: approval actions and
 
 A separate native counter task on 2026-09-30, validating the first manager version (`d6d7acf`) with Codex 0.153.4, passed `0 → 1 → 2 → 3` across three independent App Server threads under one task ID. Both handoffs completed all six READY checks, transferred ownership, and continued actual work. Four reported MCP entries were disabled with zero tools. An earlier attempt safely stopped at a negative READY; the manager protocol was clarified and a new independent run passed without bypassing verification. The successful run took about 9 minutes 26 seconds; this simple example is not a performance benchmark, and handoffs add model usage and time.
 
-A native reliability run on 2026-09-30 with Codex 0.153.4 also passed immediate pause, confirmed interruption, close/reopen, read-only reconciliation, and explicit continuation. The product waited for the matching native `turn/started` before sending its interrupt. The same task and thread remained at generation 0; a distinct read-only turn returned the unique test-file contents without changing its hash, with no approval responses. Manual preparation then saved a `preparatory`, `ready=false` draft with the matching file hash, issuing only `thread/read` and no new turn or thread. An earlier timing failure retained its unknown outcome without retry and prompted the pause-ordering fix.
+The reliability version (`8e429e0`) passed a native run on 2026-09-30 with Codex 0.153.4 covering immediate pause, confirmed interruption, close/reopen, read-only reconciliation, and explicit continuation. The product waited for the matching native `turn/started` before sending its interrupt. The same task and thread remained at generation 0; a distinct read-only turn returned the unique test-file contents without changing its hash, with no approval responses. Manual preparation then saved a `preparatory`, `ready=false` draft with the matching file hash, issuing only `thread/read` and no new turn or thread. An earlier timing failure retained its unknown outcome without retry and prompted the pause-ordering fix.
+
+For the current local-organization changes, a real Manager and Tk window with disposable data passed search, archive, history lookup and restore. Project files were unchanged and no native requests were issued. This local check does not rerun native handoff or interrupted inference.
 
 High-context automatic triggering has only simulated coverage. Physical sleep, power loss, network loss, crashes, and other environments have not been tested live. The controlled read-only recovery example does not establish recovery of every interrupted external operation.
 

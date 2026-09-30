@@ -174,6 +174,19 @@ class Manager:
                               self.db.execute("SELECT at,kind,data FROM events WHERE task_id=? ORDER BY seq DESC LIMIT 100", (task_id,))]
             return task
 
+    def set_archived(self, task_id, archived):
+        with self._lock:
+            if not isinstance(archived, bool):
+                raise ValueError("归档标记必须是布尔值。")
+            task = self._task(task_id)
+            if archived and (task["state"] != "completed" or task["inflight"] or task["intent"]
+                             or task["pending"] or task["receiver_id"] or task["run_started"] is not None):
+                raise ValueError("只能归档已完成且没有待核对操作的任务。")
+            if bool(task.get("archived")) != archived:
+                task["archived"] = archived
+                self._save(task, "task_archived" if archived else "task_unarchived")
+            return copy.deepcopy(task)
+
     def create_task(self, title, cwd, goal, mode="read-only", auto_handoff=False, max_tokens=0, max_minutes=0):
         with self._lock:
             if mode not in ("read-only", "workspace-write"):
@@ -189,7 +202,8 @@ class Manager:
             if int(max_tokens) < 0 or float(max_minutes) < 0:
                 raise ValueError("预算不能为负数；0 表示不设上限。")
             task = {"id": uuid.uuid4().hex, "title": title.strip(), "cwd": str(directory),
-                    "goal": goal.strip(), "mode": mode, "state": "queued", "auto_handoff": bool(auto_handoff),
+                    "goal": goal.strip(), "mode": mode, "state": "queued", "archived": False,
+                    "auto_handoff": bool(auto_handoff),
                     "max_tokens": int(max_tokens), "max_minutes": float(max_minutes),
                     "thread_id": None, "turn_id": None, "receiver_id": None, "generation": 0,
                     "last_message": "", "error": "", "pending": [], "requirements": [goal.strip()],
@@ -330,7 +344,7 @@ class Manager:
     def start(self, task_id, message=None):
         with self._lock:
             task = self._task(task_id)
-            if task["state"] not in ("queued", "idle", "paused"):
+            if task.get("archived") or task["state"] not in ("queued", "idle", "paused"):
                 raise ValueError("任务还不能继续，请先暂停或核对恢复。")
             self._assert_workspace(task)
             if self._budget(task):
@@ -405,6 +419,8 @@ class Manager:
     def reconcile(self, task_id):
         with self._lock:
             task = self._task(task_id)
+            if task.get("archived"):
+                raise ValueError("请先取消本地归档，再核对任务。")
             if task["state"] in BUSY:
                 raise ValueError("先请求暂停；不能把正在运行的任务直接恢复。")
             if task["intent"] and task["intent"]["kind"].startswith("create"):

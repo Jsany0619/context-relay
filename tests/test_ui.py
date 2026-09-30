@@ -1,5 +1,6 @@
 """Tk integration smoke checks with a fake controller; no Codex sessions are started."""
 from copy import deepcopy
+import gc
 import tempfile
 import threading
 import time
@@ -15,6 +16,8 @@ class FakeManager:
         self.calls = []
         self.answers = []
         self.prepared_task_ids = []
+        self.starts = []
+        self.archives = []
         self.delay = 0
         self.close_delay = 0
         self.close_failures = 0
@@ -52,7 +55,22 @@ class FakeManager:
 
     def start(self, task_id, message=None):
         self.record("start")
-        self.tasks[0].update(state="running", last_message=message or "正在运行")
+        self.starts.append((task_id, message))
+        time.sleep(self.delay)
+        next(task for task in self.tasks if task["id"] == task_id).update(
+            state="running", last_message=message or "正在运行")
+
+    def get_task(self, task_id):
+        self.record("get_task")
+        time.sleep(self.delay)
+        return deepcopy(next(task for task in self.tasks if task["id"] == task_id))
+
+    def set_archived(self, task_id, archived):
+        self.record("set_archived")
+        self.archives.append((task_id, archived))
+        task = next(task for task in self.tasks if task["id"] == task_id)
+        task["archived"] = archived
+        return deepcopy(task)
 
     def pause(self, task_id):
         self.record("pause")
@@ -117,10 +135,150 @@ class TkSmokeTests(unittest.TestCase):
                 self.wait_for(lambda: self.app.closed)
             self.app.worker.join(timeout=2)
             self.assertFalse(self.app.worker.is_alive(), "The UI must not leave an invisible worker")
+            self.app = None
+            gc.collect()  # Dispose Tk reference cycles on the UI thread before another worker starts.
 
     def set_pending(self, request):
         self.fake.tasks[0]["pending"] = [request]
         self.wait_for(lambda: self.app.pending_requests == [request])
+
+    def add_task(self, **values):
+        task = dict(self.fake.tasks[0], id="task-other", title="另一任务", goal="Other goal", **values)
+        self.fake.tasks.append(task)
+        self.wait_for(lambda: task["id"] in self.app.tasks)
+        return task
+
+    def select_task(self, task_id):
+        self.app.task_tree.selection_set(task_id)
+        self.app._select_task()
+
+    def test_search_filters_title_goal_directory_without_losing_all_tasks(self):
+        self.add_task(cwd="C:\\sample\\Folder", state="completed")
+        for query in ("另一任务", "OTHER GOAL", "folder"):
+            self.app.search.set(query)
+            self.assertEqual(self.app.task_tree.get_children(), ("task-other",))
+            self.assertEqual(self.app.selected_id, "task-other")
+            self.assertEqual(len(self.app.tasks), 2)
+        self.app.search.set("no matches")
+        self.assertIsNone(self.app.selected_id)
+        self.assertEqual(self.app.goal_text.get("1.0", "end-1c"), "")
+        self.assertTrue(self.app.buttons["start"].instate(["disabled"]))
+        self.app._action("start")
+        self.assertFalse(self.fake.starts)
+
+    def test_status_filters_and_hidden_running_task_still_protect_close(self):
+        self.fake.tasks[0]["state"] = "running"
+        self.add_task(state="completed", archived=True)
+        self.wait_for(lambda: self.app.tasks["task-1"]["state"] == "running")
+        for label, expected in (("运行中", ("task-1",)), ("待处理", ()),
+                                ("已完成", ()), ("已归档", ("task-other",))):
+            self.app.state_filter.set(label)
+            self.assertEqual(self.app.task_tree.get_children(), expected)
+        self.assertEqual(len(self.app.tasks), 2)
+        with mock.patch("relay.ui.messagebox.askokcancel", return_value=False) as confirm:
+            self.app.request_close()
+        confirm.assert_called_once()
+        self.assertFalse(self.app.closing)
+
+    def test_archive_unarchive_completed_task_and_legacy_visibility(self):
+        self.assertNotIn("archived", self.app.tasks["task-1"])
+        self.assertTrue(self.app.buttons["set_archived"].instate(["disabled"]))
+        self.fake.tasks[0]["state"] = "completed"
+        self.wait_for(lambda: not self.app.buttons["set_archived"].instate(["disabled"]))
+        self.app.buttons["set_archived"].invoke()
+        self.wait_for(lambda: not self.app.busy and self.app.tasks["task-1"].get("archived"))
+        self.assertEqual(self.app.task_tree.get_children(), ())
+        self.assertIsNone(self.app.selected_id)
+        self.app.state_filter.set("已归档")
+        self.assertEqual(self.app.buttons["set_archived"].cget("text"), "取消归档")
+        self.app.buttons["set_archived"].invoke()
+        self.wait_for(lambda: not self.app.busy and not self.app.tasks["task-1"].get("archived"))
+        self.app.state_filter.set("全部未归档")
+        self.assertEqual(self.app.tasks["task-1"]["state"], "completed")
+        self.assertEqual(self.fake.archives, [("task-1", True), ("task-1", False)])
+        self.assertFalse(self.fake.starts)
+
+    def test_archive_disabled_with_unknown_execution(self):
+        self.fake.tasks[0].update(state="completed", intent={"kind": "turn"})
+        self.wait_for(lambda: self.app.tasks["task-1"]["state"] == "completed")
+        self.assertTrue(self.app.buttons["set_archived"].instate(["disabled"]))
+        self.app.buttons["set_archived"].invoke()
+        self.assertFalse(self.fake.archives)
+
+    def test_new_task_clears_filters_and_selects_created_task(self):
+        self.app.search.set("invisible")
+        self.app.state_filter.set("已归档")
+        self.app.submit("create_task", title="新任务", cwd=self.temp.name, goal="新的目标")
+        self.wait_for(lambda: "task-2" in self.app.tasks and not self.app.busy)
+        self.assertEqual(self.app.search.get(), "")
+        self.assertEqual(self.app.state_filter.get(), "全部未归档")
+        self.assertEqual(self.app.selected_id, "task-2")
+        self.assertIn("task-2", self.app.task_tree.get_children())
+
+    def test_task_drafts_are_separate_and_start_completion_clears_only_sent_task(self):
+        self.add_task()
+        self.app.message_text.insert("1.0", "给第一个任务")
+        self.select_task("task-other")
+        self.assertEqual(self.app.message_text.get("1.0", "end-1c"), "")
+        self.app.message_text.insert("1.0", "给另一个任务")
+        self.select_task("task-1")
+        self.assertEqual(self.app.message_text.get("1.0", "end-1c"), "给第一个任务")
+        self.fake.delay = 0.3
+        self.app.buttons["start"].invoke()
+        self.wait_for(lambda: bool(self.fake.starts))
+        self.select_task("task-other")
+        self.wait_for(lambda: not self.app.busy)
+        self.assertEqual(self.app.message_text.get("1.0", "end-1c"), "给另一个任务")
+        self.select_task("task-1")
+        self.assertEqual(self.app.message_text.get("1.0", "end-1c"), "")
+        self.assertEqual(self.fake.starts, [("task-1", "给第一个任务")])
+
+    def test_start_completion_preserves_newer_edit_on_same_task(self):
+        self.fake.delay = 0.3
+        self.app.message_text.insert("1.0", "已发送的要求")
+        self.app.buttons["start"].invoke()
+        self.wait_for(lambda: bool(self.fake.starts))
+        self.app.message_text.delete("1.0", "end")
+        self.app.message_text.insert("1.0", "下一次补充")
+        self.wait_for(lambda: not self.app.busy)
+        self.assertEqual(self.app.message_text.get("1.0", "end-1c"), "下一次补充")
+        self.assertEqual(self.fake.starts, [("task-1", "已发送的要求")])
+
+    def test_history_is_read_only_redacted_and_bound_to_requested_task(self):
+        self.add_task()
+        self.fake.tasks[0]["events"] = [
+            {"at": "2026-09-30T12:00:00Z", "kind": "turn_started", "data": {"goal": "SECRET-GOAL"}},
+            {"at": "2026-09-30T12:00:01Z", "kind": "native_turn_started", "data": {"command": "SECRET-COMMAND"}},
+            {"at": "2026-09-30T12:00:02Z", "kind": "turn_completed", "data": {"status": "completed", "purpose": "work", "answer": "SECRET-ANSWER"}},
+            {"at": "2026-09-30T12:00:03Z", "kind": "future_event", "data": {"status": "SECRET-STATUS"}},
+        ]
+        self.fake.delay = 0.3
+        self.app.buttons["get_task"].invoke()
+        self.wait_for(lambda: any(method == "get_task" for method, _ in self.fake.calls))
+        self.select_task("task-other")
+        self.wait_for(lambda: not self.app.busy)
+        window = next(child for child in self.root.winfo_children() if getattr(child, "task_id", None) == "task-1")
+        text = window.history_text.get("1.0", "end-1c")
+        self.assertIn("测试任务", text)
+        self.assertIn("task-1", text)
+        self.assertIn("2026-09-30T12:00:00Z", text)
+        self.assertIn("启动回执", text)
+        self.assertIn("原生轮次已开始", text)
+        self.assertIn("不是完整对话", text)
+        self.assertIn("外部成功凭证", text)
+        self.assertIn("其他本地记录", text)
+        self.assertNotIn("SECRET", text)
+        self.assertNotIn("future_event", text)
+        self.assertEqual(str(window.history_text.cget("state")), "disabled")
+        worker_ids = {identifier for method, identifier in self.fake.calls if method == "get_task"}
+        self.assertEqual(worker_ids, {self.app.worker.ident})
+        window.destroy()
+        self.fake.tasks[0]["events"].append({"at": "later", "kind": "draft_saved", "data": {}})
+        self.select_task("task-1")
+        self.app.buttons["get_task"].invoke()
+        self.wait_for(lambda: not self.app.busy)
+        refreshed = next(child for child in self.root.winfo_children() if getattr(child, "task_id", None) == "task-1")
+        self.assertIn("later", refreshed.history_text.get("1.0", "end-1c"))
 
     def test_manager_calls_use_one_worker_and_tasks_refresh(self):
         self.assertFalse(self.app.worker.daemon)
@@ -299,6 +457,8 @@ class TkLayoutTests(unittest.TestCase):
                     app = RelayApp(root, factory=FakeManager)
                     root.update()
                     self.assertIn("prepare_snapshot", app.buttons)
+                    self.assertIn("set_archived", app.buttons)
+                    self.assertIn("get_task", app.buttons)
                     for method, button in app.buttons.items():
                         self.assertTrue(button.winfo_ismapped(), method)
                         parent = button.master
@@ -322,6 +482,8 @@ class TkLayoutTests(unittest.TestCase):
                         self.assertFalse(app.worker.is_alive())
                     if app is None or not app.closed:
                         root.destroy()
+                    app = None
+                    gc.collect()
 
 
 if __name__ == "__main__":

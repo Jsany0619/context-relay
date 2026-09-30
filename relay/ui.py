@@ -17,6 +17,21 @@ STATES = {
 ACTIVE = {"creating", "running", "pausing", "summarizing", "verifying"}
 APPROVALS = {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"}
 USER_INPUT = "item/tool/requestUserInput"
+FILTERS = ("全部未归档", "运行中", "待处理", "等待继续", "已完成", "已归档")
+EVENT_LABELS = {
+    "task_created": "已记录任务", "create_requested": "已请求创建会话", "thread_created": "已收到会话创建回执",
+    "turn_requested": "已请求启动轮次", "turn_started": "已收到启动回执（不代表已实际开始）",
+    "native_turn_started": "原生轮次已开始", "turn_completed": "已收到轮次终态", "work_finished": "工作轮次结束",
+    "interrupt_requested": "已记录暂停请求", "paused": "已暂停", "draft_saved": "已保存预备快照",
+    "requires_reconciliation": "需要核对恢复", "restart_requires_reconciliation": "重启后需要核对恢复",
+    "reconciled_read_only": "已完成只读恢复核对", "handoff_requested": "已请求交接",
+    "handoff_unnecessary": "无需交接", "checkpoint_frozen": "已冻结检查点", "ownership_transferred": "已移交执行权",
+    "receiver_abandoned": "已放弃原接收会话", "user_instruction": "已记录用户指令", "user_answer": "已记录用户回答",
+    "awaiting_user": "等待用户处理", "approval_denied_by_guard": "执行检查拒绝审批",
+    "permission_expansion_denied": "已拒绝扩大权限", "secret_input_refused": "已拒绝采集秘密信息",
+    "late_receipt_recorded": "已记录迟到回执", "tool_state": "已记录工具状态",
+    "user_marked_complete": "用户已标记完成", "task_archived": "已归档", "task_unarchived": "已取消归档",
+}
 
 
 def manager_factory(state_dir=None):
@@ -69,7 +84,7 @@ class CommandWorker(threading.Thread):
                 except Exception as error:
                     self.events.put(("command_error", (method, str(error))))
                 else:
-                    self.events.put(("command_done", (method, deepcopy(result))))
+                    self.events.put(("command_done", (method, args, deepcopy(result))))
                 if self.stop_requested.is_set():
                     continue
             try:
@@ -109,6 +124,32 @@ def text_area(parent, height):
     scrollbar.pack(side="right", fill="y")
     frame.pack(fill="both", expand=True, padx=6, pady=6)
     return widget
+
+
+class HistoryWindow(tk.Toplevel):
+    def __init__(self, parent, task):
+        super().__init__(parent)
+        self.task_id = task["id"]
+        self.title(f"操作记录 · {task['title']}")
+        self.transient(parent)
+        self.geometry(f"{min(760, parent.winfo_screenwidth() - 80)}x{min(540, parent.winfo_screenheight() - 120)}")
+        self.history_text = text_area(self, 18)
+        lines = [f"任务：{task['title']}\n任务 ID：{task['id']}",
+                 "最近最多 100 条本地操作记录；不是完整对话，也不是外部成功凭证。关闭后重新打开可刷新。", ""]
+        status_labels = dict(STATES, inProgress="进行中", failed="失败", interrupted="已中断", declined="已拒绝")
+        purpose_labels = {"work": "任务执行", "summary": "交接摘要", "verify": "接收核验"}
+        for event in task.get("events", []):
+            line = f"{event.get('at', '时间未知')} · {EVENT_LABELS.get(event.get('kind'), '其他本地记录')}"
+            data = event.get("data") or {}
+            for key, label, labels in (("status", "状态", status_labels), ("purpose", "阶段", purpose_labels)):
+                value = data.get(key)
+                if isinstance(value, str):
+                    line += f" · {label}：{labels.get(value, '未知')}"
+            lines.append(line)
+        if not task.get("events"):
+            lines.append("暂无本地操作记录。")
+        set_text(self.history_text, "\n".join(lines))
+        ttk.Button(self, text="关闭", command=self.destroy).pack(pady=(0, 10))
 
 
 class NewTaskDialog(tk.Toplevel):
@@ -182,6 +223,8 @@ class RelayApp:
         self.tasks = {}
         self.selected_id = None
         self.rendered_task_id = None
+        self.message_drafts = {}
+        self.visible_ids = set()
         self.ready = False
         self.busy = False
         self.closing = False
@@ -197,7 +240,11 @@ class RelayApp:
         self.root.protocol("WM_DELETE_WINDOW", self.request_close)
         self.status = tk.StringVar(value="正在连接 Codex…")
         self.details = tk.StringVar(value="选择左侧任务查看详情。")
+        self.search = tk.StringVar()
+        self.state_filter = tk.StringVar(value=FILTERS[0])
         self._build()
+        self.search.trace_add("write", lambda *args: self._apply_filters())
+        self.state_filter.trace_add("write", lambda *args: self._apply_filters())
         self.worker = CommandWorker(factory, state_dir)
         self.worker.start()
         self.root.after(40, self._pump)
@@ -213,13 +260,27 @@ class RelayApp:
         panes.add(right, weight=4)
         self.new_button = ttk.Button(left, text="新建任务", command=lambda: NewTaskDialog(self.root, self.submit))
         self.new_button.pack(fill="x", pady=(0, 8))
-        self.task_tree = ttk.Treeview(left, columns=("state",), show="tree headings", selectmode="browse")
+        ttk.Label(left, text="搜索名称、目标或目录").pack(anchor="w")
+        self.search_entry = ttk.Entry(left, textvariable=self.search)
+        self.search_entry.pack(fill="x", pady=(2, 6))
+        self.filter_choice = ttk.Combobox(left, textvariable=self.state_filter, values=FILTERS, state="readonly")
+        self.filter_choice.pack(fill="x", pady=(0, 6))
+        organize = ttk.Frame(left)
+        organize.pack(fill="x", pady=(0, 8))
+        self.buttons = {}
+        for label, method in (("操作记录", "get_task"), ("归档", "set_archived")):
+            button = ttk.Button(organize, text=label, command=lambda action=method: self._action(action))
+            button.pack(side="left", expand=True, fill="x", padx=(0, 4))
+            self.buttons[method] = button
+        task_list = ttk.Frame(left)
+        task_list.pack(fill="both", expand=True)
+        self.task_tree = ttk.Treeview(task_list, columns=("state",), show="tree headings", selectmode="browse")
         self.task_tree.heading("#0", text="任务")
         self.task_tree.heading("state", text="状态")
         self.task_tree.column("#0", width=160, minwidth=100)
         self.task_tree.column("state", width=92, minwidth=75, stretch=False)
         self.task_tree.pack(side="left", fill="both", expand=True)
-        scrollbar = ttk.Scrollbar(left, command=self.task_tree.yview)
+        scrollbar = ttk.Scrollbar(task_list, command=self.task_tree.yview)
         self.task_tree.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
         self.task_tree.bind("<<TreeviewSelect>>", self._select_task)
@@ -248,7 +309,6 @@ class RelayApp:
         self.message_text.pack(fill="x", pady=(2, 6))
         actions = ttk.Frame(controls)
         actions.pack(fill="x")
-        self.buttons = {}
         for label, method in (("启动 / 继续", "start"), ("暂停", "pause"), ("核对恢复", "reconcile"),
                               ("预备快照", "prepare_snapshot"), ("交接", "handoff"),
                               ("标记完成", "finish"), ("导出", "export_task")):
@@ -261,6 +321,8 @@ class RelayApp:
     def submit(self, method, *args, **kwargs):
         if not self.ready or self.busy or self.closing:
             return False
+        if method != "create_task" and args and args[0] not in self.visible_ids:
+            return False
         self.busy = True
         self.status.set("正在处理，请稍候…")
         self._controls()
@@ -268,10 +330,12 @@ class RelayApp:
         return True
 
     def _action(self, method):
-        if not self.selected_id:
+        if self.selected_id not in self.visible_ids or self.buttons[method].instate(["disabled"]):
             return
         if method == "start":
             self.submit(method, self.selected_id, self.message_text.get("1.0", "end").strip() or None)
+        elif method == "set_archived":
+            self.submit(method, self.selected_id, not self.tasks[self.selected_id].get("archived", False))
         elif method == "export_task":
             destination = filedialog.asksaveasfilename(parent=self.root, title="导出任务记录", defaultextension=".json",
                                                       initialfile="context-relay-task.json", filetypes=(("JSON", "*.json"),))
@@ -285,22 +349,43 @@ class RelayApp:
 
     def _select_task(self, event=None):
         selection = self.task_tree.selection()
-        self.selected_id = selection[0] if selection else None
+        self.selected_id = selection[0] if selection and selection[0] in self.visible_ids else None
         self._render_task()
 
     def _render_tasks(self, tasks):
         self.tasks = {task["id"]: task for task in tasks}
+        self._apply_filters()
+
+    def _apply_filters(self):
+        query, state_filter = self.search.get().strip().casefold(), self.state_filter.get()
+        visible = []
+        for task in self.tasks.values():
+            if bool(task.get("archived", False)) != (state_filter == "已归档"):
+                continue
+            state = task.get("state")
+            if state_filter == "运行中" and state not in ACTIVE:
+                continue
+            if state_filter == "待处理" and state not in ("blocked", "needs_reconcile") and not task.get("pending"):
+                continue
+            if state_filter == "等待继续" and state not in ("queued", "idle", "paused"):
+                continue
+            if state_filter == "已完成" and state != "completed":
+                continue
+            if query and not any(query in task.get(key, "").casefold() for key in ("title", "goal", "cwd")):
+                continue
+            visible.append(task)
+        self.visible_ids = {task["id"] for task in visible}
         for item in self.task_tree.get_children():
-            if item not in self.tasks:
+            if item not in self.visible_ids:
                 self.task_tree.delete(item)
-        for task in tasks:
-            values = (STATES.get(task.get("state"), task.get("state", "未知")),)
+        for task in visible:
+            values = ("已归档" if task.get("archived") else STATES.get(task.get("state"), task.get("state", "未知")),)
             if self.task_tree.exists(task["id"]):
                 self.task_tree.item(task["id"], text=task["title"], values=values)
             else:
                 self.task_tree.insert("", "end", iid=task["id"], text=task["title"], values=values)
-        if self.selected_id not in self.tasks:
-            self.selected_id = next(iter(self.tasks), None)
+        if self.selected_id not in self.visible_ids:
+            self.selected_id = visible[0]["id"] if visible else None
         if self.selected_id:
             self.task_tree.selection_set(self.selected_id)
         self._render_task()
@@ -308,6 +393,11 @@ class RelayApp:
     def _render_task(self):
         task = self.tasks.get(self.selected_id)
         switched = self.rendered_task_id != self.selected_id
+        if switched:
+            if self.rendered_task_id is not None:
+                self.message_drafts[self.rendered_task_id] = self.message_text.get("1.0", "end-1c")
+            self.message_text.delete("1.0", "end")
+            self.message_text.insert("1.0", self.message_drafts.get(self.selected_id, ""))
         self.rendered_task_id = self.selected_id
         if not task:
             self.details.set("选择左侧任务查看详情。")
@@ -448,12 +538,20 @@ class RelayApp:
     def _controls(self):
         available = self.ready and not self.busy and not self.closing
         self.new_button.configure(state="normal" if available else "disabled")
-        task = self.tasks.get(self.selected_id)
+        task = self.tasks.get(self.selected_id) if self.selected_id in self.visible_ids else None
         state = task.get("state") if task else None
+        archived = bool(task and task.get("archived", False))
+        can_archive = bool(task) and state == "completed" and not any(
+            task.get(key) for key in ("inflight", "intent", "pending", "receiver_id")) and task.get("run_started") is None
         allowed = {"start": state in ("queued", "paused", "idle"), "pause": state in ACTIVE,
                    "prepare_snapshot": state in ("idle", "paused"),
                    "handoff": state == "idle", "finish": state in ("idle", "paused"),
-                   "reconcile": bool(task), "export_task": bool(task)}
+                   "reconcile": bool(task), "export_task": bool(task), "get_task": bool(task),
+                   "set_archived": archived or can_archive}
+        if archived:
+            for method in ("start", "pause", "prepare_snapshot", "handoff", "finish", "reconcile"):
+                allowed[method] = False
+        self.buttons["set_archived"].configure(text="取消归档" if archived else "归档")
         for method, button in self.buttons.items():
             button.configure(state="normal" if available and allowed[method] else "disabled")
         request = self._current_request()
@@ -474,11 +572,22 @@ class RelayApp:
                 self._render_tasks(value)
             elif kind == "command_done":
                 self.busy = False
-                method, result = value
+                method, args, result = value
                 if method == "create_task" and isinstance(result, dict):
-                    self.selected_id = result.get("id")
+                    self.search.set("")
+                    self.state_filter.set(FILTERS[0])
+                    self.tasks[result["id"]] = result
+                    self.selected_id = result["id"]
+                    self._apply_filters()
                 if method == "start":
-                    self.message_text.delete("1.0", "end")
+                    task_id = args[0]
+                    sent = (args[1] if len(args) > 1 else None) or ""
+                    if self.message_drafts.get(task_id, "").strip() == sent:
+                        self.message_drafts.pop(task_id, None)
+                    if self.rendered_task_id == task_id and self.message_text.get("1.0", "end-1c").strip() == sent:
+                        self.message_text.delete("1.0", "end")
+                if method == "get_task" and isinstance(result, dict) and not self.closing:
+                    HistoryWindow(self.root, result)
                 self.status.set("已导出任务记录。" if method == "export_task" else "操作已处理；以任务状态和实际回复为准。")
             elif kind in ("command_error", "poll_error", "startup_error", "close_error"):
                 if kind == "command_error":
