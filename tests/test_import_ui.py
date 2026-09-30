@@ -50,6 +50,7 @@ class ImportManager(base_ui.FakeManager):
             raise ValueError("来源已改变，请重新预览")
         task = dict(self.tasks[0], **{key: kwargs[key] for key in ("title", "goal", "mode", "max_tokens", "max_minutes", "auto_handoff")})
         task.update(id=kwargs.get("existing_task_id") or "imported-task", state="queued", thread_id=None)
+        task["brief_required"] = not bool(kwargs["goal"].strip())
         task["source_snapshot"] = {"thread_id": thread_id}
         self.tasks = [entry for entry in self.tasks if entry["id"] != task["id"]] + [task]
         return deepcopy(task)
@@ -130,10 +131,6 @@ class ImportUiTests(unittest.TestCase):
         self.assertEqual(dialog.mode.get(), "read-only")
         self.assertFalse(dialog.source_stopped.get())
         dialog.save()
-        self.assertFalse(self.fake.import_calls)
-        dialog.source_stopped.set(True)
-        dialog.save()
-        self.assertIn("目标不能为空", dialog.info.get())
         self.assertFalse(self.fake.import_calls)
         self.fill(dialog)
         dialog.tokens.set("1200")
