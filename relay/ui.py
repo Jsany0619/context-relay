@@ -301,6 +301,7 @@ class RelayApp:
         self.root.minsize(min(940, width), min(720, height))
         self.root.protocol("WM_DELETE_WINDOW", self.request_close)
         self.status = tk.StringVar(value="正在读取本机任务…")
+        self.root.report_callback_exception = self._callback_error
         self.details = tk.StringVar(value="选择左侧任务查看详情。")
         self.budget_details = tk.StringVar()
         self.search = tk.StringVar()
@@ -310,7 +311,7 @@ class RelayApp:
         self.state_filter.trace_add("write", lambda *args: self._apply_filters())
         self.worker = CommandWorker(factory, state_dir)
         self.worker.start()
-        self.root.after(40, self._pump)
+        self._pump_after = self.root.after(40, self._pump)
 
     def _build(self):
         compact = self.root.winfo_screenheight() < 900
@@ -683,7 +684,16 @@ class RelayApp:
         self.approval_decline.configure(state="normal" if allow_approval else "disabled")
         self.approval_allow.configure(state="normal" if allow_approval and self._has_action(request) else "disabled")
 
+    def _callback_error(self, exception_type, exception, _traceback):
+        message = f"{exception_type.__name__}: {exception}"
+        self.status.set(f"界面回调出错：{message}")
+        messagebox.showerror("界面回调出错", message, parent=self.root)
+        # A failed refresh must not strand worker results or the close receipt.
+        if self._pump_after is None and not self.closed:
+            self._pump_after = self.root.after(40, self._pump)
+
     def _pump(self):
+        self._pump_after = None
         while True:
             try:
                 kind, value = self.worker.events.get_nowait()
@@ -740,7 +750,7 @@ class RelayApp:
                 self.root.destroy()
                 return
         self._controls()
-        self.root.after(40, self._pump)
+        self._pump_after = self.root.after(40, self._pump)
 
     def request_close(self):
         if self.closing or self.closed:

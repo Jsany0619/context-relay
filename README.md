@@ -15,7 +15,9 @@ python -m relay --check
 python -m relay
 ```
 
-You can also double-click `start-manager.cmd`. The Chinese interface provides task creation, start/continue, pause, recovery checks, preparatory snapshots, handoff, one-time approvals, and export. Automatic handoff is opt-in for each task. Read-only and workspace-write are the two permission ceilings; budgets are soft limits and may be exceeded by an in-flight call.
+For everyday use, double-click `install-shortcuts.cmd` once, then use **Context Relay** on your Desktop or Start Menu. **Context Relay Check** in the Start Menu displays prerequisite results without opening task state. These current-user shortcuts use `pythonw` with no console window; startup and interface-callback errors appear in dialogs. The installer does not install Python/Codex, enable auto-start or change global hooks or PowerShell policy. Keep the checkout and Python paths available; see [shortcut setup and removal](docs/windows-manager.md#快捷启动).
+
+You can still double-click `start-manager.cmd` for the console entry point. The Chinese interface provides task creation, start/continue, pause, recovery checks, preparatory snapshots, handoff, one-time approvals, and export. Automatic handoff is opt-in for each task. Read-only and workspace-write are the two permission ceilings; budgets are soft limits and may be exceeded by an in-flight call.
 
 Find tasks by title, goal or directory, filter their status, and move completed tasks into a reversible local archive. Archiving preserves the task, files, permissions and conversation ownership; restoring it does not resume work. The operation-history window shows the latest 100 recorded events, distinguishing requests, native starts and confirmed results. These local management actions do not start Codex inference or archive native conversations.
 
@@ -110,11 +112,13 @@ The installer has **6 passing tests** covering previews, backups, configuration 
 python -m unittest -v test_install.py
 ```
 
-The backup follow-up passed **137 manager tests**, including 10 archive checks, 5 backup/controller/CLI integration checks and 37 Tk checks. The 71 standalone runtime and 6 installer tests also passed: **214 tests total**. Final manager tests use simulated clients or servers and real Tk widgets. The first-version validation on 2026-09-30 used Windows, Python 3.13.2, Tk 8.6.15, and Codex 0.153.4. Run the manager suite separately:
+The quick-launch version passed **148 manager, launcher and shortcut tests**, including 39 Tk checks, 3 windowed-entry checks and 6 Windows COM shortcut checks. The 71 standalone runtime and 6 skill-installer tests also passed: **225 tests total**. Manager execution tests use simulated clients or servers; Tk widgets and shortcut files are real. Local validation used Windows, Python 3.13.2, Tk 8.6.15, and Windows PowerShell 5.1. Run the manager suite separately:
 
 ```shell
 python -m unittest discover -s tests -v
 ```
+
+A separate actual Windows Shell `.lnk` exercise opened the windowed manager with an isolated empty state directory, displayed successful prerequisite and invalid-argument dialogs, and closed all three processes normally. No tasks were started. Current-user Desktop and Start Menu shortcuts were then installed and their target, arguments and working directory read back. This verifies local startup, not account login or native task execution; see the [acceptance details](docs/windows-manager.md#验证状态).
 
 The real Tk window was also inspected with synthetic tasks: approval actions and the bottom controls remain visible with the default screen-bounded layout. Basic layout checks covered 96/144-DPI-equivalent Tk scaling on the local display. Fake-server, FakeManager, and window checks do not prove native conversation handoff. See the manager guide for the current acceptance status.
 

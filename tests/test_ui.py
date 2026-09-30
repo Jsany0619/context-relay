@@ -663,6 +663,44 @@ class TkSmokeTests(unittest.TestCase):
         self.wait_for(lambda: any(method == "pause" for method, _ in self.fake.calls))
         self.assertFalse(self.fake.answers)
 
+    def test_tk_callback_exception_is_visible_without_changing_work_and_can_close(self):
+        self.app.busy = True
+        tasks = deepcopy(self.app.tasks)
+        commands = self.app.worker.commands
+        calls = [method for method, _ in self.fake.calls if method not in ("poll", "list_tasks")]
+
+        def fail_callback():
+            raise RuntimeError("测试回调失败")
+
+        with mock.patch("relay.ui.messagebox.showerror") as showerror:
+            self.root.after(0, fail_callback)
+            self.root.update()
+            showerror.assert_called_once_with("界面回调出错", "RuntimeError: 测试回调失败", parent=self.root)
+        self.assertIn("RuntimeError: 测试回调失败", self.app.status.get())
+        self.assertEqual(self.app.tasks, tasks)
+        self.assertTrue(self.app.busy)
+        self.assertIs(self.app.worker.commands, commands)
+        self.assertTrue(commands.empty())
+        self.assertEqual([method for method, _ in self.fake.calls if method not in ("poll", "list_tasks")], calls)
+        self.assertTrue(self.root.winfo_exists())
+        with mock.patch("relay.ui.messagebox.askokcancel", return_value=True):
+            self.app.request_close()
+        self.wait_for(lambda: self.app.closed)
+        self.assertTrue(self.fake.closed)
+        self.assertEqual([method for method, _ in self.fake.calls if method not in ("poll", "list_tasks")], calls + ["close"])
+
+    def test_render_callback_error_keeps_event_pump_and_close_working(self):
+        calls = [method for method, _ in self.fake.calls if method not in ("poll", "list_tasks")]
+        with mock.patch.object(self.app, "_render_tasks", side_effect=RuntimeError("render failed")), \
+                mock.patch("relay.ui.messagebox.showerror") as showerror:
+            self.app.worker.events.put(("tasks", deepcopy(self.fake.tasks)))
+            self.wait_for(lambda: showerror.called)
+        self.app.request_close()
+        self.wait_for(lambda: self.app.closed)
+        self.assertTrue(self.fake.closed)
+        self.assertEqual([method for method, _ in self.fake.calls if method not in ("poll", "list_tasks")],
+                         calls + ["close"])
+
     def test_slow_operation_does_not_block_tk(self):
         self.fake.delay = 0.3
         heartbeat = []
