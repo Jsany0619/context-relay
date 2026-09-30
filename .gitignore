@@ -14,3 +14,4 @@ work/
 tasks.sqlite3*
 manager.lock
 checkpoints/
+drafts/

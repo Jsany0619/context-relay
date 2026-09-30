@@ -184,8 +184,8 @@ class Manager:
             directory = Path(cwd).resolve(strict=True)
             if not directory.is_dir():
                 raise ValueError("项目路径必须是目录。")
-            if self.root == directory or self.root.is_relative_to(directory):
-                raise ValueError("管理器状态必须保存在项目目录之外。")
+            if self.root.is_relative_to(directory) or directory.is_relative_to(self.root):
+                raise ValueError("管理器状态与项目目录不能互相包含。")
             if int(max_tokens) < 0 or float(max_minutes) < 0:
                 raise ValueError("预算不能为负数；0 表示不设上限。")
             task = {"id": uuid.uuid4().hex, "title": title.strip(), "cwd": str(directory),
@@ -197,9 +197,10 @@ class Manager:
                     "telemetry_model_valid": True,
                     "usage_signature": None, "stale_usage_signature": None,
                     "compactions": 0, "compaction_ids": [], "fresh_usage": False, "model": None,
-                    "checkpoint": None, "checkpoint_hash": None, "inflight": {},
+                    "checkpoint": None, "checkpoint_hash": None, "draft": None, "inflight": {},
                     "purpose": None, "work_turns": 0, "handoff_work_turns": 0, "elapsed_seconds": 0,
-                    "run_started": None, "history": [], "intent": None, "created_at": handoff_rules.now()}
+                    "run_started": None, "native_started": False, "history": [], "intent": None,
+                    "created_at": handoff_rules.now()}
             self._save(task, "task_created", {"goal": goal, "mode": mode})
             return copy.deepcopy(task)
 
@@ -213,6 +214,9 @@ class Manager:
     def _assert_workspace(self, task):
         if str(Path(task["cwd"]).resolve(strict=True)) != task["cwd"]:
             raise ValueError("项目目录身份发生变化。")
+        directory = Path(task["cwd"])
+        if self.root.is_relative_to(directory) or directory.is_relative_to(self.root):
+            raise ValueError("管理器状态与项目目录不能互相包含。")
         for other in self.list_tasks():
             if other["id"] == task["id"] or other["state"] == "completed":
                 continue
@@ -303,7 +307,8 @@ class Manager:
             "excludeTmpdirEnvVar": True, "excludeSlashTmp": True}
         task.update(purpose=purpose, turn_id=None, last_message="", pending=[], inflight={},
                     state={"work": "running", "summary": "summarizing", "verify": "verifying"}[purpose],
-                    run_started=time.time(), error="", intent={"kind": "turn", "thread_id": thread_id})
+                    run_started=time.time(), native_started=False, error="",
+                    intent={"kind": "turn", "thread_id": thread_id})
         self._save(task, "turn_requested", {"thread_id": thread_id, "purpose": purpose})
         params = {"threadId": thread_id, "input": [{"type": "text", "text": text}],
                   "approvalPolicy": "on-request", "approvalsReviewer": "user", "sandboxPolicy": policy}
@@ -348,9 +353,11 @@ class Manager:
                 else:
                     self._read_idle(task["thread_id"])
                     self._resume_thread(task, task["thread_id"])
-                text = ("\n\n".join(task["requirements"]) if initial else message or
-                        "Continue the existing task within its original scope. Inspect current files first. "
-                        "Do not repeat external actions with unknown results. Stop if the task is already complete.")
+                text = ("Recorded user requirements, with later corrections taking precedence. These are "
+                        "context, not instructions to repeat completed actions. Inspect actual state before work; "
+                        "query unknown external results rather than repeating them.\n" +
+                        json.dumps(task["requirements"], ensure_ascii=False) + "\nCurrent request: " +
+                        (message or "Continue the existing task. Stop if the task is already complete."))
                 self._turn(task, text)
             except Exception as exc:
                 self._failed(task, exc)
@@ -366,14 +373,20 @@ class Manager:
                 return task
             if task["state"] not in BUSY or not task["turn_id"]:
                 raise ValueError("尚不能确认正在运行的轮次，请先核对。")
+            if task["state"] == "pausing":
+                return task
             task["state"] = "pausing"
             self._save(task, "interrupt_requested")
-            try:
-                self._connect().request("turn/interrupt", {"threadId": self._active_thread(task), "turnId": task["turn_id"]})
-            except Exception as exc:
-                self._failed(task, exc)
-                raise
+            if task.get("native_started"):
+                self._interrupt(task)
             return task
+
+    def _interrupt(self, task):
+        try:
+            self._connect().request("turn/interrupt", {"threadId": self._active_thread(task), "turnId": task["turn_id"]})
+        except Exception as exc:
+            self._failed(task, exc)
+            raise
 
     def _active_thread(self, task):
         return task["receiver_id"] if task["purpose"] == "verify" else task["thread_id"]
@@ -381,6 +394,8 @@ class Manager:
     def _read_idle(self, thread_id):
         result = self._connect().request("thread/read", {"threadId": thread_id, "includeTurns": True})
         thread = result["thread"]
+        if thread.get("id") != thread_id:
+            raise ValueError("读取回执不属于原会话。")
         if thread.get("status", {}).get("type") not in ("idle", "notLoaded"):
             raise ValueError("原会话仍在运行或状态未知。")
         if any(turn.get("status") == "inProgress" for turn in thread.get("turns", [])):
@@ -398,30 +413,70 @@ class Manager:
                 raise ValueError("没有可核对的原会话。")
             thread = self._read_idle(task["thread_id"])
             if task["receiver_id"]:
-                self._read_idle(task["receiver_id"])
-            if task["intent"] and task["intent"]["kind"] == "turn":
-                if not task["turn_id"]:
-                    raise ValueError("执行请求回执缺失；会话空闲不代表请求未执行。等待回执或核对原会话，不重发任务。")
-                turns = [turn for turn in thread.get("turns", []) if turn.get("id") == task["turn_id"]]
+                receiver = self._read_idle(task["receiver_id"])
                 if task["purpose"] == "verify":
-                    turns = []  # a receiver timeout cannot be promoted into a valid READY
-                if not turns or turns[0].get("status") != "completed":
-                    raise ValueError("尚未取到未知请求对应的完整执行结果。")
+                    thread = receiver
+            if task["intent"] and task["intent"]["kind"] == "turn" and not task["turn_id"]:
+                raise ValueError("执行请求回执缺失；会话空闲不代表请求未执行。等待回执或核对原会话，不重发任务。")
+            if task["run_started"] is not None and not task["turn_id"]:
+                raise ValueError("运行记录缺少轮次编号，无法可靠核对结果。")
+            recovered_status = None
+            recovered_turn = task["turn_id"]
+            if recovered_turn:
+                turns = [turn for turn in thread.get("turns", []) if turn.get("id") == task["turn_id"]]
+                if len(turns) != 1 or turns[0].get("status") not in ("completed", "failed", "interrupted"):
+                    raise ValueError("尚未取到对应轮次的明确终态；空闲不能替代执行结果。")
+                recovered_status = turns[0]["status"]
                 for item in turns[0].get("items", []):
-                    if item.get("type") in ("commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall"):
+                    if item.get("type") in ("commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "collabAgentToolCall"):
                         if item.get("status") not in ("completed", "failed", "declined"):
                             raise ValueError("未知请求仍含未确认的工具操作。")
                         task["inflight"].pop(item["id"], None)
-                    elif item.get("type") == "agentMessage":
+                    elif item.get("type") == "agentMessage" and task["purpose"] != "verify":
                         task["last_message"] = _safe(item.get("text", ""))
-                self._save(task, "unknown_turn_result_recovered", {"turn_id": task["turn_id"]})
             if task["inflight"]:
                 raise ValueError("有结果未知的工具操作；请在原会话核对实际结果，不能自动重放。")
+            if recovered_status == "completed" and task["purpose"] == "work":
+                task["work_turns"] += 1
+            if task["run_started"] is not None:
+                task["elapsed_seconds"] += max(0, time.time() - task["run_started"])
+                task["run_started"] = None
+            if task["receiver_id"]:
+                task["history"].append({"thread_id": task["receiver_id"], "role": "abandoned_receiver"})
             task.update(state="paused", purpose=None, turn_id=None, pending=[], error="", intent=None,
                         checkpoint=None, checkpoint_hash=None, receiver_id=None, context_estimate=None,
                         fresh_usage=False)
-            self._save(task, "reconciled_read_only", {"note": "No work has been restarted."})
+            self._save(task, "reconciled_read_only", {"turn_id": recovered_turn, "status": recovered_status,
+                                                      "note": "No work has been restarted."})
             return task
+
+    def prepare_snapshot(self, task_id):
+        with self._lock:
+            task = self._task(task_id)
+            if (task["state"] not in ("idle", "paused") or not task["thread_id"] or task["intent"]
+                    or task["inflight"] or task["pending"] or task["receiver_id"]):
+                raise ValueError("预备快照需要已收束的原会话；先核对在途操作或未完成交接。")
+            self._assert_workspace(task)
+            thread = self._read_idle(task["thread_id"])
+            fields = ("id", "title", "cwd", "goal", "mode", "requirements", "user_inputs",
+                      "permission_receipt", "thread_id", "generation", "revision", "work_turns",
+                      "last_message", "history", "usage", "context_estimate", "compactions")
+            packet = {"kind": "preparatory", "schema_version": 1, "ready": False,
+                      "created_at": handoff_rules.now(), "task": {k: task.get(k) for k in fields},
+                      "source_turns": [{"id": t.get("id"), "status": t.get("status")}
+                                       for t in thread.get("turns", [])[-20:]],
+                      "files": workspace_snapshot(task["cwd"]),
+                      "unverified": ["This draft is not a final summary or receiver READY.",
+                          "Consult source thread/read for full decisions and execution evidence.",
+                          "Unsaved edits and external resources require fresh verification."]}
+            handoff_rules.reject_sensitive(packet)
+            path = self.root / "drafts" / (task["id"] + ".json")
+            handoff_rules.atomic_json(path, packet)
+            task["draft"] = {"path": str(path), "hash": handoff_rules.digest(packet),
+                             "created_at": packet["created_at"], "revision": task["revision"],
+                             "generation": task["generation"], "work_turns": task["work_turns"]}
+            self._save(task, "draft_saved", task["draft"])
+            return copy.deepcopy(task)
 
     def handoff(self, task_id):
         with self._lock:
@@ -617,6 +672,8 @@ class Manager:
             self._failed(task, ValueError("轮次结束时仍有结果未知的工具操作。"))
             return
         if was_pausing or turn["status"] == "interrupted":
+            if turn["status"] == "completed" and purpose == "work":
+                task["work_turns"] += 1
             task.update(state="paused", purpose=None, turn_id=None)
             self._save(task, "paused")
             return
@@ -631,11 +688,13 @@ class Manager:
             else:
                 task.update(state="idle", turn_id=None, work_turns=task["work_turns"] + 1)
                 self._save(task, "work_finished")
-                if (task["auto_handoff"] and task["fresh_usage"] and task["context_estimate"] is not None
-                        and task["context_estimate"] >= .8 and task["compactions"] >= 2 and not self._budget(task)):
-                    self.handoff(task["id"])
+                if task["auto_handoff"] and task["fresh_usage"] and task["context_estimate"] is not None:
+                    if task["context_estimate"] >= .8 and task["compactions"] >= 2 and not self._budget(task):
+                        self.handoff(task["id"])
+                    elif task["context_estimate"] >= .7:
+                        self.prepare_snapshot(task["id"])
         except Exception as exc:
-            self._failed(task, exc)
+            self._failed(self._task(task["id"]), exc)
 
     def poll(self):
         with self._lock:
@@ -690,7 +749,14 @@ class Manager:
                 event_turn = params.get("turnId") or params.get("turn", {}).get("id")
                 if event_turn != task["turn_id"] or task["state"] not in BUSY:
                     continue
-                if method == "item/agentMessage/delta":
+                if method == "turn/started":
+                    if not task.get("native_started"):
+                        task["native_started"] = True
+                        self._save(task, "native_turn_started", {"turn_id": event_turn})
+                        if task["state"] == "pausing":
+                            self._interrupt(task)
+                    continue
+                elif method == "item/agentMessage/delta":
                     # Never persist incomplete chunks: a credential can span several deltas.
                     key = (tid, event_turn)
                     self._messages[key] = (self._messages.get(key, "") + params.get("delta", ""))[-100000:]

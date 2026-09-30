@@ -250,7 +250,8 @@ class RelayApp:
         actions.pack(fill="x")
         self.buttons = {}
         for label, method in (("启动 / 继续", "start"), ("暂停", "pause"), ("核对恢复", "reconcile"),
-                              ("交接", "handoff"), ("标记完成", "finish"), ("导出", "export_task")):
+                              ("预备快照", "prepare_snapshot"), ("交接", "handoff"),
+                              ("标记完成", "finish"), ("导出", "export_task")):
             button = ttk.Button(actions, text=label, command=lambda action=method: self._action(action))
             button.pack(side="left", padx=(0, 5))
             self.buttons[method] = button
@@ -322,9 +323,11 @@ class RelayApp:
         usage_text = str(usage) if isinstance(usage, (int, float)) else "未知"
         if task.get("max_tokens"):
             usage_text += f" / {task['max_tokens']}"
+        draft = task.get("draft")
         self.details.set(f"{task['title']} · {STATES.get(task.get('state'), task.get('state', '未知'))}\n"
                          f"{task['cwd']}\n权限：{mode}  ·  交接代次：{task.get('generation', 0)}  ·  "
                          f"上下文估算：{pressure_text}  ·  压缩：{task.get('compactions', 0)} 次  ·  累计 Token：{usage_text}"
+                         + (f"\n预备快照：{draft.get('created_at', '时间未知')} · 仅预备，交接前须重验" if draft else "")
                          + (f"\n需要处理：{task['error']}" if task.get("error") else ""))
         set_text(self.goal_text, task.get("goal"))
         set_text(self.latest_text, task.get("last_message") or "尚无回复。", follow=True)
@@ -448,6 +451,7 @@ class RelayApp:
         task = self.tasks.get(self.selected_id)
         state = task.get("state") if task else None
         allowed = {"start": state in ("queued", "paused", "idle"), "pause": state in ACTIVE,
+                   "prepare_snapshot": state in ("idle", "paused"),
                    "handoff": state == "idle", "finish": state in ("idle", "paused"),
                    "reconcile": bool(task), "export_task": bool(task)}
         for method, button in self.buttons.items():

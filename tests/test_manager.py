@@ -39,7 +39,9 @@ class FakeClient:
                     "sandbox": {"type": sandbox}, "approvalPolicy": params.get("approvalPolicy")}
         if method == "turn/start":
             self.turn_count += 1
-            return {"turn": {"id": f"turn-{self.turn_count}", "status": "inProgress", "items": []}}
+            turn = {"id": f"turn-{self.turn_count}", "status": "inProgress", "items": []}
+            self.push("turn/started", {"threadId": params["threadId"], "turn": turn})
+            return {"turn": turn}
         if method == "turn/interrupt":
             if self.interrupt_completes:
                 self.push("turn/completed", {"threadId": params["threadId"],
@@ -90,6 +92,7 @@ class ManagerContractTests(unittest.TestCase):
     def start_task(self, **kwargs):
         task = self.task(**kwargs)
         self.manager.start(task["id"])
+        self.manager.poll()
         return self.manager.get_task(task["id"])
 
     def complete(self, task, status="completed"):
@@ -133,6 +136,7 @@ class ManagerContractTests(unittest.TestCase):
         summary.update(changes)
         turn = self.client.calls_for("turn/start")[-1]
         self.finish_agent(turn["threadId"], f"turn-{self.client.turn_count}", summary)
+        self.manager.poll()
         return self.manager.get_task(source["id"])
 
     def finish_ready(self, task, **changes):

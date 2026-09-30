@@ -14,6 +14,7 @@ class FakeManager:
     def __init__(self, state_dir=None):
         self.calls = []
         self.answers = []
+        self.prepared_task_ids = []
         self.delay = 0
         self.close_delay = 0
         self.close_failures = 0
@@ -57,6 +58,12 @@ class FakeManager:
         self.record("pause")
         time.sleep(self.delay)
         self.tasks[0]["state"] = "paused"
+
+    def prepare_snapshot(self, task_id):
+        self.record("prepare_snapshot")
+        self.prepared_task_ids.append(task_id)
+        self.tasks[0]["draft"] = {"created_at": "2026-09-30T12:34:56Z"}
+        return deepcopy(self.tasks[0])
 
     def answer(self, task_id, request_id, answer):
         self.record("answer")
@@ -136,6 +143,36 @@ class TkSmokeTests(unittest.TestCase):
         self.assertEqual(self.fake.answers[0], ("task-1", 17, {"decision": "accept"}))
         self.app._answer_approval("accept")
         self.assertEqual(len(self.fake.answers), 1)
+
+    def test_prepare_snapshot_uses_worker_and_displays_only_a_draft(self):
+        self.assertNotIn("draft", self.app.tasks["task-1"])
+        self.assertNotIn("预备快照", self.app.details.get())
+        self.app.buttons["prepare_snapshot"].invoke()
+        self.wait_for(lambda: self.app.tasks["task-1"].get("draft") and not self.app.busy)
+        self.assertEqual(self.fake.prepared_task_ids, ["task-1"])
+        self.assertIn("2026-09-30T12:34:56Z", self.app.details.get())
+        self.assertIn("仅预备，交接前须重验", self.app.details.get())
+        self.assertNotIn("READY", self.app.details.get())
+        self.assertNotIn("已接管", self.app.details.get())
+        self.assertEqual(self.app.tasks["task-1"]["state"], "idle")
+        self.assertEqual(self.app.tasks["task-1"]["thread_id"], "thread-1")
+        worker_ids = {identifier for method, identifier in self.fake.calls if method == "prepare_snapshot"}
+        self.assertEqual(worker_ids, {self.app.worker.ident})
+
+    def test_prepare_snapshot_only_available_for_idle_or_paused(self):
+        button = self.app.buttons["prepare_snapshot"]
+        for state in ("idle", "paused", "working", "running", "queued", "needs_reconcile",
+                      "creating", "pausing", "summarizing", "verifying", "blocked", "completed", "unknown"):
+            with self.subTest(state=state):
+                self.fake.tasks[0]["state"] = state
+                self.wait_for(lambda: self.app.tasks["task-1"]["state"] == state)
+                self.assertEqual(button.instate(["disabled"]), state not in ("idle", "paused"))
+                if state not in ("idle", "paused"):
+                    button.invoke()
+                    self.assertFalse(self.fake.prepared_task_ids)
+        self.fake.tasks.clear()
+        self.wait_for(lambda: self.app.selected_id is None)
+        self.assertTrue(button.instate(["disabled"]))
 
     def test_unsupported_permissions_cannot_be_approved(self):
         self.set_pending({"id": "permission", "method": "item/permissions/requestApproval", "params": {}})
@@ -246,6 +283,45 @@ class TkSmokeTests(unittest.TestCase):
         self.assertEqual(submit.call_args.kwargs["mode"], "read-only")
         self.assertFalse(submit.call_args.kwargs["auto_handoff"])
         self.assertEqual(submit.call_args.kwargs["max_tokens"], 1000)
+
+
+class TkLayoutTests(unittest.TestCase):
+    def test_snapshot_and_existing_actions_visible_at_supported_scaling(self):
+        for dpi in (96, 144):
+            with self.subTest(dpi=dpi):
+                try:
+                    root = tk.Tk()
+                except tk.TclError as error:
+                    self.skipTest(f"Tk display unavailable: {error}")
+                app = None
+                try:
+                    root.tk.call("tk", "scaling", dpi / 72)
+                    app = RelayApp(root, factory=FakeManager)
+                    root.update()
+                    self.assertIn("prepare_snapshot", app.buttons)
+                    for method, button in app.buttons.items():
+                        self.assertTrue(button.winfo_ismapped(), method)
+                        parent = button.master
+                        while parent is not None:
+                            self.assertGreaterEqual(button.winfo_rootx(), parent.winfo_rootx(), method)
+                            self.assertGreaterEqual(button.winfo_rooty(), parent.winfo_rooty(), method)
+                            self.assertLessEqual(button.winfo_rootx() + button.winfo_width(),
+                                                 parent.winfo_rootx() + parent.winfo_width(), method)
+                            self.assertLessEqual(button.winfo_rooty() + button.winfo_height(),
+                                                 parent.winfo_rooty() + parent.winfo_height(), method)
+                            parent = parent.master
+                finally:
+                    if app:
+                        with mock.patch("relay.ui.messagebox.askokcancel", return_value=True):
+                            app.request_close()
+                        deadline = time.monotonic() + 4
+                        while not app.closed and time.monotonic() < deadline:
+                            root.update()
+                            time.sleep(0.005)
+                        app.worker.join(timeout=2)
+                        self.assertFalse(app.worker.is_alive())
+                    if app is None or not app.closed:
+                        root.destroy()
 
 
 if __name__ == "__main__":
