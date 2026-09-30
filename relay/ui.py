@@ -42,6 +42,11 @@ def manager_factory(state_dir=None):
     return Manager(state_dir=state_dir)
 
 
+def needs_attention(task):
+    return not task.get("archived", False) and bool(
+        task.get("state") in ("blocked", "needs_reconcile") or task.get("pending"))
+
+
 class CommandWorker(threading.Thread):
     def __init__(self, factory, state_dir):
         super().__init__(name="context-relay-manager", daemon=False)
@@ -294,7 +299,7 @@ class RelayApp:
         self.root.geometry(f"{width}x{height}+{left}+20")
         self.root.minsize(min(940, width), min(720, height))
         self.root.protocol("WM_DELETE_WINDOW", self.request_close)
-        self.status = tk.StringVar(value="正在连接 Codex…")
+        self.status = tk.StringVar(value="正在读取本机任务…")
         self.details = tk.StringVar(value="选择左侧任务查看详情。")
         self.budget_details = tk.StringVar()
         self.search = tk.StringVar()
@@ -322,6 +327,8 @@ class RelayApp:
         self.search_entry.pack(fill="x", pady=(2, 6))
         self.filter_choice = ttk.Combobox(left, textvariable=self.state_filter, values=FILTERS, state="readonly")
         self.filter_choice.pack(fill="x", pady=(0, 6))
+        self.attention_button = ttk.Button(left, command=self._show_attention)
+        self.attention_button.pack(fill="x", pady=(0, 8))
         organize = ttk.Frame(left)
         organize.pack(fill="x", pady=(0, 8))
         self.buttons = {}
@@ -419,6 +426,12 @@ class RelayApp:
         self.tasks = {task["id"]: task for task in tasks}
         self._apply_filters()
 
+    def _show_attention(self):
+        if self.closing or not self.attention_count:
+            return
+        self.search.set("")
+        self.state_filter.set("待处理")
+
     def _apply_filters(self):
         query, state_filter = self.search.get().strip().casefold(), self.state_filter.get()
         visible = []
@@ -428,7 +441,7 @@ class RelayApp:
             state = task.get("state")
             if state_filter == "运行中" and state not in ACTIVE:
                 continue
-            if state_filter == "待处理" and state not in ("blocked", "needs_reconcile") and not task.get("pending"):
+            if state_filter == "待处理" and not needs_attention(task):
                 continue
             if state_filter == "等待继续" and state not in ("queued", "idle", "paused"):
                 continue
@@ -600,6 +613,9 @@ class RelayApp:
 
     def _controls(self):
         available = self.ready and not self.busy and not self.closing
+        self.attention_count = sum(needs_attention(task) for task in self.tasks.values())
+        self.attention_button.configure(text=f"待处理 {self.attention_count} 项 · 查看",
+                                        state="normal" if self.attention_count and not self.closing else "disabled")
         self.new_button.configure(state="normal" if available else "disabled")
         task = self.tasks.get(self.selected_id) if self.selected_id in self.visible_ids else None
         state = task.get("state") if task else None
@@ -646,7 +662,7 @@ class RelayApp:
                 break
             if kind == "ready":
                 self.ready = True
-                self.status.set("已就绪。新建任务后，点击启动。")
+                self.status.set("本机任务已加载；启动任务时连接 Codex。")
             elif kind == "tasks":
                 self._render_tasks(value)
             elif kind == "command_done":

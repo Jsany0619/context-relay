@@ -770,6 +770,9 @@ class Manager:
                         if task["state"] in BUSY:
                             self._failed(task, RuntimeError("Codex 连接关闭，执行结果待核对。"))
                     self._loaded.clear()
+                    self._raw_requests.clear()
+                    self._messages.clear()
+                    self._session_config.clear()
                     self.client.close()
                     self.client = None
                     self._configured = False

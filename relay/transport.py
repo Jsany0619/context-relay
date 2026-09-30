@@ -211,23 +211,59 @@ class CodexClient:
 
     def _read_messages(self) -> None:
         assert self._process.stdout is not None
-        for line in self._process.stdout:
-            if not line.strip():
-                continue
-            try:
-                message = json.loads(line)
-                if not isinstance(message, dict):
-                    raise ValueError("message is not an object")
-            except (json.JSONDecodeError, ValueError) as error:
-                self._events.put({"method": "transport/protocolError", "params": {"error": str(error)}})
-                continue
-            if "id" in message and "method" not in message and ("result" in message or "error" in message):
-                self._accept_response(message)
-            elif isinstance(message.get("method"), str):
-                self._events.put(message)
-            else:
-                self._events.put({"method": "transport/protocolError", "params": {"error": "invalid message shape"}})
-        self._finish_closed()
+        try:
+            while True:
+                try:
+                    line = self._process.stdout.readline()
+                except (UnicodeError, OSError, ValueError):
+                    self._protocol_failure()
+                    return
+                if not line:
+                    return
+                if not line.strip():
+                    continue
+                try:
+                    message = json.loads(line)
+                    kind = self._message_kind(message)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    self._protocol_failure()
+                    return
+                if kind == "response":
+                    self._accept_response(message)
+                else:
+                    self._events.put(message)
+        finally:
+            self._finish_closed()
+
+    @staticmethod
+    def _message_kind(message: Any) -> str:
+        if not isinstance(message, dict):
+            raise ValueError("invalid message")
+        has_id = "id" in message
+        if has_id and (not isinstance(message["id"], (str, int)) or isinstance(message["id"], bool)):
+            raise ValueError("invalid message")
+        if "method" in message:
+            if not isinstance(message["method"], str) or not message["method"]:
+                raise ValueError("invalid message")
+            if "params" in message and not isinstance(message["params"], dict):
+                raise ValueError("invalid message")
+            if "result" in message or "error" in message:
+                raise ValueError("invalid message")
+            return "method"
+        has_result, has_error = "result" in message, "error" in message
+        if not has_id or has_result == has_error:
+            raise ValueError("invalid message")
+        if has_error:
+            error = message["error"]
+            if (not isinstance(error, dict)
+                    or not isinstance(error.get("code"), int) or isinstance(error.get("code"), bool)
+                    or not isinstance(error.get("message"), str)):
+                raise ValueError("invalid message")
+        return "response"
+
+    def _protocol_failure(self) -> None:
+        self._events.put({"method": "transport/protocolError",
+                          "params": {"error": "invalid or unreadable app-server stream"}})
 
     def _accept_response(self, message: dict[str, Any]) -> None:
         request_id = message["id"]

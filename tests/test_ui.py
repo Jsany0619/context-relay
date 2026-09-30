@@ -309,6 +309,62 @@ class TkSmokeTests(unittest.TestCase):
         confirm.assert_called_once()
         self.assertFalse(self.app.closing)
 
+    def test_attention_entry_recovers_filtered_error_without_control_calls(self):
+        self.fake.tasks[0]["state"] = "running"
+        self.wait_for(lambda: self.app.tasks["task-1"]["state"] == "running")
+        self.app.state_filter.set("运行中")
+        self.app.message_text.insert("1.0", "留给原任务的草稿")
+        self.fake.tasks[0].update(state="needs_reconcile", error="连接已断开，需核对执行结果")
+        self.wait_for(lambda: self.app.tasks["task-1"]["state"] == "needs_reconcile")
+        self.assertEqual(self.app.state_filter.get(), "运行中")
+        self.assertEqual(self.app.task_tree.get_children(), ())
+        self.assertIsNone(self.app.selected_id)
+        self.assertTrue(self.app.buttons["reconcile"].instate(["disabled"]))
+        self.assertEqual(self.app.attention_count, 1)
+        self.assertIn("待处理 1 项", self.app.attention_button.cget("text"))
+        calls = [method for method, _ in self.fake.calls if method not in ("poll", "list_tasks")]
+        with mock.patch.object(self.app, "submit", wraps=self.app.submit) as submit:
+            self.app.attention_button.invoke()
+            self.root.update()
+        submit.assert_not_called()
+        self.assertEqual(calls, [method for method, _ in self.fake.calls if method not in ("poll", "list_tasks")])
+        self.assertEqual(self.app.state_filter.get(), "待处理")
+        self.assertEqual(self.app.selected_id, "task-1")
+        self.assertFalse(self.app.buttons["reconcile"].instate(["disabled"]))
+        self.assertEqual(self.app.message_text.get("1.0", "end-1c"), "留给原任务的草稿")
+
+    def test_attention_counts_tasks_ignores_search_and_archive_then_clears(self):
+        self.fake.tasks[0]["pending"] = [{"id": 1, "method": "unsupported"}, {"id": 2, "method": "unsupported"}]
+        self.add_task(state="blocked", archived=True)
+        self.wait_for(lambda: len(self.app.tasks["task-1"]["pending"]) == 2)
+        self.app.search.set("没有匹配项")
+        self.assertEqual(self.app.task_tree.get_children(), ())
+        self.assertEqual(self.app.attention_count, 1)
+        self.app.attention_button.invoke()
+        self.assertEqual(self.app.search.get(), "")
+        self.assertEqual(self.app.task_tree.get_children(), ("task-1",))
+        self.fake.tasks[0]["pending"] = []
+        self.wait_for(lambda: self.app.tasks["task-1"]["pending"] == [])
+        self.assertEqual(self.app.attention_count, 0)
+        self.assertTrue(self.app.attention_button.instate(["disabled"]))
+
+    def test_attention_browsing_allowed_while_busy_but_disabled_during_close(self):
+        self.fake.tasks[0]["state"] = "blocked"
+        self.wait_for(lambda: self.app.tasks["task-1"]["state"] == "blocked")
+        self.app.search.set("hidden")
+        try:
+            self.app.busy = True
+            self.app._controls()
+            self.assertFalse(self.app.attention_button.instate(["disabled"]))
+            self.app.attention_button.invoke()
+            self.assertEqual(self.app.selected_id, "task-1")
+            self.assertTrue(self.app.buttons["reconcile"].instate(["disabled"]))
+            self.app.closing = True
+            self.app._controls()
+            self.assertTrue(self.app.attention_button.instate(["disabled"]))
+        finally:
+            self.app.busy = self.app.closing = False
+
     def test_archive_unarchive_completed_task_and_legacy_visibility(self):
         self.assertNotIn("archived", self.app.tasks["task-1"])
         self.assertTrue(self.app.buttons["set_archived"].instate(["disabled"]))
@@ -602,7 +658,8 @@ class TkLayoutTests(unittest.TestCase):
                     self.assertIn("get_task", app.buttons)
                     self.assertIn("update_settings", app.buttons)
                     self.assertIn("已达预算", app.budget_details.get())
-                    for method, button in dict(app.buttons, budget_label=app.budget_label).items():
+                    for method, button in dict(app.buttons, budget_label=app.budget_label,
+                                               attention_button=app.attention_button).items():
                         self.assertTrue(button.winfo_ismapped(), method)
                         parent = button.master
                         while parent is not None:

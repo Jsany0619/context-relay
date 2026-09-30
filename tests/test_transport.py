@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import queue
 import subprocess
 import sys
 import threading
@@ -43,6 +44,7 @@ def _fake_server(mode: str) -> None:
         requests = [_read(), _read()]
         _write({"method": "fake/notice", "params": {"ok": True}})
         _write({"id": "server-1", "method": "fake/approve", "params": {"x": 1}})
+        _write({"id": "orphan-1", "result": {"ok": "orphan"}})
         for request in reversed(requests):
             _write({"id": request["id"], "result": {"method": request["method"]}})
     elif mode == "respond":
@@ -59,6 +61,25 @@ def _fake_server(mode: str) -> None:
         _write({"id": request["id"], "error": {"code": -32001, "message": "nope", "data": {"why": "fake"}}})
     elif mode == "pending-eof":
         _read()
+    elif mode.startswith("invalid-"):
+        request = _read()
+        if mode == "invalid-id":
+            _write({"id": [], "result": {"secret": "DO-NOT-LEAK"}})
+            _write({"id": request["id"], "result": {"accepted": "must-not-win"}})
+        elif mode == "invalid-bool-id":
+            _write({"id": True, "result": {"secret": "DO-NOT-LEAK"}})
+        elif mode == "invalid-error":
+            _write({"id": request["id"], "error": {
+                "code": "DO-NOT-LEAK", "message": {"secret": "DO-NOT-LEAK"}}})
+        elif mode == "invalid-params":
+            _write({"method": "fake/notice", "params": ["DO-NOT-LEAK"]})
+        elif mode == "invalid-json":
+            sys.stdout.write('{"secret":"DO-NOT-LEAK"\n')
+            sys.stdout.flush()
+        elif mode == "invalid-utf8":
+            sys.stdout.buffer.write(b"\xffDO-NOT-LEAK\n")
+            sys.stdout.buffer.flush()
+        time.sleep(10)
 
 
 def _command(mode: str) -> list[str]:
@@ -73,6 +94,17 @@ def _wait_for_event(client: CodexClient, method: str, timeout: float = 2.0) -> d
                 return event
         time.sleep(0.01)
     raise AssertionError(f"event {method!r} did not arrive")
+
+
+def _wait_for_methods(client: CodexClient, methods: set[str], timeout: float = 2.0) -> list[dict]:
+    deadline = time.monotonic() + timeout
+    events = []
+    while time.monotonic() < deadline:
+        events.extend(client.drain_events())
+        if methods <= {event.get("method") for event in events}:
+            return events
+        time.sleep(0.01)
+    raise AssertionError(f"events {methods!r} did not all arrive; got {events!r}")
 
 
 class TransportTests(unittest.TestCase):
@@ -100,6 +132,8 @@ class TransportTests(unittest.TestCase):
         events = client.drain_events()
         self.assertIn({"method": "fake/notice", "params": {"ok": True}}, events)
         self.assertIn({"id": "server-1", "method": "fake/approve", "params": {"x": 1}}, events)
+        self.assertIn({"method": "transport/orphanResponse", "params": {
+            "requestId": "orphan-1", "response": {"id": "orphan-1", "result": {"ok": "orphan"}}}}, events)
 
     def test_responds_to_server_request(self) -> None:
         client = CodexClient(_command("respond"))
@@ -145,6 +179,52 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, -32000)
         event = _wait_for_event(client, "transport/closed")
         self.assertIn("returncode", event["params"])
+
+    def test_invalid_server_frames_fail_closed_without_leaking_payload(self) -> None:
+        for mode in ("invalid-id", "invalid-bool-id", "invalid-error", "invalid-params",
+                     "invalid-json", "invalid-utf8"):
+            with self.subTest(mode=mode):
+                client = CodexClient(_command(mode))
+                try:
+                    with self.assertRaises(RpcError) as raised:
+                        client.request("fake/pending", {"safe": True}, timeout=1)
+                    self.assertNotIsInstance(raised.exception, RequestTimeout)
+                    self.assertNotIn("DO-NOT-LEAK", str(raised.exception))
+                    events = _wait_for_methods(
+                        client, {"transport/protocolError", "transport/closed"})
+                    serialized = json.dumps(events)
+                    self.assertNotIn("DO-NOT-LEAK", serialized)
+                    client._reader.join(1)
+                    self.assertFalse(client._reader.is_alive())
+                finally:
+                    client.close()
+                self.assertIsNotNone(client._process.poll())
+
+    def test_read_error_is_generic_and_closes_transport(self) -> None:
+        class BrokenOutput:
+            def readline(self):
+                raise OSError("DO-NOT-LEAK")
+
+        class StoppedProcess:
+            stdout = BrokenOutput()
+
+            @staticmethod
+            def poll():
+                return 9
+
+        client = CodexClient.__new__(CodexClient)
+        client._process = StoppedProcess()
+        client._state_lock = threading.Lock()
+        client._pending = {}
+        client._events = queue.SimpleQueue()
+        client._closed = False
+
+        client._read_messages()
+
+        events = client.drain_events()
+        self.assertEqual([event["method"] for event in events],
+                         ["transport/protocolError", "transport/closed"])
+        self.assertNotIn("DO-NOT-LEAK", json.dumps(events))
 
 
 if __name__ == "__main__":

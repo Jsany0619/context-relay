@@ -35,6 +35,8 @@ A start receipt does not mean the native turn has begun. An immediate pause is p
 
 The skill installer below does **not** install or start the manager; the two entry points remain separate.
 
+The Windows single-user Codex core is implemented; the full remote/multi-tool platform is not. See the [framework map and remaining gaps](docs/architecture.md) for implemented modules, version-specific evidence, and delivery/backup/diagnostic work still needed.
+
 ## Standalone skill triggers
 
 | Verified signal | Response |
@@ -106,7 +108,7 @@ The installer has **6 passing tests** covering previews, backups, configuration 
 python -m unittest -v test_install.py
 ```
 
-The settings/budget follow-up passed **107 manager tests** (38 controller, 5 transport, 29 Tk, 7 snapshot, 12 recovery, 6 local organization, 10 settings). The 71 standalone runtime and 6 installer tests were also rerun successfully: **184 tests total**. Manager tests use simulated controllers or servers and real Tk widgets. The first-version validation on 2026-09-30 used Windows, Python 3.13.2, Tk 8.6.15, and Codex 0.153.4. Run the manager suite separately:
+The connection-recovery follow-up passed **117 manager tests** (38 controller, 7 transport, 32 Tk, 7 snapshot, 12 recovery, 6 local organization, 10 settings, 5 disconnect). The 71 standalone runtime and 6 installer tests were also rerun successfully: **194 tests total**. Manager tests use simulated controllers or servers and real Tk widgets. The first-version validation on 2026-09-30 used Windows, Python 3.13.2, Tk 8.6.15, and Codex 0.153.4. Run the manager suite separately:
 
 ```shell
 python -m unittest discover -s tests -v
@@ -118,7 +120,9 @@ A separate native counter task on 2026-09-30, validating the first manager versi
 
 The reliability version (`8e429e0`) passed a native run on 2026-09-30 with Codex 0.153.4 covering immediate pause, confirmed interruption, close/reopen, read-only reconciliation, and explicit continuation. The product waited for the matching native `turn/started` before sending its interrupt. The same task and thread remained at generation 0; a distinct read-only turn returned the unique test-file contents without changing its hash, with no approval responses. Manual preparation then saved a `preparatory`, `ready=false` draft with the matching file hash, issuing only `thread/read` and no new turn or thread. An earlier timing failure retained its unknown outcome without retry and prompted the pause-ordering fix.
 
-Local organization was verified with a real Manager/Tk window and disposable data. The current settings follow-up also passed a reached-budget task through renaming, higher limits and disabling automatic handoff: consumed usage and paused state remained intact, the UI enabled explicit continuation, stale checkpoints were invalidated, and saving issued zero native requests. Project files were unchanged and windows/workers closed. These local checks do not rerun native handoff or interrupted inference.
+Local organization was verified with a real Manager/Tk window and disposable data. The previous settings follow-up also passed a reached-budget task through renaming, higher limits and disabling automatic handoff: consumed usage and paused state remained intact, the UI enabled explicit continuation, stale checkpoints were invalidated, and saving issued zero native requests. Project files were unchanged and windows/workers closed. These local checks do not rerun native handoff or interrupted inference.
+
+The current recovery checks use local fake RPC subprocesses to verify that malformed messages release pending requests and the dead connection. Old approval/message caches are cleared, explicit reconciliation reconnects read-only, and unknown requests are never replayed. A separate real Manager/Tk exercise injected a simulated disconnect: the failed task remained discoverable through the global attention count despite a running-only filter, its input draft survived, and viewing it issued zero native requests or approval replies. These checks do not establish real network-loss, system-crash or power-loss recovery.
 
 High-context automatic triggering has only simulated coverage. Physical sleep, power loss, network loss, crashes, and other environments have not been tested live. The controlled read-only recovery example does not establish recovery of every interrupted external operation.
 
