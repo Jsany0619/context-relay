@@ -15,3 +15,4 @@ tasks.sqlite3*
 manager.lock
 checkpoints/
 drafts/
+context-relay-backup*.zip

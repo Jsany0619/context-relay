@@ -118,12 +118,29 @@ class Manager:
         except OSError:
             self._file_lock.close()
             raise RuntimeError("这个状态目录已有管理器运行，请回到现有窗口。") from None
-        self.db = sqlite3.connect(str(self.root / "tasks.sqlite3"), check_same_thread=False)
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA synchronous=FULL")
-        self.db.execute("CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, data TEXT NOT NULL)")
-        self.db.execute("CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY, task_id TEXT, at TEXT, kind TEXT, data TEXT)")
-        self.db.commit()
+        self.recovery_info = None
+        try:
+            self.db = sqlite3.connect(str(self.root / "tasks.sqlite3"), check_same_thread=False)
+            self.db.execute("PRAGMA trusted_schema=OFF")
+            if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='recovery'").fetchone():
+                rows = self.db.execute("SELECT data FROM recovery").fetchall()
+                if len(rows) != 1:
+                    raise ValueError("恢复库只读标记无效。")
+                self.recovery_info = json.loads(rows[0][0])
+                if not isinstance(self.recovery_info, dict) or self.recovery_info.get("mode") != "inspection":
+                    raise ValueError("恢复库只读标记无效。")
+                self.db.execute("PRAGMA query_only=ON")
+            else:
+                self.db.execute("PRAGMA journal_mode=WAL")
+                self.db.execute("PRAGMA synchronous=FULL")
+                self.db.execute("CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, data TEXT NOT NULL)")
+                self.db.execute("CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY, task_id TEXT, at TEXT, kind TEXT, data TEXT)")
+                self.db.commit()
+        except Exception:
+            if hasattr(self, "db"):
+                self.db.close()
+            self._file_lock.close()
+            raise
         self.client = client
         self._configured = False
         self._connection_id = uuid.uuid4().hex
@@ -131,12 +148,17 @@ class Manager:
         self._loaded = set()
         self._raw_requests = {}
         self._messages = {}
-        for task in self.list_tasks():
+        for task in ([] if self.recovery_info else self.list_tasks()):
             if task["state"] in BUSY or task["pending"]:
                 task.update(state="needs_reconcile", pending=[], error="上次运行未正常收束；先核对原会话和在途操作。")
                 self._save(task, "restart_requires_reconciliation")
 
+    def _require_writable(self):
+        if self.recovery_info:
+            raise ValueError("恢复库只读，仅供查看和导出；不能启动、审批或接管历史任务。")
+
     def _connect(self):
+        self._require_writable()
         if self.client is None:
             from .transport import CodexClient
             self.client = CodexClient()
@@ -151,6 +173,7 @@ class Manager:
         return self.client
 
     def _save(self, task, kind=None, data=None):
+        self._require_writable()
         task["updated_at"] = handoff_rules.now()
         with self.db:
             self.db.execute("INSERT OR REPLACE INTO tasks VALUES (?,?)",
@@ -178,6 +201,7 @@ class Manager:
 
     def set_archived(self, task_id, archived):
         with self._lock:
+            self._require_writable()
             if not isinstance(archived, bool):
                 raise ValueError("归档标记必须是布尔值。")
             task = self._task(task_id)
@@ -191,6 +215,7 @@ class Manager:
 
     def create_task(self, title, cwd, goal, mode="read-only", auto_handoff=False, max_tokens=0, max_minutes=0):
         with self._lock:
+            self._require_writable()
             if mode not in ("read-only", "workspace-write"):
                 raise ValueError("首版只支持只读或工作区写入。")
             if not title.strip() or not goal.strip():
@@ -223,6 +248,7 @@ class Manager:
 
     def update_settings(self, task_id, *, title, max_tokens, max_minutes, auto_handoff):
         with self._lock:
+            self._require_writable()
             task = self._task(task_id)
             if (task.get("archived") or task["state"] not in ("queued", "idle", "paused")
                     or task["inflight"] or task["intent"] or task["pending"] or task["receiver_id"]
@@ -368,6 +394,7 @@ class Manager:
 
     def start(self, task_id, message=None):
         with self._lock:
+            self._require_writable()
             task = self._task(task_id)
             if task.get("archived") or task["state"] not in ("queued", "idle", "paused"):
                 raise ValueError("任务还不能继续，请先暂停或核对恢复。")
@@ -405,6 +432,7 @@ class Manager:
 
     def pause(self, task_id):
         with self._lock:
+            self._require_writable()
             task = self._task(task_id)
             if task["state"] in ("idle", "queued", "paused"):
                 task["state"] = "paused"
@@ -443,6 +471,7 @@ class Manager:
 
     def reconcile(self, task_id):
         with self._lock:
+            self._require_writable()
             task = self._task(task_id)
             if task.get("archived"):
                 raise ValueError("请先取消本地归档，再核对任务。")
@@ -493,6 +522,7 @@ class Manager:
 
     def prepare_snapshot(self, task_id):
         with self._lock:
+            self._require_writable()
             task = self._task(task_id)
             if (task["state"] not in ("idle", "paused") or not task["thread_id"] or task["intent"]
                     or task["inflight"] or task["pending"] or task["receiver_id"]):
@@ -522,6 +552,7 @@ class Manager:
 
     def handoff(self, task_id):
         with self._lock:
+            self._require_writable()
             task = self._task(task_id)
             if task["state"] != "idle" or task["inflight"] or task["pending"]:
                 raise ValueError("交接只能在工作轮次结束且无在途操作时进行。")
@@ -632,6 +663,7 @@ class Manager:
 
     def answer(self, task_id, request_id, answer):
         with self._lock:
+            self._require_writable()
             task = self._task(task_id)
             matches = [r for r in task["pending"] if r["id"] == request_id]
             if not matches or task["state"] not in ("running", "summarizing", "verifying"):
@@ -741,7 +773,7 @@ class Manager:
 
     def poll(self):
         with self._lock:
-            if not self.client or self._closed:
+            if self.recovery_info or not self.client or self._closed:
                 return
             for event in self.client.drain_events():
                 method, params = event.get("method", ""), event.get("params", {})
@@ -853,6 +885,7 @@ class Manager:
 
     def finish(self, task_id):
         with self._lock:
+            self._require_writable()
             task = self._task(task_id)
             if task["state"] not in ("idle", "paused", "queued") or task["inflight"]:
                 raise ValueError("先收束执行并核对结果，再标记完成。")
@@ -860,11 +893,30 @@ class Manager:
             self._save(task, "user_marked_complete")
             return task
 
+    def backup_state(self, destination):
+        with self._lock:
+            self._require_writable()
+            if self._closed:
+                raise ValueError("管理器已经关闭。")
+            tasks = self.list_tasks()
+            if any(task["state"] in BUSY or task["pending"] for task in tasks):
+                raise ValueError("请先暂停正在执行的任务并处理待审批请求，再备份。")
+            path = Path(destination).resolve()
+            if path.is_relative_to(self.root) or any(path.is_relative_to(Path(task["cwd"]).resolve()) for task in tasks):
+                raise ValueError("备份必须保存在管理器状态及项目目录之外。")
+            from .backup import create_backup
+            return create_backup(self.db, self.root, destination)
+
     def export_task(self, task_id, destination):
         with self._lock:
             task = self.get_task(task_id)
             handoff_rules.reject_sensitive(task)
             path = Path(destination).resolve()
+            if self.recovery_info:
+                protected = [self.root, Path(self.recovery_info["source_state_dir"]).resolve()]
+                protected.extend(Path(item["cwd"]).resolve() for item in self.list_tasks())
+                if any(path.is_relative_to(root) for root in protected):
+                    raise ValueError("恢复库只读，请把导出文件保存在状态和原项目目录之外。")
             if path.exists():
                 raise ValueError("导出文件已存在，请选择新文件名。")
             handoff_rules.atomic_json(path, task)
@@ -875,7 +927,7 @@ class Manager:
             if self._closed:
                 return
             self.stop_requested.set()
-            if self.client:
+            if self.client and not self.recovery_info:
                 for task in self.list_tasks():
                     if task["state"] in BUSY and task["turn_id"]:
                         try:
@@ -889,8 +941,8 @@ class Manager:
                 for task in self.list_tasks():
                     if task["state"] in BUSY:
                         self._failed(task, RuntimeError("关闭时未确认停止；下次启动需核对。"))
-                if self.client:
-                    self.client.close()
+            if self.client:
+                self.client.close()
             self._closed = True
             self.db.close()
             if os.name == "nt":

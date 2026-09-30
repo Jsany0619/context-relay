@@ -63,7 +63,7 @@ class CommandWorker(threading.Thread):
             self.events.put(("startup_error", str(error)))
             return
         previous, last_poll_error = None, None
-        self.events.put(("ready", None))
+        self.events.put(("ready", deepcopy(getattr(manager, "recovery_info", None))))
         while True:
             if self.stop_requested.is_set():
                 while True:
@@ -286,6 +286,7 @@ class RelayApp:
         self.rendered_task_id = None
         self.message_drafts = {}
         self.visible_ids = set()
+        self.recovery_info = None
         self.ready = False
         self.busy = False
         self.closing = False
@@ -315,13 +316,20 @@ class RelayApp:
         compact = self.root.winfo_screenheight() < 900
         ttk.Label(self.root, text="Context Relay", font=("Segoe UI", 17, "bold")).pack(anchor="w", padx=16, pady=(12, 0))
         ttk.Label(self.root, text="仅管理这里创建的任务；现有聊天不会自动导入。", foreground="#555555").pack(anchor="w", padx=16, pady=(0, 8))
+        self.recovery_banner = ttk.Label(self.root, wraplength=1140, justify="left", foreground="#8a3b00")
         panes = ttk.Panedwindow(self.root, orient="horizontal")
+        self.panes = panes
         panes.pack(fill="both", expand=True, padx=12)
         left, right = ttk.Frame(panes, padding=4), ttk.Frame(panes, padding=4)
         panes.add(left, weight=1)
         panes.add(right, weight=4)
         self.new_button = ttk.Button(left, text="新建任务", command=lambda: NewTaskDialog(self.root, self.submit))
         self.new_button.pack(fill="x", pady=(0, 8))
+        self.backup_button = ttk.Button(left, text="备份管理器", command=self._backup)
+        self.backup_button.pack(fill="x", pady=(0, 4))
+        self.backup_notice = ttk.Label(left, text="本地明文记录；不含项目文件、Codex 登录或原生聊天。",
+                                       wraplength=240, justify="left", foreground="#555555")
+        self.backup_notice.pack(fill="x", pady=(0, 8))
         ttk.Label(left, text="搜索名称、目标或目录").pack(anchor="w")
         self.search_entry = ttk.Entry(left, textvariable=self.search)
         self.search_entry.pack(fill="x", pady=(2, 6))
@@ -389,13 +397,25 @@ class RelayApp:
     def submit(self, method, *args, **kwargs):
         if not self.ready or self.busy or self.closing:
             return False
-        if method != "create_task" and args and args[0] not in self.visible_ids:
+        if self.recovery_info is not None and method not in ("get_task", "export_task"):
+            self.status.set("恢复库为永久只读检视，不能继续任务或修改记录。")
+            return False
+        if method not in ("create_task", "backup_state") and args and args[0] not in self.visible_ids:
             return False
         self.busy = True
         self.status.set("正在处理，请稍候…")
         self._controls()
         self.worker.commands.put((method, args, kwargs))
         return True
+
+    def _backup(self):
+        if self.backup_button.instate(["disabled"]):
+            return
+        destination = filedialog.asksaveasfilename(parent=self.root, title="保存新的管理器备份（本地明文）",
+                                                  defaultextension=".zip", initialfile="context-relay-backup.zip",
+                                                  filetypes=(("ZIP", "*.zip"),), confirmoverwrite=False)
+        if destination:
+            self.submit("backup_state", destination)
 
     def _action(self, method):
         if self.selected_id not in self.visible_ids or self.buttons[method].instate(["disabled"]):
@@ -560,7 +580,10 @@ class RelayApp:
             if paths:
                 summary = "拟修改文件：\n" + "\n".join(paths) + "\n\n"
         set_text(self.request_text, summary + json.dumps(details, ensure_ascii=False, indent=2))
-        if request.get("method") in APPROVALS:
+        if self.recovery_info is not None:
+            ttk.Label(self.answer_frame, text="备份中的历史请求：只读检视，不能审批、回答或继续。",
+                      wraplength=780, foreground="#8a3b00").pack(anchor="w")
+        elif request.get("method") in APPROVALS:
             if not self._has_action(request):
                 ttk.Label(self.answer_frame, text="动作资料不完整，暂不能允许；可拒绝或核对恢复。",
                           foreground="#8a3b00").pack(side="left", padx=(0, 6))
@@ -613,17 +636,21 @@ class RelayApp:
 
     def _controls(self):
         available = self.ready and not self.busy and not self.closing
+        inspection = self.recovery_info is not None
         self.attention_count = sum(needs_attention(task) for task in self.tasks.values())
         self.attention_button.configure(text=f"待处理 {self.attention_count} 项 · 查看",
                                         state="normal" if self.attention_count and not self.closing else "disabled")
-        self.new_button.configure(state="normal" if available else "disabled")
+        self.new_button.configure(state="normal" if available and not inspection else "disabled")
+        backup_safe = not any(task.get("state") in ACTIVE or task.get("pending") for task in self.tasks.values())
+        self.backup_button.configure(state="normal" if available and not inspection and backup_safe else "disabled")
+        self.message_text.configure(state="disabled" if inspection else "normal")
         task = self.tasks.get(self.selected_id) if self.selected_id in self.visible_ids else None
         state = task.get("state") if task else None
         archived = bool(task and task.get("archived", False))
         quiet = bool(task) and not any(
             task.get(key) for key in ("inflight", "intent", "pending", "receiver_id")) and task.get("run_started") is None
         can_archive = quiet and state == "completed"
-        budget = budget_status(task) if task else None
+        budget = budget_status(dict(task, run_started=None) if inspection else task) if task else None
         if task:
             limit = f"{task['max_minutes']:g}" if task.get("max_minutes") else "不限"
             text = (f"已记录用时（分钟）：{budget['elapsed_seconds'] / 60:.2f} / {limit}  ·  "
@@ -646,11 +673,13 @@ class RelayApp:
         if archived:
             for method in ("start", "pause", "prepare_snapshot", "handoff", "finish", "reconcile"):
                 allowed[method] = False
+        if inspection:
+            allowed = {method: bool(task) and method in ("get_task", "export_task") for method in allowed}
         self.buttons["set_archived"].configure(text="取消归档" if archived else "归档")
         for method, button in self.buttons.items():
             button.configure(state="normal" if available and allowed[method] else "disabled")
         request = self._current_request()
-        allow_approval = available and request and request.get("method") in APPROVALS
+        allow_approval = available and not inspection and request and request.get("method") in APPROVALS
         self.approval_decline.configure(state="normal" if allow_approval else "disabled")
         self.approval_allow.configure(state="normal" if allow_approval and self._has_action(request) else "disabled")
 
@@ -662,7 +691,15 @@ class RelayApp:
                 break
             if kind == "ready":
                 self.ready = True
-                self.status.set("本机任务已加载；启动任务时连接 Codex。")
+                self.recovery_info = value
+                if value is not None:
+                    self.recovery_banner.configure(text=(
+                        "恢复库 · 永久只读检视。下列为备份历史状态，并非当前执行状态；不能继续任务，只能浏览和导出。\n"
+                        f"备份时间：{value.get('backup_created_at', '未知')}  ·  恢复时间：{value.get('restored_at', '未知')}"))
+                    self.recovery_banner.pack(fill="x", padx=16, pady=(0, 8), before=self.panes)
+                    self.status.set("恢复库已加载；不连接 Codex，只检视本地历史记录。")
+                else:
+                    self.status.set("本机任务已加载；启动任务时连接 Codex。")
             elif kind == "tasks":
                 self._render_tasks(value)
             elif kind == "command_done":
@@ -683,9 +720,13 @@ class RelayApp:
                         self.message_text.delete("1.0", "end")
                 if method == "get_task" and isinstance(result, dict) and not self.closing:
                     HistoryWindow(self.root, result)
-                self.status.set("已导出任务记录。" if method == "export_task" else
-                                "设置已保存；未启动任务。" if method == "update_settings" else
-                                "操作已处理；以任务状态和实际回复为准。")
+                if method == "backup_state" and isinstance(result, dict):
+                    self.status.set(f"备份已保存：{result['path']}\n任务 {result['task_count']} · 事件 {result['event_count']} · "
+                                    f"文件 {result['file_count']} · 创建时间 {result['created_at']}")
+                else:
+                    self.status.set("已导出任务记录。" if method == "export_task" else
+                                    "设置已保存；未启动任务。" if method == "update_settings" else
+                                    "操作已处理；以任务状态和实际回复为准。")
             elif kind in ("command_error", "poll_error", "startup_error", "close_error"):
                 if kind == "command_error":
                     self.busy = False
@@ -704,7 +745,7 @@ class RelayApp:
     def request_close(self):
         if self.closing or self.closed:
             return
-        active = self.busy or any(task.get("state") in ACTIVE for task in self.tasks.values())
+        active = self.recovery_info is None and (self.busy or any(task.get("state") in ACTIVE for task in self.tasks.values()))
         if active and not messagebox.askokcancel("关闭并中断任务？",
                 "有任务或后台操作正在进行。关闭将先请求中断并清理；结果无法确认的任务会保留为待核对恢复。\n\n选择“取消”保留窗口。",
                 default=messagebox.CANCEL, parent=self.root):
@@ -714,7 +755,8 @@ class RelayApp:
             self.root.destroy()
             return
         self.closing = True
-        self.status.set("正在中断任务并关闭，请保持窗口开启…")
+        self.status.set("正在关闭本地检视窗口…" if self.recovery_info is not None else
+                        "正在中断任务并关闭，请保持窗口开启…")
         self._controls()
         self.worker.stop_requested.set()
 

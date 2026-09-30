@@ -1,6 +1,7 @@
 """Tk integration smoke checks with a fake controller; no Codex sessions are started."""
 from copy import deepcopy
 import gc
+from pathlib import Path
 import tempfile
 import threading
 import time
@@ -8,7 +9,7 @@ import tkinter as tk
 import unittest
 from unittest import mock
 
-from relay.ui import NewTaskDialog, RelayApp
+from relay.ui import CommandWorker, NewTaskDialog, RelayApp
 
 
 class FakeManager:
@@ -19,6 +20,8 @@ class FakeManager:
         self.starts = []
         self.archives = []
         self.settings = []
+        self.backups = []
+        self.backup_error = None
         self.delay = 0
         self.close_delay = 0
         self.close_failures = 0
@@ -79,6 +82,18 @@ class FakeManager:
         task = next(task for task in self.tasks if task["id"] == task_id)
         task.update(values)
         return deepcopy(task)
+
+    def backup_state(self, destination):
+        self.record("backup_state")
+        if self.backup_error:
+            raise OSError(self.backup_error)
+        self.backups.append(destination)
+        return {"path": destination, "task_count": len(self.tasks), "event_count": 4,
+                "file_count": 2, "created_at": "2026-09-30T12:00:00Z"}
+
+    def export_task(self, task_id, destination):
+        self.record("export_task")
+        return {"path": destination}
 
     def pause(self, task_id):
         self.record("pause")
@@ -164,6 +179,91 @@ class TkSmokeTests(unittest.TestCase):
         self.app.buttons["update_settings"].invoke()
         return next(child for child in self.root.winfo_children()
                     if getattr(child, "task_id", None) == self.app.selected_id and hasattr(child, "save"))
+
+    def set_inspection(self):
+        info = {"mode": "inspection", "source_state_dir": self.temp.name,
+                "backup_created_at": "2026-09-30T12:00:00Z", "restored_at": "2026-09-30T13:00:00Z"}
+        self.app.worker.events.put(("ready", info))
+        self.wait_for(lambda: getattr(self.app, "recovery_info", None) == info)
+
+    def test_global_backup_does_not_need_selected_task_and_reports_counts(self):
+        self.app.search.set("no match")
+        self.assertIsNone(self.app.selected_id)
+        destination = str(Path(self.temp.name) / "manager.zip")
+        with mock.patch("relay.ui.filedialog.asksaveasfilename", return_value=destination):
+            self.app.backup_button.invoke()
+        self.wait_for(lambda: self.fake.backups and not self.app.busy)
+        self.assertEqual(self.fake.backups, [destination])
+        self.assertIn(destination, self.app.status.get())
+        self.assertIn("任务 1", self.app.status.get())
+        self.assertIn("事件 4", self.app.status.get())
+        self.assertIn("文件 2", self.app.status.get())
+        self.assertIn("明文", self.app.backup_notice.cget("text"))
+        self.assertIn("原生聊天", self.app.backup_notice.cget("text"))
+        self.assertEqual({identifier for method, identifier in self.fake.calls if method == "backup_state"},
+                         {self.app.worker.ident})
+
+    def test_backup_failure_keeps_message_draft_and_pending_or_active_tasks_disable_it(self):
+        self.app.message_text.insert("1.0", "不能丢失的补充说明")
+        self.fake.backup_error = "目标文件已存在"
+        with mock.patch("relay.ui.filedialog.asksaveasfilename", return_value="already-exists.zip"):
+            self.app.backup_button.invoke()
+        self.wait_for(lambda: not self.app.busy and "目标文件已存在" in self.app.status.get())
+        self.assertEqual(self.app.message_text.get("1.0", "end-1c"), "不能丢失的补充说明")
+        self.add_task(state="running")
+        self.app.search.set("测试任务")
+        self.assertTrue(self.app.backup_button.instate(["disabled"]))
+        self.fake.tasks[1].update(state="paused", pending=[{"id": "pending"}])
+        self.wait_for(lambda: self.app.tasks["task-other"]["state"] == "paused")
+        self.assertTrue(self.app.backup_button.instate(["disabled"]))
+        self.fake.tasks[1]["pending"] = []
+        self.wait_for(lambda: not self.app.backup_button.instate(["disabled"]))
+
+    def test_inspection_blocks_mutations_and_questions_but_allows_local_inspection(self):
+        self.set_inspection()
+        self.assertIn("永久只读", self.app.recovery_banner.cget("text"))
+        self.assertIn("并非当前", self.app.recovery_banner.cget("text"))
+        self.assertIn("不能继续", self.app.recovery_banner.cget("text"))
+        self.assertTrue(self.app.new_button.instate(["disabled"]))
+        self.assertTrue(self.app.backup_button.instate(["disabled"]))
+        for method in ("start", "pause", "handoff", "reconcile", "finish", "prepare_snapshot", "update_settings", "set_archived"):
+            self.assertTrue(self.app.buttons[method].instate(["disabled"]), method)
+            self.assertFalse(self.app.submit(method, "task-1"), method)
+        self.assertFalse(self.app.submit("create_task", title="不可创建"))
+        self.assertFalse(self.app.submit("backup_state", "backup.zip"))
+        self.assertFalse(self.app.submit("answer", "task-1", 1, {"decision": "accept"}))
+        self.set_pending({"id": 1, "method": "item/commandExecution/requestApproval", "params": {"command": "echo test"}})
+        self.assertTrue(self.app.approval_allow.instate(["disabled"]))
+        self.assertTrue(self.app.approval_decline.instate(["disabled"]))
+        self.app._answer_approval("decline")
+        self.assertFalse(self.fake.answers)
+        self.set_pending({"id": 2, "method": "item/tool/requestUserInput", "params": {
+            "questions": [{"id": "q", "question": "历史问题"}]}})
+        self.assertFalse(self.app.question_values)
+        self.assertFalse(any(child.winfo_manager() and child.winfo_class() in ("TButton", "TEntry", "TCombobox")
+                             for child in self.app.answer_frame.winfo_children()))
+        self.assertFalse(self.app.buttons["get_task"].instate(["disabled"]))
+        self.assertTrue(self.app.submit("get_task", "task-1"))
+        self.wait_for(lambda: not self.app.busy)
+        self.assertTrue(self.app.submit("export_task", "task-1", "local-inspection.json"))
+        self.wait_for(lambda: not self.app.busy)
+        self.assertFalse(self.fake.starts)
+
+    def test_inspection_close_does_not_interrupt_historical_running_task_or_tick_budget(self):
+        self.set_inspection()
+        self.fake.tasks[0].update(state="running", run_started=100, elapsed_seconds=60)
+        self.wait_for(lambda: self.app.tasks["task-1"]["state"] == "running")
+        with mock.patch("relay.budget.time.time", return_value=100000):
+            self.app._controls()
+            self.assertIn("1.00 /", self.app.budget_details.get())
+        self.fake.close_delay = 0.1
+        with mock.patch("relay.ui.messagebox.askokcancel") as confirm:
+            self.app.request_close()
+        confirm.assert_not_called()
+        self.assertNotIn("中断", self.app.status.get())
+        self.wait_for(lambda: self.app.closed)
+        self.assertTrue(self.fake.closed)
+        self.assertFalse(any(method in ("pause", "start", "answer") for method, _ in self.fake.calls))
 
     def test_settings_bound_to_opened_task_and_only_save(self):
         self.fake.tasks[0].update(max_tokens=500, max_minutes=2.5, auto_handoff=False)
@@ -631,10 +731,24 @@ class TkSmokeTests(unittest.TestCase):
         self.assertEqual(submit.call_args.kwargs["max_tokens"], 1000)
 
 
+class WorkerTests(unittest.TestCase):
+    def test_ready_carries_optional_recovery_metadata(self):
+        manager = FakeManager()
+        manager.recovery_info = {"mode": "inspection", "backup_created_at": "known time"}
+        worker = CommandWorker(lambda state_dir: manager, None)
+        worker.start()
+        try:
+            self.assertEqual(worker.events.get(timeout=2), ("ready", manager.recovery_info))
+        finally:
+            worker.stop_requested.set()
+            worker.join(timeout=2)
+            self.assertFalse(worker.is_alive())
+
+
 class TkLayoutTests(unittest.TestCase):
     def test_snapshot_and_existing_actions_visible_at_supported_scaling(self):
-        for dpi in (95, 96, 144):
-            with self.subTest(dpi=dpi):
+        for dpi, inspection in ((95, False), (96, False), (144, False), (96, True), (144, True)):
+            with self.subTest(dpi=dpi, inspection=inspection):
                 try:
                     root = tk.Tk()
                 except tk.TclError as error:
@@ -645,6 +759,9 @@ class TkLayoutTests(unittest.TestCase):
                     def factory(state_dir=None):
                         manager = FakeManager(state_dir)
                         manager.tasks[0].update(max_minutes=1, elapsed_seconds=60, telemetry_model_valid=False)
+                        if inspection:
+                            manager.recovery_info = {"mode": "inspection", "backup_created_at": "2026-09-30T12:00:00Z",
+                                                     "restored_at": "2026-09-30T13:00:00Z"}
                         return manager
                     app = RelayApp(root, factory=factory)
                     deadline = time.monotonic() + 4
@@ -658,8 +775,11 @@ class TkLayoutTests(unittest.TestCase):
                     self.assertIn("get_task", app.buttons)
                     self.assertIn("update_settings", app.buttons)
                     self.assertIn("已达预算", app.budget_details.get())
-                    for method, button in dict(app.buttons, budget_label=app.budget_label,
-                                               attention_button=app.attention_button).items():
+                    widgets = dict(app.buttons, budget_label=app.budget_label, attention_button=app.attention_button,
+                                   backup_button=app.backup_button, backup_notice=app.backup_notice)
+                    if inspection:
+                        widgets["recovery_banner"] = app.recovery_banner
+                    for method, button in widgets.items():
                         self.assertTrue(button.winfo_ismapped(), method)
                         parent = button.master
                         while parent is not None:

@@ -35,6 +35,8 @@ A start receipt does not mean the native turn has begun. An immediate pause is p
 
 The skill installer below does **not** install or start the manager; the two entry points remain separate.
 
+The manager's global **Backup** action saves the full SQLite ledger and managed handoff JSON files to a new local ZIP. It excludes project files, unsent input, native transcripts and Codex credential files. Validate with `python -m relay --inspect-backup backup.zip`; restore with `python -m relay --restore-backup backup.zip --state-dir NEW_DIRECTORY`. Restored records open in **inspection-only mode**: search, history and export work, while all execution and approval actions remain disabled. An old backup cannot prove who owns the task today. Backups are plaintext private records, not public support bundles; see [backup usage and limits](docs/windows-manager.md#整库备份与只读恢复).
+
 The Windows single-user Codex core is implemented; the full remote/multi-tool platform is not. See the [framework map and remaining gaps](docs/architecture.md) for implemented modules, version-specific evidence, and delivery/backup/diagnostic work still needed.
 
 ## Standalone skill triggers
@@ -108,7 +110,7 @@ The installer has **6 passing tests** covering previews, backups, configuration 
 python -m unittest -v test_install.py
 ```
 
-The connection-recovery follow-up passed **117 manager tests** (38 controller, 7 transport, 32 Tk, 7 snapshot, 12 recovery, 6 local organization, 10 settings, 5 disconnect). The 71 standalone runtime and 6 installer tests were also rerun successfully: **194 tests total**. Manager tests use simulated controllers or servers and real Tk widgets. The first-version validation on 2026-09-30 used Windows, Python 3.13.2, Tk 8.6.15, and Codex 0.153.4. Run the manager suite separately:
+The backup follow-up passed **137 manager tests**, including 10 archive checks, 5 backup/controller/CLI integration checks and 37 Tk checks. The 71 standalone runtime and 6 installer tests also passed: **214 tests total**. Final manager tests use simulated clients or servers and real Tk widgets. The first-version validation on 2026-09-30 used Windows, Python 3.13.2, Tk 8.6.15, and Codex 0.153.4. Run the manager suite separately:
 
 ```shell
 python -m unittest discover -s tests -v
@@ -122,7 +124,9 @@ The reliability version (`8e429e0`) passed a native run on 2026-09-30 with Codex
 
 Local organization was verified with a real Manager/Tk window and disposable data. The previous settings follow-up also passed a reached-budget task through renaming, higher limits and disabling automatic handoff: consumed usage and paused state remained intact, the UI enabled explicit continuation, stale checkpoints were invalidated, and saving issued zero native requests. Project files were unchanged and windows/workers closed. These local checks do not rerun native handoff or interrupted inference.
 
-The current recovery checks use local fake RPC subprocesses to verify that malformed messages release pending requests and the dead connection. Old approval/message caches are cleared, explicit reconciliation reconnects read-only, and unknown requests are never replayed. A separate real Manager/Tk exercise injected a simulated disconnect: the failed task remained discoverable through the global attention count despite a running-only filter, its input draft survived, and viewing it issued zero native requests or approval replies. These checks do not establish real network-loss, system-crash or power-loss recovery.
+The connection-recovery version (`1cfd26d`) used local fake RPC subprocesses to verify that malformed messages release pending requests and the dead connection. Old approval/message caches are cleared, explicit reconciliation reconnects read-only, and unknown requests are never replayed. A separate real Manager/Tk exercise injected a simulated disconnect: the failed task remained discoverable through the global attention count despite a running-only filter, its input draft survived, and viewing it issued zero native requests or approval replies. These checks do not establish real network-loss, system-crash or power-loss recovery.
+
+The backup version passed a real Manager/Tk exercise with disposable simulated tasks: all 121 event records survived, backup worked without a selected task, source input and project files were unchanged, and the recovered inspection window exported identical historical records while refusing execution. The final exercise issued zero native requests or approval replies and closed both workers. The guide separately records an early red-test isolation mistake and its correction; it is not native backup acceptance evidence.
 
 High-context automatic triggering has only simulated coverage. Physical sleep, power loss, network loss, crashes, and other environments have not been tested live. The controlled read-only recovery example does not establish recovery of every interrupted external operation.
 
