@@ -18,6 +18,7 @@ class FakeManager:
         self.prepared_task_ids = []
         self.starts = []
         self.archives = []
+        self.settings = []
         self.delay = 0
         self.close_delay = 0
         self.close_failures = 0
@@ -28,7 +29,7 @@ class FakeManager:
         self.tasks = [{"id": "task-1", "title": "测试任务", "cwd": str(state_dir), "goal": "完成一个可验证任务",
                        "mode": "read-only", "state": "idle", "thread_id": "thread-1", "turn_id": None,
                        "generation": 0, "last_message": "准备就绪", "error": None, "pending": [],
-                       "usage": {}, "context_estimate": 0.4, "compactions": 0}]
+                       "usage": 0, "context_estimate": 0.4, "compactions": 0}]
         self.record("init")
 
     def record(self, method):
@@ -70,6 +71,13 @@ class FakeManager:
         self.archives.append((task_id, archived))
         task = next(task for task in self.tasks if task["id"] == task_id)
         task["archived"] = archived
+        return deepcopy(task)
+
+    def update_settings(self, task_id, **values):
+        self.record("update_settings")
+        self.settings.append((task_id, values))
+        task = next(task for task in self.tasks if task["id"] == task_id)
+        task.update(values)
         return deepcopy(task)
 
     def pause(self, task_id):
@@ -151,6 +159,127 @@ class TkSmokeTests(unittest.TestCase):
     def select_task(self, task_id):
         self.app.task_tree.selection_set(task_id)
         self.app._select_task()
+
+    def open_settings(self):
+        self.app.buttons["update_settings"].invoke()
+        return next(child for child in self.root.winfo_children()
+                    if getattr(child, "task_id", None) == self.app.selected_id and hasattr(child, "save"))
+
+    def test_settings_bound_to_opened_task_and_only_save(self):
+        self.fake.tasks[0].update(max_tokens=500, max_minutes=2.5, auto_handoff=False)
+        self.add_task()
+        self.wait_for(lambda: self.app.tasks["task-1"].get("max_tokens") == 500)
+        dialog = self.open_settings()
+        self.assertEqual(dialog.fields["title"].get(), "测试任务")
+        self.assertEqual(dialog.fields["max_minutes"].get(), "2.5")
+        self.assertEqual(self.root.grab_current(), dialog)
+        self.select_task("task-other")
+        dialog.fields["title"].set("新名称")
+        dialog.fields["max_tokens"].set("1000")
+        dialog.fields["max_minutes"].set("3.75")
+        dialog.auto_handoff.set(True)
+        dialog.save()
+        self.wait_for(lambda: self.fake.settings and not self.app.busy)
+        self.assertEqual(self.fake.settings, [("task-1", {
+            "title": "新名称", "max_tokens": 1000, "max_minutes": 3.75, "auto_handoff": True})])
+        self.assertEqual(self.app.tasks["task-other"]["title"], "另一任务")
+        self.assertFalse(self.fake.starts)
+        self.assertEqual({identifier for method, identifier in self.fake.calls if method == "update_settings"},
+                         {self.app.worker.ident})
+
+    def test_settings_reject_invalid_limits_without_dispatch(self):
+        dialog = self.open_settings()
+        for tokens, minutes in (("1.5", "0"), ("True", "0"), ("-1", "0"),
+                                ("0", "nan"), ("0", "inf"), ("0", "-0.1")):
+            with self.subTest(tokens=tokens, minutes=minutes), mock.patch("relay.ui.messagebox.showwarning") as warning:
+                dialog.fields["max_tokens"].set(tokens)
+                dialog.fields["max_minutes"].set(minutes)
+                dialog.save()
+                warning.assert_called_once()
+                self.assertFalse(self.fake.settings)
+        dialog.destroy()
+
+    def test_settings_disabled_during_work_unknown_execution_and_archive(self):
+        for changes in ({"state": "running"}, {"state": "needs_reconcile"}, {"state": "completed"},
+                        {"state": "idle", "intent": {"kind": "turn"}},
+                        {"state": "paused", "run_started": 0},
+                        {"state": "queued", "inflight": {"op": {}}},
+                        {"state": "idle", "pending": [{"id": 1, "method": "unsupported"}]},
+                        {"state": "idle", "receiver_id": "receiver"}, {"state": "completed", "archived": True}):
+            with self.subTest(changes=changes):
+                self.fake.tasks[0].update(state="idle", intent=None, run_started=None, inflight={},
+                                          pending=[], receiver_id=None, archived=False)
+                self.fake.tasks[0].update(changes)
+                if changes.get("archived"):
+                    self.app.state_filter.set("已归档")
+                self.wait_for(lambda: all(self.app.tasks["task-1"].get(key) == value for key, value in changes.items()))
+                self.assertTrue(self.app.buttons["update_settings"].instate(["disabled"]))
+                self.app.buttons["update_settings"].invoke()
+                self.assertFalse(self.fake.settings)
+
+    def test_budget_limit_disables_start_and_handoff_but_keeps_settings_and_reconcile(self):
+        for values in ({"usage": 100, "max_tokens": 100, "max_minutes": 0, "elapsed_seconds": 60},
+                       {"usage": 0, "max_tokens": 0, "max_minutes": 1.5, "elapsed_seconds": 90}):
+            with self.subTest(values=values):
+                self.fake.tasks[0].update(values, auto_handoff=True)
+                self.wait_for(lambda: self.app.tasks["task-1"].get("elapsed_seconds") == values["elapsed_seconds"])
+                self.assertTrue(self.app.buttons["start"].instate(["disabled"]))
+                self.assertTrue(self.app.buttons["handoff"].instate(["disabled"]))
+                self.assertFalse(self.app.buttons["update_settings"].instate(["disabled"]))
+                self.assertFalse(self.app.buttons["reconcile"].instate(["disabled"]))
+                self.assertIn("已达预算", self.app.budget_details.get())
+                self.assertIn("先调整预算或核对结果", self.app.budget_details.get())
+                self.assertIn("自动交接：已开启", self.app.budget_details.get())
+        self.assertIn("1.50 / 1.5", self.app.budget_details.get())
+
+    def test_budget_display_refreshes_elapsed_wait_without_new_task_event(self):
+        self.fake.tasks[0].update(state="running", elapsed_seconds=30, run_started=100, max_minutes=10)
+        self.wait_for(lambda: self.app.tasks["task-1"]["state"] == "running")
+        with mock.patch("relay.budget.time.time", return_value=130) as clock:
+            self.app._controls()
+            self.assertIn("1.00 / 10", self.app.budget_details.get())
+            clock.return_value = 160
+            self.app._controls()
+            self.assertIn("1.50 / 10", self.app.budget_details.get())
+
+    def test_settings_disable_auto_only_for_invalid_model_basis(self):
+        self.fake.tasks[0].update(telemetry_model_valid=False, context_estimate=None)
+        self.wait_for(lambda: self.app.tasks["task-1"].get("telemetry_model_valid") is False)
+        dialog = self.open_settings()
+        self.assertTrue(dialog.auto_check.instate(["disabled"]))
+        self.assertIn("模型口径", dialog.notice.cget("text"))
+        dialog.auto_handoff.set(True)
+        with mock.patch("relay.ui.messagebox.showwarning") as warning:
+            dialog.save()
+        warning.assert_called_once()
+        self.assertFalse(self.fake.settings)
+        dialog.destroy()
+        self.fake.tasks[0]["telemetry_model_valid"] = True
+        self.wait_for(lambda: self.app.tasks["task-1"].get("telemetry_model_valid") is True)
+        dialog = self.open_settings()
+        self.assertFalse(dialog.auto_check.instate(["disabled"]))
+        dialog.auto_handoff.set(True)
+        dialog.save()
+        self.wait_for(lambda: self.fake.settings and not self.app.busy)
+        self.assertTrue(self.fake.settings[0][1]["auto_handoff"])
+
+    def test_new_task_accepts_fractional_minutes_and_rejects_nonfinite(self):
+        submit = mock.Mock(return_value=True)
+        dialog = NewTaskDialog(self.root, submit)
+        dialog.fields["title"].set("小预算任务")
+        dialog.fields["cwd"].set(self.temp.name)
+        dialog.goal.insert("1.0", "只读核对")
+        for value in ("nan", "inf"):
+            dialog.fields["max_minutes"].set(value)
+            with mock.patch("relay.ui.messagebox.showwarning") as warning:
+                dialog.save()
+            warning.assert_called_once()
+            submit.assert_not_called()
+        dialog.fields["max_minutes"].set("0.5")
+        with mock.patch("relay.ui.messagebox.showwarning"):
+            dialog.save()
+        self.assertIsNotNone(submit.call_args)
+        self.assertEqual(submit.call_args.kwargs["max_minutes"], 0.5)
 
     def test_search_filters_title_goal_directory_without_losing_all_tasks(self):
         self.add_task(cwd="C:\\sample\\Folder", state="completed")
@@ -251,6 +380,8 @@ class TkSmokeTests(unittest.TestCase):
             {"at": "2026-09-30T12:00:01Z", "kind": "native_turn_started", "data": {"command": "SECRET-COMMAND"}},
             {"at": "2026-09-30T12:00:02Z", "kind": "turn_completed", "data": {"status": "completed", "purpose": "work", "answer": "SECRET-ANSWER"}},
             {"at": "2026-09-30T12:00:03Z", "kind": "future_event", "data": {"status": "SECRET-STATUS"}},
+            {"at": "2026-09-30T12:00:04Z", "kind": "task_settings_updated", "data": {
+                "changes": {"title": {"before": "SECRET-OLD", "after": "SECRET-NEW"}}}},
         ]
         self.fake.delay = 0.3
         self.app.buttons["get_task"].invoke()
@@ -267,6 +398,7 @@ class TkSmokeTests(unittest.TestCase):
         self.assertIn("不是完整对话", text)
         self.assertIn("外部成功凭证", text)
         self.assertIn("其他本地记录", text)
+        self.assertIn("已更新任务设置", text)
         self.assertNotIn("SECRET", text)
         self.assertNotIn("future_event", text)
         self.assertEqual(str(window.history_text.cget("state")), "disabled")
@@ -445,7 +577,7 @@ class TkSmokeTests(unittest.TestCase):
 
 class TkLayoutTests(unittest.TestCase):
     def test_snapshot_and_existing_actions_visible_at_supported_scaling(self):
-        for dpi in (96, 144):
+        for dpi in (95, 96, 144):
             with self.subTest(dpi=dpi):
                 try:
                     root = tk.Tk()
@@ -454,12 +586,23 @@ class TkLayoutTests(unittest.TestCase):
                 app = None
                 try:
                     root.tk.call("tk", "scaling", dpi / 72)
-                    app = RelayApp(root, factory=FakeManager)
+                    def factory(state_dir=None):
+                        manager = FakeManager(state_dir)
+                        manager.tasks[0].update(max_minutes=1, elapsed_seconds=60, telemetry_model_valid=False)
+                        return manager
+                    app = RelayApp(root, factory=factory)
+                    deadline = time.monotonic() + 4
+                    while (not app.ready or app.selected_id is None) and time.monotonic() < deadline:
+                        root.update()
+                        time.sleep(0.005)
+                    self.assertTrue(app.ready)
                     root.update()
                     self.assertIn("prepare_snapshot", app.buttons)
                     self.assertIn("set_archived", app.buttons)
                     self.assertIn("get_task", app.buttons)
-                    for method, button in app.buttons.items():
+                    self.assertIn("update_settings", app.buttons)
+                    self.assertIn("已达预算", app.budget_details.get())
+                    for method, button in dict(app.buttons, budget_label=app.budget_label).items():
                         self.assertTrue(button.winfo_ismapped(), method)
                         parent = button.master
                         while parent is not None:

@@ -19,6 +19,8 @@ You can also double-click `start-manager.cmd`. The Chinese interface provides ta
 
 Find tasks by title, goal or directory, filter their status, and move completed tasks into a reversible local archive. Archiving preserves the task, files, permissions and conversation ownership; restoring it does not resume work. The operation-history window shows the latest 100 recorded events, distinguishing requests, native starts and confirmed results. These local management actions do not start Codex inference or archive native conversations.
 
+For a safely idle, queued or paused task, **Task settings** changes its name, Token/minute limits and automatic-handoff choice. Recorded usage remains intact; saving never starts work. The UI shows recorded minutes and limits, and blocks start/handoff when the known budget is reached. Only actual changes invalidate current draft/checkpoint references. Model-invalid telemetry cannot be re-enabled by a settings change; the original directory, goal, permissions and owner remain unchanged. These are soft limits, including active-turn waiting time, rather than billing caps.
+
 With automatic handoff enabled, the manager saves a preparatory snapshot after a completed work turn becomes idle and fresh context telemetry reaches 70%. At 80% with at least two compactions, it can initiate the full handoff instead. You can also request a snapshot while idle or paused. Snapshots copy known local state and file hashes without extra model inference or a new conversation; only the latest `drafts/<task-id>.json` is retained. They contain recorded requirements and answers, the last reply, up to 20 source-turn references, and explicit unknowns, with `ready=false`. They are not complete decision summaries or project backups.
 
 Formal handoff always regenerates the summary and checks current files and READY; an old draft is never accepted as a final checkpoint. Summary preparation and the receiver's READY verification intentionally run read-only, even for a workspace-write task. Continuation may restore only the original permission ceiling after checking the original task instructions, permission record, checkpoint, and effective session configuration.
@@ -104,7 +106,7 @@ The installer has **6 passing tests** covering previews, backups, configuration 
 python -m unittest -v test_install.py
 ```
 
-The task-organization follow-up passed **90 manager tests** (38 controller, 5 transport, 22 Tk, 7 snapshot, 12 recovery, 6 local organization). The 71 standalone runtime and 6 installer tests were also rerun successfully: **167 tests total**. Manager tests use simulated controllers or servers and real Tk widgets. The first-version validation on 2026-09-30 used Windows, Python 3.13.2, Tk 8.6.15, and Codex 0.153.4. Run the manager suite separately:
+The settings/budget follow-up passed **107 manager tests** (38 controller, 5 transport, 29 Tk, 7 snapshot, 12 recovery, 6 local organization, 10 settings). The 71 standalone runtime and 6 installer tests were also rerun successfully: **184 tests total**. Manager tests use simulated controllers or servers and real Tk widgets. The first-version validation on 2026-09-30 used Windows, Python 3.13.2, Tk 8.6.15, and Codex 0.153.4. Run the manager suite separately:
 
 ```shell
 python -m unittest discover -s tests -v
@@ -116,7 +118,7 @@ A separate native counter task on 2026-09-30, validating the first manager versi
 
 The reliability version (`8e429e0`) passed a native run on 2026-09-30 with Codex 0.153.4 covering immediate pause, confirmed interruption, close/reopen, read-only reconciliation, and explicit continuation. The product waited for the matching native `turn/started` before sending its interrupt. The same task and thread remained at generation 0; a distinct read-only turn returned the unique test-file contents without changing its hash, with no approval responses. Manual preparation then saved a `preparatory`, `ready=false` draft with the matching file hash, issuing only `thread/read` and no new turn or thread. An earlier timing failure retained its unknown outcome without retry and prompted the pause-ordering fix.
 
-For the current local-organization changes, a real Manager and Tk window with disposable data passed search, archive, history lookup and restore. Project files were unchanged and no native requests were issued. This local check does not rerun native handoff or interrupted inference.
+Local organization was verified with a real Manager/Tk window and disposable data. The current settings follow-up also passed a reached-budget task through renaming, higher limits and disabling automatic handoff: consumed usage and paused state remained intact, the UI enabled explicit continuation, stale checkpoints were invalidated, and saving issued zero native requests. Project files were unchanged and windows/workers closed. These local checks do not rerun native handoff or interrupted inference.
 
 High-context automatic triggering has only simulated coverage. Physical sleep, power loss, network loss, crashes, and other environments have not been tested live. The controlled read-only recovery example does not establish recovery of every interrupted external operation.
 

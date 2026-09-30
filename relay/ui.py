@@ -7,6 +7,8 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+from .budget import budget_status, validate_limits
+
 
 STATES = {
     "queued": "待启动", "creating": "正在创建", "running": "运行中",
@@ -31,6 +33,7 @@ EVENT_LABELS = {
     "permission_expansion_denied": "已拒绝扩大权限", "secret_input_refused": "已拒绝采集秘密信息",
     "late_receipt_recorded": "已记录迟到回执", "tool_state": "已记录工具状态",
     "user_marked_complete": "用户已标记完成", "task_archived": "已归档", "task_unarchived": "已取消归档",
+    "task_settings_updated": "已更新任务设置",
 }
 
 
@@ -204,16 +207,69 @@ class NewTaskDialog(tk.Toplevel):
             if not directory.is_dir():
                 raise ValueError("工作目录不存在。")
             values["cwd"] = str(directory)
-            for key in ("max_tokens", "max_minutes"):
-                values[key] = int(values[key] or "0")
-                if values[key] < 0:
-                    raise ValueError("上限必须为非负整数。")
+            values["max_tokens"], values["max_minutes"] = validate_limits(
+                values["max_tokens"] or "0", values["max_minutes"] or "0")
         except (OSError, ValueError) as error:
             messagebox.showwarning("输入有误", str(error), parent=self)
             return
         values.update(mode="read-only" if self.mode.get() == "只读" else "workspace-write",
                       auto_handoff=self.auto_handoff.get())
         if self.submit("create_task", **values):
+            self.destroy()
+
+
+class TaskSettingsDialog(tk.Toplevel):
+    def __init__(self, parent, task, submit):
+        super().__init__(parent)
+        self.task_id = task["id"]
+        self.submit = submit
+        self.auto_allowed = task.get("telemetry_model_valid", True) is not False
+        self.title(f"任务设置 · {task['title']}")
+        self.transient(parent)
+        self.resizable(True, False)
+        body = ttk.Frame(self, padding=16)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(1, weight=1)
+        ttk.Label(body, text=f"任务 ID：{self.task_id}").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        self.fields = {}
+        for row, (key, label) in enumerate((("title", "任务名称"), ("max_tokens", "Token 上限（留空或 0 不限）"),
+                                           ("max_minutes", "分钟上限（可小数，0 不限）")), 1):
+            value = task.get(key) or ""
+            self.fields[key] = tk.StringVar(value=str(value))
+            ttk.Label(body, text=label).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=5)
+            ttk.Entry(body, textvariable=self.fields[key], width=44).grid(row=row, column=1, sticky="ew", pady=5)
+        self.auto_handoff = tk.BooleanVar(value=bool(task.get("auto_handoff")) and self.auto_allowed)
+        self.auto_check = ttk.Checkbutton(body, text="允许按上下文风险自动预备与交接此任务", variable=self.auto_handoff,
+                                         state="normal" if self.auto_allowed else "disabled")
+        self.auto_check.grid(row=4, column=0, columnspan=2, sticky="w", pady=8)
+        text = ("权限、目录和原始目标不在此修改。预算是软上限，已记录用时包括活动轮次的等待，"
+                "运行中调用可能超出预算。保存变更后，原预备快照与检查点失效；保存不会启动任务。")
+        if not self.auto_allowed:
+            text += "\n模型口径无效，不能开启自动交接，请先核对遥测。"
+        self.notice = ttk.Label(body, text=text, wraplength=580, justify="left")
+        self.notice.grid(row=5, column=0, columnspan=2, sticky="w", pady=6)
+        buttons = ttk.Frame(body)
+        buttons.grid(row=6, column=0, columnspan=2, sticky="e", pady=(8, 0))
+        ttk.Button(buttons, text="取消", command=self.destroy).pack(side="left", padx=5)
+        self.save_button = ttk.Button(buttons, text="保存设置", command=self.save)
+        self.save_button.pack(side="left")
+        self.grab_set()
+
+    def save(self):
+        try:
+            title = self.fields["title"].get().strip()
+            if not title:
+                raise ValueError("任务名称不能为空。")
+            tokens, minutes = validate_limits(self.fields["max_tokens"].get().strip() or "0",
+                                              self.fields["max_minutes"].get().strip() or "0")
+            auto = self.auto_handoff.get()
+            if auto and not self.auto_allowed:
+                raise ValueError("模型口径无效，不能开启自动交接，请先核对遥测。")
+        except ValueError as error:
+            messagebox.showwarning("输入有误", str(error), parent=self)
+            return
+        if self.submit("update_settings", self.task_id, title=title, max_tokens=tokens,
+                       max_minutes=minutes, auto_handoff=auto):
             self.destroy()
 
 
@@ -240,6 +296,7 @@ class RelayApp:
         self.root.protocol("WM_DELETE_WINDOW", self.request_close)
         self.status = tk.StringVar(value="正在连接 Codex…")
         self.details = tk.StringVar(value="选择左侧任务查看详情。")
+        self.budget_details = tk.StringVar()
         self.search = tk.StringVar()
         self.state_filter = tk.StringVar(value=FILTERS[0])
         self._build()
@@ -272,6 +329,8 @@ class RelayApp:
             button = ttk.Button(organize, text=label, command=lambda action=method: self._action(action))
             button.pack(side="left", expand=True, fill="x", padx=(0, 4))
             self.buttons[method] = button
+        self.buttons["update_settings"] = ttk.Button(left, text="任务设置", command=lambda: self._action("update_settings"))
+        self.buttons["update_settings"].pack(fill="x", pady=(0, 8))
         task_list = ttk.Frame(left)
         task_list.pack(fill="both", expand=True)
         self.task_tree = ttk.Treeview(task_list, columns=("state",), show="tree headings", selectmode="browse")
@@ -285,6 +344,8 @@ class RelayApp:
         scrollbar.pack(side="right", fill="y")
         self.task_tree.bind("<<TreeviewSelect>>", self._select_task)
         ttk.Label(right, textvariable=self.details, wraplength=820, justify="left").pack(fill="x", pady=(0, 6))
+        self.budget_label = ttk.Label(right, textvariable=self.budget_details, wraplength=820, justify="left")
+        self.budget_label.pack(fill="x", pady=(0, 6))
         goal = ttk.LabelFrame(right, text="目标")
         goal.pack(fill="x")
         self.goal_text = text_area(goal, 2 if compact else 3)
@@ -334,6 +395,8 @@ class RelayApp:
             return
         if method == "start":
             self.submit(method, self.selected_id, self.message_text.get("1.0", "end").strip() or None)
+        elif method == "update_settings":
+            TaskSettingsDialog(self.root, self.tasks[self.selected_id], self.submit)
         elif method == "set_archived":
             self.submit(method, self.selected_id, not self.tasks[self.selected_id].get("archived", False))
         elif method == "export_task":
@@ -541,13 +604,29 @@ class RelayApp:
         task = self.tasks.get(self.selected_id) if self.selected_id in self.visible_ids else None
         state = task.get("state") if task else None
         archived = bool(task and task.get("archived", False))
-        can_archive = bool(task) and state == "completed" and not any(
+        quiet = bool(task) and not any(
             task.get(key) for key in ("inflight", "intent", "pending", "receiver_id")) and task.get("run_started") is None
+        can_archive = quiet and state == "completed"
+        budget = budget_status(task) if task else None
+        if task:
+            limit = f"{task['max_minutes']:g}" if task.get("max_minutes") else "不限"
+            text = (f"已记录用时（分钟）：{budget['elapsed_seconds'] / 60:.2f} / {limit}  ·  "
+                    f"自动交接：{'已开启' if task.get('auto_handoff') else '未开启'}")
+            if budget["reached"]:
+                text += "\n已达预算：先调整预算或核对结果，再继续执行。"
+            if task.get("telemetry_model_valid", True) is False:
+                text += "\n模型口径无效，不能开启自动交接，请先核对遥测。"
+            self.budget_details.set(text)
+        else:
+            self.budget_details.set("")
         allowed = {"start": state in ("queued", "paused", "idle"), "pause": state in ACTIVE,
                    "prepare_snapshot": state in ("idle", "paused"),
                    "handoff": state == "idle", "finish": state in ("idle", "paused"),
                    "reconcile": bool(task), "export_task": bool(task), "get_task": bool(task),
-                   "set_archived": archived or can_archive}
+                   "set_archived": archived or can_archive,
+                   "update_settings": quiet and state in ("queued", "idle", "paused") and not archived}
+        if budget and budget["reached"]:
+            allowed["start"] = allowed["handoff"] = False
         if archived:
             for method in ("start", "pause", "prepare_snapshot", "handoff", "finish", "reconcile"):
                 allowed[method] = False
@@ -588,7 +667,9 @@ class RelayApp:
                         self.message_text.delete("1.0", "end")
                 if method == "get_task" and isinstance(result, dict) and not self.closing:
                     HistoryWindow(self.root, result)
-                self.status.set("已导出任务记录。" if method == "export_task" else "操作已处理；以任务状态和实际回复为准。")
+                self.status.set("已导出任务记录。" if method == "export_task" else
+                                "设置已保存；未启动任务。" if method == "update_settings" else
+                                "操作已处理；以任务状态和实际回复为准。")
             elif kind in ("command_error", "poll_error", "startup_error", "close_error"):
                 if kind == "command_error":
                     self.busy = False

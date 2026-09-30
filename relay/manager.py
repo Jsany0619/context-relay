@@ -12,6 +12,8 @@ import threading
 import time
 import uuid
 
+from .budget import budget_status, validate_limits
+
 
 _spec = importlib.util.spec_from_file_location(
     "relay_handoff", Path(__file__).resolve().parents[1] /
@@ -199,12 +201,13 @@ class Manager:
                 raise ValueError("项目路径必须是目录。")
             if self.root.is_relative_to(directory) or directory.is_relative_to(self.root):
                 raise ValueError("管理器状态与项目目录不能互相包含。")
-            if int(max_tokens) < 0 or float(max_minutes) < 0:
-                raise ValueError("预算不能为负数；0 表示不设上限。")
+            max_tokens, max_minutes = validate_limits(max_tokens, max_minutes)
+            if not isinstance(auto_handoff, bool):
+                raise ValueError("自动交接开关必须是布尔值。")
             task = {"id": uuid.uuid4().hex, "title": title.strip(), "cwd": str(directory),
                     "goal": goal.strip(), "mode": mode, "state": "queued", "archived": False,
-                    "auto_handoff": bool(auto_handoff),
-                    "max_tokens": int(max_tokens), "max_minutes": float(max_minutes),
+                    "auto_handoff": auto_handoff,
+                    "max_tokens": max_tokens, "max_minutes": max_minutes,
                     "thread_id": None, "turn_id": None, "receiver_id": None, "generation": 0,
                     "last_message": "", "error": "", "pending": [], "requirements": [goal.strip()],
                     "revision": 1, "user_inputs": [], "usage": 0, "thread_usage": {}, "context_estimate": None,
@@ -218,12 +221,34 @@ class Manager:
             self._save(task, "task_created", {"goal": goal, "mode": mode})
             return copy.deepcopy(task)
 
+    def update_settings(self, task_id, *, title, max_tokens, max_minutes, auto_handoff):
+        with self._lock:
+            task = self._task(task_id)
+            if (task.get("archived") or task["state"] not in ("queued", "idle", "paused")
+                    or task["inflight"] or task["intent"] or task["pending"] or task["receiver_id"]
+                    or task["run_started"] is not None):
+                raise ValueError("先暂停并核对在途操作，再修改任务设置。")
+            if not isinstance(title, str) or not title.strip():
+                raise ValueError("任务名称不能为空。")
+            handoff_rules.reject_sensitive({"title": title})
+            max_tokens, max_minutes = validate_limits(max_tokens, max_minutes)
+            if not isinstance(auto_handoff, bool):
+                raise ValueError("自动交接开关必须是布尔值。")
+            if auto_handoff and not task.get("telemetry_model_valid", True):
+                raise ValueError("模型口径变化，不能重新开启自动交接。")
+            settings = {"title": title.strip(), "max_tokens": max_tokens,
+                        "max_minutes": max_minutes, "auto_handoff": auto_handoff}
+            changes = {key: {"before": task[key], "after": value}
+                       for key, value in settings.items() if task[key] != value}
+            if changes:
+                task.update(settings)
+                task.update(revision=task["revision"] + 1, checkpoint=None, checkpoint_hash=None,
+                            checkpoint_path=None, draft=None)
+                self._save(task, "task_settings_updated", {"changes": changes})
+            return copy.deepcopy(task)
+
     def _budget(self, task):
-        elapsed = task["elapsed_seconds"]
-        if task["run_started"]:
-            elapsed += max(0, time.time() - task["run_started"])
-        return ((task["max_tokens"] and task["usage"] >= task["max_tokens"]) or
-                (task["max_minutes"] and elapsed >= task["max_minutes"] * 60))
+        return budget_status(task)["reached"]
 
     def _assert_workspace(self, task):
         if str(Path(task["cwd"]).resolve(strict=True)) != task["cwd"]:
@@ -476,7 +501,8 @@ class Manager:
             thread = self._read_idle(task["thread_id"])
             fields = ("id", "title", "cwd", "goal", "mode", "requirements", "user_inputs",
                       "permission_receipt", "thread_id", "generation", "revision", "work_turns",
-                      "last_message", "history", "usage", "context_estimate", "compactions")
+                      "last_message", "history", "usage", "context_estimate", "compactions",
+                      "max_tokens", "max_minutes", "auto_handoff", "elapsed_seconds")
             packet = {"kind": "preparatory", "schema_version": 1, "ready": False,
                       "created_at": handoff_rules.now(), "task": {k: task.get(k) for k in fields},
                       "source_turns": [{"id": t.get("id"), "status": t.get("status")}
@@ -547,6 +573,7 @@ class Manager:
         packet = {"task_id": task["id"], "generation": task["generation"], "revision": task["revision"],
                   "source_thread_id": task["thread_id"], "cwd": task["cwd"], "mode": task["mode"],
                   "protocol": "context-relay-manager-v1", "permission_receipt": task.get("permission_receipt"),
+                  "settings": {key: task[key] for key in ("title", "max_tokens", "max_minutes", "auto_handoff")},
                   "requirements": task["requirements"], "user_inputs": task["user_inputs"], "summary": summary, "files": current,
                   "created_at": handoff_rules.now()}
         task["checkpoint"] = packet
