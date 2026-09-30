@@ -1,5 +1,6 @@
 """Tk interface; every Manager call belongs to the single command worker."""
 from copy import deepcopy
+from datetime import datetime
 import json
 from pathlib import Path
 import queue
@@ -20,6 +21,23 @@ ACTIVE = {"creating", "running", "pausing", "summarizing", "verifying"}
 APPROVALS = {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"}
 USER_INPUT = "item/tool/requestUserInput"
 FILTERS = ("全部未归档", "运行中", "待处理", "等待继续", "已完成", "已归档")
+IMPORT_WARNINGS = {
+    "cross_client_activity_unknown": "无法确认原客户端是否仍在执行；请回原聊天核对。",
+    "stop_original_thread_before_import": "导入前须停止原聊天及同项目其他操作。",
+    "source_thread_active": "来源聊天仍有活动状态，暂不能导入。",
+    "source_thread_system_error": "来源聊天报告系统错误，请先在原聊天核对。",
+    "title_truncated": "聊天名称过长，当前显示已截短。",
+    "history_contains_incomplete_turns": "历史中存在未完整收束的轮次，不能当作已完成操作。",
+    "latest_turn_not_completed": "最近轮次尚未完成，请先核对结果。",
+    "unfinished_action": "仍有未收束的工具操作，请先查明结果。",
+    "metadata_only": "当前只取得聊天信息，未取得可供导入的文字历史。",
+    "no_completed_turn": "尚无已完成轮次，不能假定历史操作已完成。",
+    "unfinished_turn": "存在仍在进行的轮次，请先收束原聊天。",
+    "incomplete_or_unknown_history": "历史资料不完整或含未知状态，须先核对原始结果。",
+    "active_subagent": "仍有等待或运行中的子代理，暂不能导入。",
+    "subagent_activity_unknown": "子代理状态缺失或未知，须先核对，暂不能导入。",
+    "subagent_incomplete": "子代理已中断、出错或关闭，历史结果仍有缺口。",
+}
 EVENT_LABELS = {
     "task_created": "已记录任务", "create_requested": "已请求创建会话", "thread_created": "已收到会话创建回执",
     "turn_requested": "已请求启动轮次", "turn_started": "已收到启动回执（不代表已实际开始）",
@@ -34,6 +52,8 @@ EVENT_LABELS = {
     "late_receipt_recorded": "已记录迟到回执", "tool_state": "已记录工具状态",
     "user_marked_complete": "用户已标记完成", "task_archived": "已归档", "task_unarchived": "已取消归档",
     "task_settings_updated": "已更新任务设置",
+    "source_imported": "已导入历史资料（尚未启动）",
+    "source_import_updated": "已更新待启动任务的来源资料",
 }
 
 
@@ -278,6 +298,218 @@ class TaskSettingsDialog(tk.Toplevel):
             self.destroy()
 
 
+def import_time(value):
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M:%S")
+        except (ValueError, OverflowError, OSError):
+            return "未知"
+    return str(value or "未知")
+
+
+class ImportDialog(tk.Toplevel):
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.generation = 0
+        self.selected_source = None
+        self.preview = None
+        self.next_cursor = None
+        self.search, self.archived = tk.StringVar(), tk.BooleanVar(value=False)
+        self.info = tk.StringVar(value="选择来源后，点击预览。")
+        self.title_value, self.mode = tk.StringVar(), tk.StringVar(value="read-only")
+        self.tokens, self.minutes = tk.StringVar(value="0"), tk.StringVar(value="0")
+        self.auto, self.source_stopped = tk.BooleanVar(value=False), tk.BooleanVar(value=False)
+        self.title("导入已有 Codex 聊天 · 仅创建待启动任务")
+        self.geometry(f"{min(900, self.winfo_screenwidth() - 80)}x{min(820, self.winfo_screenheight() - 140)}")
+        self.transient(app.root)
+        footer = ttk.Frame(self, padding=10)
+        footer.pack(side="bottom", fill="x")
+        ttk.Label(footer, textvariable=self.info, wraplength=820, justify="left").pack(fill="x", pady=(0, 6))
+        self.close_button = ttk.Button(footer, text="关闭", command=self.destroy)
+        self.close_button.pack(side="right")
+        self.save_button = ttk.Button(footer, text="导入为待启动任务", command=self.save)
+        self.save_button.pack(side="right", padx=8)
+        top = ttk.Frame(self, padding=10)
+        top.pack(fill="x")
+        ttk.Label(top, text="列出当前 Codex 环境可访问的桌面 / IDE 聊天，仅导入文字资料。旧授权不延续，原聊天不会被修改或自动启动。",
+                  wraplength=820, justify="left").pack(fill="x", pady=(0, 8))
+        search = ttk.Frame(top)
+        search.pack(fill="x")
+        ttk.Entry(search, textvariable=self.search).pack(side="left", fill="x", expand=True)
+        ttk.Checkbutton(search, text="已归档", variable=self.archived).pack(side="left", padx=6)
+        self.load_button = ttk.Button(search, text="搜索 / 首页", command=self.load_page)
+        self.load_button.pack(side="left")
+        self.next_button = ttk.Button(search, text="下一页", command=lambda: self.load_page(self.next_cursor))
+        self.next_button.pack(side="left", padx=(6, 0))
+        listing = ttk.Frame(top)
+        listing.pack(fill="x", pady=8)
+        self.tree = ttk.Treeview(listing, columns=("updated", "source"), show="tree headings", height=4, selectmode="browse")
+        for column, label, width in (("#0", "来源聊天", 380), ("updated", "更新时间（本机）", 170), ("source", "来源类型", 100)):
+            self.tree.heading(column, text=label)
+            self.tree.column(column, width=width, minwidth=60)
+        self.tree.pack(side="left", fill="x", expand=True)
+        scroll = ttk.Scrollbar(listing, command=self.tree.yview)
+        scroll.pack(side="right", fill="y")
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.bind("<<TreeviewSelect>>", self.select_source)
+        self.preview_button = ttk.Button(top, text="预览选定聊天", command=self.preview_selected)
+        self.preview_button.pack(anchor="w")
+        scrolling = ttk.Frame(self)
+        scrolling.pack(fill="both", expand=True, padx=10)
+        self.canvas = tk.Canvas(scrolling, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(scrolling, command=self.canvas.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        body = ttk.Frame(self.canvas, padding=(0, 0, 8, 8))
+        body_id = self.canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>", lambda event: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", lambda event: self.canvas.itemconfigure(body_id, width=event.width))
+        ttk.Label(body, text="来源预览（只读摘录，不是完整历史或权限证明）").pack(anchor="w")
+        self.preview_text = text_area(body, 6)
+        ttk.Label(body, text="任务名称").pack(anchor="w")
+        ttk.Entry(body, textvariable=self.title_value).pack(fill="x", pady=(2, 6))
+        ttk.Label(body, text="本轮目标（必须明确填写；旧消息仅作资料）").pack(anchor="w")
+        self.goal_text = tk.Text(body, height=3, wrap="word")
+        self.goal_text.pack(fill="x", pady=(2, 6))
+        options = ttk.Frame(body)
+        options.pack(fill="x", pady=4)
+        ttk.Label(options, text="权限").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(options, textvariable=self.mode, values=("read-only", "workspace-write"), state="readonly", width=18).grid(row=0, column=1, padx=6)
+        ttk.Label(options, text="Token 上限").grid(row=0, column=2)
+        ttk.Entry(options, textvariable=self.tokens, width=10).grid(row=0, column=3, padx=6)
+        ttk.Label(options, text="分钟上限").grid(row=0, column=4)
+        ttk.Entry(options, textvariable=self.minutes, width=8).grid(row=0, column=5, padx=6)
+        ttk.Label(body, text="0 表示不限；预算是软边界，当前调用可能超出。", foreground="#555555").pack(anchor="w")
+        ttk.Checkbutton(body, text="允许满足阈值后自动交接（可选）", variable=self.auto).pack(anchor="w", pady=6)
+        ttk.Checkbutton(body, text="我确认原聊天及同项目的其他操作已停止", variable=self.source_stopped,
+                        command=self.controls).pack(anchor="w", pady=6)
+        self.controls()
+
+    def reset_preview(self):
+        self.generation += 1
+        self.preview = None
+        self.title_value.set("")
+        self.goal_text.delete("1.0", "end")
+        self.mode.set("read-only")
+        self.tokens.set("0")
+        self.minutes.set("0")
+        self.auto.set(False)
+        self.source_stopped.set(False)
+        set_text(self.preview_text, "")
+        self.save_button.configure(text="导入为待启动任务")
+
+    def request(self, method, *args, **kwargs):
+        token = (self.generation, self.selected_source)
+        if self.app.submit_import(self, token, method, *args, **kwargs):
+            self.info.set("正在读取…" if method != "import_thread" else "正在保存待启动任务…")
+            self.controls()
+
+    def load_page(self, cursor=None):
+        if self.app.busy or self.app.closing:
+            return
+        self.reset_preview()
+        self.selected_source = None
+        self.next_cursor = None
+        self.tree.delete(*self.tree.get_children())
+        self.request("list_import_threads", search=self.search.get().strip(), cursor=cursor, archived=self.archived.get())
+
+    def select_source(self, event=None):
+        selected = self.tree.selection()
+        source = selected[0] if selected else None
+        if source != self.selected_source:
+            self.selected_source = source
+            self.reset_preview()
+            self.info.set("点击预览核对来源，再填写本轮目标。")
+        self.controls()
+
+    def preview_selected(self):
+        if not self.selected_source or self.app.busy:
+            return
+        self.reset_preview()
+        self.request("preview_import", self.selected_source)
+
+    def can_save(self):
+        if not self.preview or not self.preview.get("can_import"):
+            return False
+        existing = self.preview.get("existing_task")
+        return not existing or (existing.get("state") in ("queued", "paused") and existing.get("thread_id") is None
+                                and not existing.get("archived", False))
+
+    def controls(self):
+        available = self.app.ready and not self.app.busy and not self.app.closing and self.app.recovery_info is None
+        self.load_button.configure(state="normal" if available else "disabled")
+        self.next_button.configure(state="normal" if available and self.next_cursor else "disabled")
+        self.preview_button.configure(state="normal" if available and self.selected_source else "disabled")
+        self.save_button.configure(state="normal" if available and self.can_save() and self.source_stopped.get() else "disabled")
+
+    def deliver(self, method, token, result=None, error=None):
+        if token != (self.generation, self.selected_source):
+            return
+        if error:
+            self.info.set(f"需要处理：{error}")
+        elif method == "list_import_threads":
+            for item in result["data"]:
+                title = item.get("title") or item["id"]
+                if item.get("imported_task_id"):
+                    title += "（已导入）"
+                self.tree.insert("", "end", iid=item["id"], text=title,
+                                 values=(import_time(item.get("updated_at")),
+                                         "桌面 / IDE" if item.get("source") == "vscode" else item.get("source", "未知")))
+            self.next_cursor = result.get("next_cursor")
+            self.info.set(f"本页 {len(result['data'])} 个聊天；选择后显式预览。")
+        elif method == "preview_import":
+            if result.get("thread_id") != self.selected_source:
+                self.info.set("来源标识不匹配，请重新预览。")
+                return
+            self.reset_preview()
+            self.preview = result
+            existing = result.get("existing_task")
+            self.title_value.set((existing or {}).get("title") or result.get("title") or self.selected_source)
+            if existing and self.can_save():
+                self.goal_text.insert("1.0", existing.get("goal", ""))
+                self.mode.set(existing.get("mode", "read-only"))
+                self.tokens.set(str(existing.get("max_tokens", 0)))
+                self.minutes.set(str(existing.get("max_minutes", 0)))
+                self.auto.set(existing.get("auto_handoff", False))
+                self.save_button.configure(text="更新待启动任务")
+            status = result.get("status", "未知")
+            if status == "notLoaded":
+                status = "未在本连接加载（原端状态未知）"
+            lines = [f"来源：{result['thread_id']}", f"目录：{result.get('cwd', '未知')}",
+                     f"原生状态：{status}（不证明原聊天已停止）",
+                     f"读取时间：{import_time(result.get('read_at'))} · 更新时间：{import_time(result.get('updated_at'))}",
+                     f"未展示消息 {result.get('omitted_messages', 0)} · 截短消息 {result.get('truncated_messages', 0)} · 非文字项目 {result.get('non_text_items', 0)}"]
+            lines.extend(IMPORT_WARNINGS.get(warning, "存在未识别的来源提示，请先回原聊天核对。")
+                         for warning in result.get("warnings", []))
+            lines.extend(f"\n[{item.get('role', '未知')}] {item.get('text', '')}" for item in result.get("messages", []))
+            set_text(self.preview_text, "\n".join(lines))
+            self.info.set("填写本轮目标并确认原操作已停止；导入不会自动启动。" if self.can_save() else
+                          "不能导入：已有任务已启动、已归档，或来源不满足条件；请核对预览提示。")
+        elif method == "import_thread":
+            self.destroy()
+            return
+        self.controls()
+
+    def save(self):
+        if self.app.busy or not self.can_save() or not self.source_stopped.get():
+            self.info.set("请先预览可导入来源，并确认原聊天及同项目操作已停止。")
+            return
+        try:
+            title, goal = self.title_value.get().strip(), self.goal_text.get("1.0", "end-1c").strip()
+            if not title or not goal:
+                raise ValueError("任务名称和本轮目标不能为空。")
+            tokens, minutes = validate_limits(self.tokens.get().strip(), self.minutes.get().strip())
+        except ValueError as error:
+            self.info.set(f"输入有误：{error}")
+            return
+        existing = self.preview.get("existing_task")
+        self.request("import_thread", self.selected_source, self.preview["fingerprint"], title=title, goal=goal,
+                     mode=self.mode.get(), source_stopped=True, existing_task_id=existing["id"] if existing else None,
+                     max_tokens=tokens, max_minutes=minutes, auto_handoff=self.auto.get())
+
+
 class RelayApp:
     def __init__(self, root, state_dir=None, factory=manager_factory):
         self.root = root
@@ -293,6 +525,8 @@ class RelayApp:
         self.closed = False
         self.pending_requests = []
         self.question_values = {}
+        self.import_dialog = None
+        self.import_request = None
         self.root.title("Context Relay · 本机任务管理器")
         width = min(1180, max(1, self.root.winfo_screenwidth() - 80))
         height = min(850, max(1, self.root.winfo_screenheight() - 120))
@@ -315,8 +549,12 @@ class RelayApp:
 
     def _build(self):
         compact = self.root.winfo_screenheight() < 900
-        ttk.Label(self.root, text="Context Relay", font=("Segoe UI", 17, "bold")).pack(anchor="w", padx=16, pady=(12, 0))
-        ttk.Label(self.root, text="仅管理这里创建的任务；现有聊天不会自动导入。", foreground="#555555").pack(anchor="w", padx=16, pady=(0, 8))
+        header = ttk.Frame(self.root)
+        header.pack(fill="x", padx=16, pady=(12, 0))
+        ttk.Label(header, text="Context Relay", font=("Segoe UI", 17, "bold")).pack(side="left")
+        self.import_button = ttk.Button(header, text="导入已有 Codex 聊天", command=self._open_import)
+        self.import_button.pack(side="right")
+        ttk.Label(self.root, text="仅管理这里创建或主动导入的任务；导入不会修改原聊天。", foreground="#555555").pack(anchor="w", padx=16, pady=(0, 8))
         self.recovery_banner = ttk.Label(self.root, wraplength=1140, justify="left", foreground="#8a3b00")
         panes = ttk.Panedwindow(self.root, orient="horizontal")
         self.panes = panes
@@ -328,7 +566,7 @@ class RelayApp:
         self.new_button.pack(fill="x", pady=(0, 8))
         self.backup_button = ttk.Button(left, text="备份管理器", command=self._backup)
         self.backup_button.pack(fill="x", pady=(0, 4))
-        self.backup_notice = ttk.Label(left, text="本地明文记录；不含项目文件、Codex 登录或原生聊天。",
+        self.backup_notice = ttk.Label(left, text="本地明文记录，含导入摘录；不含项目文件、登录信息或完整原生聊天。",
                                        wraplength=240, justify="left", foreground="#555555")
         self.backup_notice.pack(fill="x", pady=(0, 8))
         ttk.Label(left, text="搜索名称、目标或目录").pack(anchor="w")
@@ -401,13 +639,36 @@ class RelayApp:
         if self.recovery_info is not None and method not in ("get_task", "export_task"):
             self.status.set("恢复库为永久只读检视，不能继续任务或修改记录。")
             return False
-        if method not in ("create_task", "backup_state") and args and args[0] not in self.visible_ids:
+        if method not in ("create_task", "backup_state", "list_import_threads", "preview_import", "import_thread") and args and args[0] not in self.visible_ids:
             return False
         self.busy = True
         self.status.set("正在处理，请稍候…")
         self._controls()
         self.worker.commands.put((method, args, kwargs))
         return True
+
+    def _open_import(self):
+        if self.import_button.instate(["disabled"]):
+            return
+        if self.import_dialog is not None and self.import_dialog.winfo_exists():
+            self.import_dialog.lift()
+            return
+        self.import_dialog = ImportDialog(self)
+        self.import_dialog.load_page()
+
+    def submit_import(self, dialog, token, method, *args, **kwargs):
+        if self.submit(method, *args, **kwargs):
+            self.import_request = (dialog, token, method)
+            return True
+        return False
+
+    def _import_result(self, method, result=None, error=None):
+        request = self.import_request
+        if request is not None and request[2] == method:
+            self.import_request = None
+            dialog, token, _ = request
+            if not self.closing and dialog.winfo_exists():
+                dialog.deliver(method, token, result, error)
 
     def _backup(self):
         if self.backup_button.instate(["disabled"]):
@@ -511,10 +772,12 @@ class RelayApp:
         if task.get("max_tokens"):
             usage_text += f" / {task['max_tokens']}"
         draft = task.get("draft")
+        source = task.get("source_snapshot")
         self.details.set(f"{task['title']} · {STATES.get(task.get('state'), task.get('state', '未知'))}\n"
                          f"{task['cwd']}\n权限：{mode}  ·  交接代次：{task.get('generation', 0)}  ·  "
                          f"上下文估算：{pressure_text}  ·  压缩：{task.get('compactions', 0)} 次  ·  累计 Token：{usage_text}"
                          + (f"\n预备快照：{draft.get('created_at', '时间未知')} · 仅预备，交接前须重验" if draft else "")
+                         + (f"\n历史摘录来源：{source.get('thread_id', '未知')} · 可导出查看，不继承原聊天授权" if source else "")
                          + (f"\n需要处理：{task['error']}" if task.get("error") else ""))
         set_text(self.goal_text, task.get("goal"))
         set_text(self.latest_text, task.get("last_message") or "尚无回复。", follow=True)
@@ -642,6 +905,9 @@ class RelayApp:
         self.attention_button.configure(text=f"待处理 {self.attention_count} 项 · 查看",
                                         state="normal" if self.attention_count and not self.closing else "disabled")
         self.new_button.configure(state="normal" if available and not inspection else "disabled")
+        self.import_button.configure(state="normal" if available and not inspection else "disabled")
+        if self.import_dialog is not None and self.import_dialog.winfo_exists():
+            self.import_dialog.controls()
         backup_safe = not any(task.get("state") in ACTIVE or task.get("pending") for task in self.tasks.values())
         self.backup_button.configure(state="normal" if available and not inspection and backup_safe else "disabled")
         self.message_text.configure(state="disabled" if inspection else "normal")
@@ -715,7 +981,8 @@ class RelayApp:
             elif kind == "command_done":
                 self.busy = False
                 method, args, result = value
-                if method == "create_task" and isinstance(result, dict):
+                self._import_result(method, result=result)
+                if method in ("create_task", "import_thread") and isinstance(result, dict):
                     self.search.set("")
                     self.state_filter.set(FILTERS[0])
                     self.tasks[result["id"]] = result
@@ -735,11 +1002,13 @@ class RelayApp:
                                     f"文件 {result['file_count']} · 创建时间 {result['created_at']}")
                 else:
                     self.status.set("已导出任务记录。" if method == "export_task" else
+                                    "已导入为待启动任务；原聊天未修改，尚未启动。" if method == "import_thread" else
                                     "设置已保存；未启动任务。" if method == "update_settings" else
                                     "操作已处理；以任务状态和实际回复为准。")
             elif kind in ("command_error", "poll_error", "startup_error", "close_error"):
                 if kind == "command_error":
                     self.busy = False
+                    self._import_result(value[0], error=value[1])
                     value = value[1]
                 if kind == "close_error":
                     self.closing = False

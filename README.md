@@ -27,7 +27,9 @@ With automatic handoff enabled, the manager saves a preparatory snapshot after a
 
 Formal handoff always regenerates the summary and checks current files and READY; an old draft is never accepted as a final checkpoint. Summary preparation and the receiver's READY verification intentionally run read-only, even for a workspace-write task. Continuation may restore only the original permission ceiling after checking the original task instructions, permission record, checkpoint, and effective session configuration.
 
-The manager creates its own App Server conversations. It does not import existing desktop chats or promise official desktop sidebar integration. It disables external MCP servers, apps, and plugins for its own sessions and checks reported server status; your global Codex configuration and other sessions are unchanged. The first version manages Codex only, with no phone or multi-tool control.
+The manager creates its own App Server conversations. **Import existing chat** lets you search, select and preview locally accessible Codex desktop/IDE chats, then save reviewed historical excerpts as a queued task with a current goal and permission ceiling. Continuing creates a new managed conversation; it does not resume, fork, interrupt or take ownership of the source chat. Stop source-side work first: a separate App Server can report an active desktop chat as `notLoaded`, so discovery is not proof that another client has stopped. See [selective import and limits](docs/windows-manager.md#选择导入已有-codex-聊天).
+
+Official desktop sidebar integration is not promised. The manager disables external MCP servers, apps, and plugins for its own sessions and checks reported server status; your global Codex configuration and other sessions are unchanged. The first version manages Codex only, with no phone or multi-tool control.
 
 State is local plaintext under `%LOCALAPPDATA%\ContextRelay`: SQLite task/event records, drafts, and checkpoints. A supplied `--state-dir` chooses another directory. The state directory and project directory must be separate: neither may equal or contain the other, including for existing task records. This manager ledger is separate from the standalone skill's `CODEX_HOME/context-handoffs` files; their ownership records are not interchangeable or automatically migrated. Ownership checks fence managed requests, not arbitrary processes or other clients. Read the [Chinese usage guide and exact limits](docs/windows-manager.md). Native session acceptance is tracked there separately from simulated tests.
 
@@ -37,7 +39,7 @@ A start receipt does not mean the native turn has begun. An immediate pause is p
 
 The skill installer below does **not** install or start the manager; the two entry points remain separate.
 
-The manager's global **Backup** action saves the full SQLite ledger and managed handoff JSON files to a new local ZIP. It excludes project files, unsent input, native transcripts and Codex credential files. Validate with `python -m relay --inspect-backup backup.zip`; restore with `python -m relay --restore-backup backup.zip --state-dir NEW_DIRECTORY`. Restored records open in **inspection-only mode**: search, history and export work, while all execution and approval actions remain disabled. An old backup cannot prove who owns the task today. Backups are plaintext private records, not public support bundles; see [backup usage and limits](docs/windows-manager.md#整库备份与只读恢复).
+The manager's global **Backup** action saves the full SQLite ledger, including imported excerpts, and managed handoff JSON files to a new local ZIP. It excludes project files, unsent input, complete native transcripts and Codex credential files. Validate with `python -m relay --inspect-backup backup.zip`; restore with `python -m relay --restore-backup backup.zip --state-dir NEW_DIRECTORY`. Restored records open in **inspection-only mode**: search, history and export work, while all execution and approval actions remain disabled. An old backup cannot prove who owns the task today. Backups are plaintext private records, not public support bundles; see [backup usage and limits](docs/windows-manager.md#整库备份与只读恢复).
 
 The Windows single-user Codex core is implemented; the full remote/multi-tool platform is not. See the [framework map and remaining gaps](docs/architecture.md) for implemented modules, version-specific evidence, and delivery/backup/diagnostic work still needed.
 
@@ -112,13 +114,15 @@ The installer has **6 passing tests** covering previews, backups, configuration 
 python -m unittest -v test_install.py
 ```
 
-The quick-launch version passed **148 manager, launcher and shortcut tests**, including 39 Tk checks, 3 windowed-entry checks and 6 Windows COM shortcut checks. The 71 standalone runtime and 6 skill-installer tests also passed: **225 tests total**. Manager execution tests use simulated clients or servers; Tk widgets and shortcut files are real. Local validation used Windows, Python 3.13.2, Tk 8.6.15, and Windows PowerShell 5.1. Run the manager suite separately:
+The selective-import version passed **177 manager, launcher and shortcut tests**, including 49 Tk checks, 3 windowed-entry checks and 6 Windows COM shortcut checks. The 71 standalone runtime and 6 skill-installer tests also passed: **254 tests total**. Manager execution tests use simulated clients or servers; Tk widgets and shortcut files are real. Local validation used Windows, Python 3.13.2, Tk 8.6.15, and Windows PowerShell 5.1. Run the manager suite separately:
 
 ```shell
 python -m unittest discover -s tests -v
 ```
 
-A separate actual Windows Shell `.lnk` exercise opened the windowed manager with an isolated empty state directory, displayed successful prerequisite and invalid-argument dialogs, and closed all three processes normally. No tasks were started. Current-user Desktop and Start Menu shortcuts were then installed and their target, arguments and working directory read back. This verifies local startup, not account login or native task execution; see the [acceptance details](docs/windows-manager.md#验证状态).
+A real Tk/Manager exercise imported a synthetic source into one queued task, preserving the source and project with no native client construction. A separate native read-only check listed 25 local chats and read only the current chat: its unfinished turn and active subagent correctly prevented import despite a `notLoaded` status. No native task was created or continued. Continuing an imported, completed desktop chat has not been tested live. Source size limits and the shutdown regression are recorded in the [acceptance details](docs/windows-manager.md#验证状态).
+
+The previous quick-launch version's actual Windows Shell `.lnk` exercise opened the windowed manager with an isolated empty state directory, displayed successful prerequisite and invalid-argument dialogs, and closed all three processes normally. No tasks were started. Current-user Desktop and Start Menu shortcuts were then installed and their target, arguments and working directory read back. This verifies local startup, not account login or native task execution.
 
 The real Tk window was also inspected with synthetic tasks: approval actions and the bottom controls remain visible with the default screen-bounded layout. Basic layout checks covered 96/144-DPI-equivalent Tk scaling on the local display. Fake-server, FakeManager, and window checks do not prove native conversation handoff. See the manager guide for the current acceptance status.
 

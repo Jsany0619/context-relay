@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import queue
+import signal
 import subprocess
 import sys
 import threading
@@ -61,6 +63,12 @@ def _fake_server(mode: str) -> None:
         _write({"id": request["id"], "error": {"code": -32001, "message": "nope", "data": {"why": "fake"}}})
     elif mode == "pending-eof":
         _read()
+    elif mode == "inherited-stdout":
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.DEVNULL,
+        )
+        _write({"method": "fake/inheritedStdout", "params": {"pid": child.pid}})
     elif mode.startswith("invalid-"):
         request = _read()
         if mode == "invalid-id":
@@ -179,6 +187,25 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, -32000)
         event = _wait_for_event(client, "transport/closed")
         self.assertIn("returncode", event["params"])
+
+    def test_close_is_bounded_when_descendant_inherits_stdout_pipe(self) -> None:
+        client = CodexClient(_command("inherited-stdout"))
+        child_pid = _wait_for_event(client, "fake/inheritedStdout")["params"]["pid"]
+        client._process.wait(timeout=2)
+        closer = threading.Thread(target=client.close)
+        closer.start()
+        try:
+            closer.join(3)
+            self.assertFalse(closer.is_alive(), "close blocked on stdout owned by the reader")
+            with self.assertRaises(RpcError):
+                client.request("fake/after-close")
+            _wait_for_event(client, "transport/closed", timeout=0.2)
+        finally:
+            try:
+                os.kill(child_pid, signal.SIGTERM)
+            except OSError:
+                pass
+            closer.join(3)
 
     def test_invalid_server_frames_fail_closed_without_leaking_payload(self) -> None:
         for mode in ("invalid-id", "invalid-bool-id", "invalid-error", "invalid-params",

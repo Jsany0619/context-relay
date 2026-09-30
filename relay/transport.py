@@ -191,9 +191,10 @@ class CodexClient:
             except subprocess.TimeoutExpired:
                 self._process.kill()
                 self._process.wait(timeout=2)
+        self._finish_closed()
+        # The reader owns stdout: closing it here can block on its TextIO lock
+        # while a detached descendant still inherits the pipe's write handle.
         self._reader.join(timeout=2)
-        if self._process.stdout:
-            self._process.stdout.close()
 
     def _send(self, message: dict[str, Any]) -> None:
         data = json.dumps(message, separators=(",", ":"), ensure_ascii=False) + "\n"
@@ -233,6 +234,10 @@ class CodexClient:
                 else:
                     self._events.put(message)
         finally:
+            try:
+                self._process.stdout.close()
+            except (AttributeError, OSError, ValueError):
+                pass
             self._finish_closed()
 
     @staticmethod
