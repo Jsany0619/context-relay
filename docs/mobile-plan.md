@@ -38,7 +38,8 @@ Pair URI: `contextrelay://pair#BASE64URL(JSON)` where JSON is exactly `{version:
 - [x] Android: task selection, reports, sealed drafts and request identity, explicit control/assessment commands, pinned certificate, redirect/cleartext rejection, Keystore storage and backup exclusion implemented.
 - [x] Package: sideloadable APK built and verified, with an out-of-repository local test-signing identity. Build instructions and exact hash recorded.
 - [x] Local integration: disposable projects, real Android emulator, TLS/Tk/Manager flows and one actual read-only Codex response verified. Uncertain results, duplicate identity, stale approval and pin mismatch have automated coverage; physical network loss is not a field-tested guarantee. See [validation](mobile-validation.md) for the separate evidence levels.
-- [ ] Delivery: record exactly what passed, provide APK and PC launch steps, test actual phone pairing when accessible, and publish only authorized source/artifacts without local secrets.
+- [x] Delivery artifacts: verification record, APK, Windows instructions and authorized source published as a prerelease without local secrets.
+- [ ] Device acceptance: install and pair the user's Android, then verify its actual Wi-Fi and any desired private cross-network connection. This requires the user's device and is not replaced by emulator success.
 
 ## Primary references
 
