@@ -12,6 +12,9 @@ telemetry/
 work/
 *.log
 tasks.sqlite3*
+remote-control.sqlite3*
+gateway-key.pem
+gateway-cert.pem
 manager.lock
 checkpoints/
 drafts/

@@ -2,7 +2,7 @@
 
 A Codex skill and an optional Windows task manager for handing unfinished work to a fresh conversation when context pressure becomes high after repeated compaction.
 
-Context Relay prepares a small handoff packet, preserves evidence and permissions, and requires the receiving chat to verify the checkpoint before taking ownership. Both entry points use Python's standard library. The standalone skill uses local files and available native chat tools; the optional manager uses SQLite and a child Codex App Server over stdio. Neither requires a listening port or background service.
+Context Relay prepares a small handoff packet, preserves evidence and permissions, and requires the receiving chat to verify the checkpoint before taking ownership. Both desktop entry points use Python's standard library. The standalone skill uses local files and available native chat tools; the optional manager uses SQLite and a child Codex App Server over stdio. Local use requires no listening port or background service. The optional Android companion connects only after you explicitly enable the manager's HTTPS phone gateway.
 
 The repository is named **Context Relay**; the installed skill remains **`context-handoff`** so invocations and handoff references use one stable name.
 
@@ -31,7 +31,7 @@ The manager creates its own App Server conversations. **Import existing chat** l
 
 Imported task ideas may be left blank: the first Start generates a **read-only task brief** with the proposed goal, decisions, unknowns, alternative approaches and stage criteria. Review and adopt the editable brief before project work. The **Brief / Review** window also requests independent stage reviews, records human adoption separately and can explicitly start rework. Results are bound to the current requirements and file hashes; stale results cannot be adopted. Both analysis steps consume task budget. AI review, reported test evidence and human acceptance remain separate; no new automated-test success is inferred from a model report. See [briefs and review boundaries](docs/windows-manager.md#自动任务简报与阶段成果审核).
 
-Official desktop sidebar integration is not promised. The manager disables external MCP servers, apps, and plugins for its own sessions and checks reported server status; your global Codex configuration and other sessions are unchanged. The first version manages Codex only, with no phone or multi-tool control.
+Official desktop sidebar integration is not promised. The manager disables external MCP servers, apps, and plugins for its own sessions and checks reported server status; your global Codex configuration and other sessions are unchanged. The manager supports Codex only; the optional phone companion controls these managed tasks, with no multi-tool control.
 
 State is local plaintext under `%LOCALAPPDATA%\ContextRelay`: SQLite task/event records, drafts, and checkpoints. A supplied `--state-dir` chooses another directory. The state directory and project directory must be separate: neither may equal or contain the other, including for existing task records. This manager ledger is separate from the standalone skill's `CODEX_HOME/context-handoffs` files; their ownership records are not interchangeable or automatically migrated. Ownership checks fence managed requests, not arbitrary processes or other clients. Read the [Chinese usage guide and exact limits](docs/windows-manager.md). Native session acceptance is tracked there separately from simulated tests.
 
@@ -44,6 +44,12 @@ The skill installer below does **not** install or start the manager; the two ent
 The manager's global **Backup** action saves the full SQLite ledger, including imported excerpts, and managed handoff JSON files to a new local ZIP. It excludes project files, unsent input, complete native transcripts and Codex credential files. Validate with `python -m relay --inspect-backup backup.zip`; restore with `python -m relay --restore-backup backup.zip --state-dir NEW_DIRECTORY`. Restored records open in **inspection-only mode**: search, history and export work, while all execution and approval actions remain disabled. An old backup cannot prove who owns the task today. Backups are plaintext private records, not public support bundles; see [backup usage and limits](docs/windows-manager.md#整库备份与只读恢复).
 
 The Windows single-user Codex core is implemented; the full remote/multi-tool platform is not. See the [framework map and remaining gaps](docs/architecture.md) for implemented modules, version-specific evidence, and delivery/backup/diagnostic work still needed.
+
+## Android phone companion
+
+The native Android app (Android 8.0 / API 26+) can select existing managed tasks, read replies, explicitly send drafts, pause, reconcile, answer current requests, and use briefs and stage reviews. Open **手机连接 / Phone connection** on the PC, select its actual private-network address, and pair using the short-lived, single-use text. HTTPS pins the paired computer's certificate; phone credentials and pending request identities are sealed with Android Keystore. The PC must stay awake with the manager running. This controls managed tasks, not a concurrently active official Codex Desktop chat.
+
+Start with the same Wi-Fi. An independently configured private network may carry the connection, but its account login and cross-network operation are not verified here. APK installation requires Android's own confirmation; the current APK uses a local test signature, not an app-store release identity. See the [Chinese phone setup and recovery guide](docs/mobile.md), [current local APK](mobile/android/build/context-relay.apk), and [separate validation record](docs/mobile-validation.md). A distribution attachment will be provided separately; the local build path is not a published release asset.
 
 ## Standalone skill triggers
 
@@ -149,6 +155,8 @@ Opt-in [native smoke procedures](docs/windows-manager.md#验证状态) cover han
 ## 中文简介
 
 Context Relay 为长任务提供上下文检测和跨聊天交接：核验目标、授权、证据和在途操作，再移交执行权。独立技能调用名保持 `$context-handoff`，缺少建聊工具时生成手动启动指令。可选 Windows 本机管理器用 `python -m relay` 启动；按任务开启自动交接后，工作轮次结束且数据新鲜时，70% 保存无需额外推理的本地预备快照，80% 加至少两次压缩走正式交接。空闲或暂停时也可手动预备；正式交接须重新核验。阈值不测量错误概率。两者使用各自的状态记录；技能 hook 仍需在 Codex 审阅并信任，管理器不会默认随技能安装。
+
+原生 Android 手机端可通过明确开启的 HTTPS 连接控制管理器中的任务，输入先保留为草稿，操作结果未知时不自动重发。安装、同 Wi-Fi 配对、防火墙与恢复步骤见[手机使用指南](docs/mobile.md)；模拟器、原生模型及 Android 真机验收分别记录。
 
 ## License
 

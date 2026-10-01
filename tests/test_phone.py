@@ -1,0 +1,159 @@
+"""Desktop/phone ownership checks without native clients or real task state."""
+
+from pathlib import Path
+import threading
+import unittest
+from unittest import mock
+
+from relay.phone import PhoneHost, local_addresses, private_address
+from tests import test_ui as base_ui
+
+
+class PhoneUiTests(unittest.TestCase):
+    setUp = base_ui.TkSmokeTests.setUp
+    tearDown = base_ui.TkSmokeTests.tearDown
+    wait_for = base_ui.TkSmokeTests.wait_for
+
+    def test_phone_reply_cannot_clear_desktop_busy_or_unsent_draft(self):
+        self.fake.root = Path(self.temp.name)
+        self.fake.recovery_info = None
+        self.fake._connection_id = "connection-one"
+        calls = []
+
+        class Core:
+            def execute(inner, request_id, manager):
+                calls.append((request_id, threading.get_ident()))
+                manager.start("task-1", "来自手机的明确指令")
+
+            def publish_tasks(inner, *args, **kwargs):
+                pass
+
+            def close(inner):
+                pass
+
+        core = Core()
+        self.app.worker.phone.core = core
+        self.app.message_text.insert("1.0", "电脑上尚未发送的草稿")
+        self.app.busy = True
+        self.app.worker.commands.put(("remote_command", (core, "phone-command"), {}))
+        self.wait_for(lambda: self.app.tasks["task-1"]["state"] == "running")
+        self.assertEqual(calls, [("phone-command", self.app.worker.ident)])
+        self.assertTrue(self.app.busy)
+        self.assertEqual(self.app.message_text.get("1.0", "end-1c"), "电脑上尚未发送的草稿")
+        self.assertEqual(self.fake.starts, [("task-1", "来自手机的明确指令")])
+        self.app.busy = False
+
+    def test_connection_dialog_needs_no_selected_task_and_invalid_input_does_not_enable(self):
+        self.app.search.set("no-visible-task")
+        with mock.patch("relay.phone.local_addresses", return_value=["127.0.0.1"]):
+            self.app.phone_button.invoke()
+        dialog = self.app.phone_dialog
+        self.wait_for(lambda: not self.app.busy)
+        self.assertFalse(dialog.enabled)
+        self.assertTrue(dialog.stop_button.instate(["disabled"]))
+        dialog.address.set("8.8.8.8")
+        dialog.enable_button.invoke()
+        self.assertIn("私有", dialog.info.get())
+        self.assertIsNone(self.app.worker.phone.core)
+        self.assertFalse(self.fake.starts)
+
+    def test_recovery_inspection_disables_phone_control(self):
+        base_ui.TkSmokeTests.set_inspection(self)
+        self.assertTrue(self.app.phone_button.instate(["disabled"]))
+        self.app.phone_button.invoke()
+        self.assertIsNone(self.app.phone_dialog)
+        self.assertIsNone(self.app.worker.phone.core)
+
+    def test_late_phone_dialog_reply_never_updates_replacement_window(self):
+        with mock.patch("relay.phone.local_addresses", return_value=["127.0.0.1"]):
+            self.app.phone_button.invoke()
+        old = self.app.phone_dialog
+        self.wait_for(lambda: not self.app.busy)
+        old.destroy()
+        with mock.patch("relay.phone.local_addresses", return_value=["127.0.0.1"]):
+            self.app.phone_button.invoke()
+        new = self.app.phone_dialog
+        self.wait_for(lambda: not self.app.busy)
+        self.app.phone_request = (old, "remote_pair")
+        self.app._phone_result("remote_pair", {"enabled": True, "endpoint": "https://127.0.0.1:8765",
+                                                "pairing_uri": "old-secret", "devices": []})
+        self.assertFalse(new.enabled)
+        self.assertEqual(new.pairing.get("1.0", "end-1c"), "")
+
+    def test_disabled_host_never_dispatches_old_queued_command(self):
+        host = PhoneHost(self.fake, self.app.worker.commands)
+        old = mock.Mock()
+        host.execute(old, "already-queued")
+        old.execute.assert_not_called()
+
+    def _assert_local_control_gates_queued_command(self, method):
+        entered, release = threading.Event(), threading.Event()
+
+        class Core:
+            def __init__(inner):
+                inner.accepted = {"queued"}
+                inner.executed = []
+                inner.closed = inner.revoked = False
+
+            def execute(inner, request_id, manager):
+                if request_id == "block-worker":
+                    entered.set()
+                    release.wait(2)
+                elif request_id in inner.accepted:
+                    inner.executed.append(request_id)
+
+            def revoke_device(inner, device_id):
+                inner.revoked = True
+                inner.accepted.clear()
+
+            def local_status(inner):
+                return {"devices": [{"id": "phone", "name": "phone", "revoked": inner.revoked}]}
+
+            def publish_tasks(inner, *args, **kwargs):
+                pass
+
+            def close(inner):
+                inner.closed = True
+                inner.accepted.clear()
+
+        core = Core()
+        self.app.worker.phone.core = core
+        self.app.worker.phone.endpoint = "https://127.0.0.1:8765"
+        self.app.worker.commands.put(("remote_command", (core, "block-worker"), {}))
+        self.assertTrue(entered.wait(1))
+        self.app.worker.commands.put(("remote_command", (core, "queued"), {}))
+        dialog = mock.Mock()
+        dialog.winfo_exists.return_value = False
+        args = ("phone",) if method == "remote_revoke" else ()
+        submitted = self.app.submit_remote(dialog, method, *args)
+        gated_before_dispatch = core.revoked if method == "remote_revoke" else core.closed
+        release.set()
+        self.wait_for(lambda: not self.app.busy)
+        self.assertTrue(submitted)
+        self.assertTrue(gated_before_dispatch)
+        self.assertEqual(core.executed, [])
+
+    def test_local_revoke_gates_commands_while_worker_is_blocked(self):
+        self._assert_local_control_gates_queued_command("remote_revoke")
+
+    def test_local_disable_gates_commands_while_worker_is_blocked(self):
+        self._assert_local_control_gates_queued_command("remote_disable")
+
+
+class PrivateAddressTests(unittest.TestCase):
+    def test_default_route_precedes_unreachable_virtual_adapter(self):
+        addresses = [(None, None, None, None, (host, 0)) for host in ("198.51.100.10", "192.0.2.10")]
+        with mock.patch("relay.phone.socket.getaddrinfo", return_value=addresses), mock.patch("relay.phone.socket.socket") as probe:
+            probe.return_value.__enter__.return_value.getsockname.return_value = ("192.0.2.10", 40000)
+            self.assertEqual(local_addresses(), ["192.0.2.10", "198.51.100.10", "127.0.0.1"])
+
+    def test_only_explicit_local_or_private_network_addresses(self):
+        for address in ("192.0.2.10", "10.0.0.8", "127.0.0.1", "100.64.1.2"):
+            self.assertEqual(private_address(address), address)
+        for address in ("0.0.0.0", "8.8.8.8", "224.0.0.1", "169.254.1.2", "example.com", "::1"):
+            with self.assertRaises(ValueError):
+                private_address(address)
+
+
+if __name__ == "__main__":
+    unittest.main()

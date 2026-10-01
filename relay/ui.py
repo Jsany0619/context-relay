@@ -78,6 +78,7 @@ class CommandWorker(threading.Thread):
         self.commands = queue.Queue()
         self.events = queue.Queue()
         self.stop_requested = threading.Event()
+        self.phone = None
 
     def run(self):
         try:
@@ -87,6 +88,8 @@ class CommandWorker(threading.Thread):
             self.events.put(("startup_error", str(error)))
             return
         previous, last_poll_error = None, None
+        from .phone import PhoneHost
+        self.phone = PhoneHost(manager, self.commands)
         self.events.put(("ready", deepcopy(getattr(manager, "recovery_info", None))))
         while True:
             if self.stop_requested.is_set():
@@ -96,6 +99,7 @@ class CommandWorker(threading.Thread):
                     except queue.Empty:
                         break
                 try:
+                    self.phone.close()
                     manager.close()
                 except Exception as error:
                     self.stop_requested.clear()
@@ -111,17 +115,28 @@ class CommandWorker(threading.Thread):
                 continue
             if command is not None:
                 method, args, kwargs = command
-                try:
-                    result = getattr(manager, method)(*args, **kwargs)
-                except Exception as error:
-                    self.events.put(("command_error", (method, str(error))))
+                if method == "remote_command":
+                    try:
+                        self.phone.execute(*args)
+                    except Exception as error:
+                        self.events.put(("remote_error", str(error)))
                 else:
-                    self.events.put(("command_done", (method, args, deepcopy(result))))
+                    phone_actions = {"remote_enable": self.phone.enable, "remote_disable": self.phone.close,
+                                     "remote_status": self.phone.status, "remote_pair": self.phone.pair,
+                                     "remote_revoke": self.phone.revoke}
+                    try:
+                        action = phone_actions[method] if method in phone_actions else getattr(manager, method)
+                        result = action(*args, **kwargs)
+                    except Exception as error:
+                        self.events.put(("command_error", (method, str(error))))
+                    else:
+                        self.events.put(("command_done", (method, args, deepcopy(result))))
                 if self.stop_requested.is_set():
                     continue
             try:
                 manager.poll()
                 tasks = deepcopy(manager.list_tasks())
+                self.phone.publish(tasks)
                 if tasks != previous:
                     previous = tasks
                     self.events.put(("tasks", tasks))
@@ -679,6 +694,8 @@ class RelayApp:
         self.import_request = None
         self.assessment_dialogs = {}
         self.assessment_request = None
+        self.phone_dialog = None
+        self.phone_request = None
         self.root.title("Context Relay · 本机任务管理器")
         width = min(1180, max(1, self.root.winfo_screenwidth() - 80))
         height = min(850, max(1, self.root.winfo_screenheight() - 120))
@@ -708,6 +725,8 @@ class RelayApp:
         self.import_button.pack(side="right")
         self.assessment_button = ttk.Button(header, text="简报 / 审核", command=self._open_assessment)
         self.assessment_button.pack(side="right", padx=8)
+        self.phone_button = ttk.Button(header, text="手机连接", command=self._open_phone)
+        self.phone_button.pack(side="right")
         ttk.Label(self.root, text="仅管理这里创建或主动导入的任务；导入不会修改原聊天。", foreground="#555555").pack(anchor="w", padx=16, pady=(0, 8))
         self.recovery_banner = ttk.Label(self.root, wraplength=1140, justify="left", foreground="#8a3b00")
         panes = ttk.Panedwindow(self.root, orient="horizontal")
@@ -787,19 +806,52 @@ class RelayApp:
         ttk.Label(self.root, textvariable=self.status, wraplength=1140, justify="left").pack(fill="x", padx=16, pady=10)
         self._controls()
 
-    def submit(self, method, *args, **kwargs):
+    def submit(self, method, *args, _before_enqueue=None, **kwargs):
         if not self.ready or self.busy or self.closing:
             return False
         if self.recovery_info is not None and method not in ("get_task", "export_task"):
             self.status.set("恢复库为永久只读检视，不能继续任务或修改记录。")
             return False
-        if method not in ("create_task", "backup_state", "list_import_threads", "preview_import", "import_thread") and args and args[0] not in self.visible_ids:
+        if method not in ("create_task", "backup_state", "list_import_threads", "preview_import", "import_thread",
+                          "remote_enable", "remote_disable", "remote_status", "remote_pair", "remote_revoke") and args and args[0] not in self.visible_ids:
             return False
+        if _before_enqueue is not None:
+            _before_enqueue()
         self.busy = True
         self.status.set("正在处理，请稍候…")
         self._controls()
         self.worker.commands.put((method, args, kwargs))
         return True
+
+    def _open_phone(self):
+        if self.phone_button.instate(["disabled"]):
+            return
+        if self.phone_dialog is not None and self.phone_dialog.winfo_exists():
+            self.phone_dialog.lift()
+            return
+        from .phone import PhoneDialog
+        self.phone_dialog = PhoneDialog(self)
+
+    def submit_remote(self, dialog, method, *args):
+        gate = (lambda: self.worker.phone.gate_control(method, *args)
+                if method in ("remote_disable", "remote_revoke") else None)
+        try:
+            if self.submit(method, *args, _before_enqueue=gate):
+                self.phone_request = (dialog, method)
+                return True
+        except Exception as error:
+            if dialog.winfo_exists():
+                dialog.deliver(error=str(error))
+            self.status.set(f"需要处理：{error}")
+        return False
+
+    def _phone_result(self, method, result=None, error=None):
+        request = self.phone_request
+        if request is not None and request[1] == method:
+            self.phone_request = None
+            dialog = request[0]
+            if not self.closing and dialog.winfo_exists():
+                dialog.deliver(result, error)
 
     def _open_import(self):
         if self.import_button.instate(["disabled"]):
@@ -1084,6 +1136,9 @@ class RelayApp:
                                         state="normal" if self.attention_count and not self.closing else "disabled")
         self.new_button.configure(state="normal" if available and not inspection else "disabled")
         self.import_button.configure(state="normal" if available and not inspection else "disabled")
+        self.phone_button.configure(state="normal" if available and not inspection else "disabled")
+        if self.phone_dialog is not None and self.phone_dialog.winfo_exists():
+            self.phone_dialog.controls()
         if self.import_dialog is not None and self.import_dialog.winfo_exists():
             self.import_dialog.controls()
         backup_safe = not any(task.get("state") in ACTIVE or task.get("pending") for task in self.tasks.values())
@@ -1171,6 +1226,7 @@ class RelayApp:
                 method, args, result = value
                 self._import_result(method, result=result)
                 self._assessment_result(method)
+                self._phone_result(method, result=result)
                 if method in ("create_task", "import_thread") and isinstance(result, dict):
                     self.search.set("")
                     self.state_filter.set(FILTERS[0])
@@ -1199,11 +1255,14 @@ class RelayApp:
                     self.busy = False
                     self._import_result(value[0], error=value[1])
                     self._assessment_result(value[0], error=value[1])
+                    self._phone_result(value[0], error=value[1])
                     value = value[1]
                 if kind == "close_error":
                     self.closing = False
                     self.busy = False
                 self.status.set(f"需要处理：{value}")
+            elif kind == "remote_error":
+                self.status.set(f"手机操作需核对：{value}")
             elif kind == "closed":
                 self.closed = True
                 self.root.destroy()
