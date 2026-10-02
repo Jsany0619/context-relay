@@ -529,6 +529,21 @@ class TkSmokeTests(unittest.TestCase):
         self.assertEqual(self.app.message_text.get("1.0", "end-1c"), "下一次补充")
         self.assertEqual(self.fake.starts, [("task-1", "已发送的要求")])
 
+    def test_send_preserves_whitespace_and_closed_original_window_stays_closed(self):
+        original = "  请保留原话\n末尾空格  "
+        self.app.message_text.insert("1.0", original)
+        self.app.buttons["start"].invoke()
+        self.wait_for(lambda: bool(self.fake.starts) and not self.app.busy)
+        self.assertEqual(self.fake.starts[-1], ("task-1", original))
+        self.assertEqual(self.app.message_text.get("1.0", "end-1c"), "")
+        window = self.app.conversation_window = tk.Toplevel(self.root)
+        window.destroy()
+        self.app.busy = True
+        self.app.worker.events.put(("command_done", ("read_chat", ("task-1",), {"entries": []})))
+        self.wait_for(lambda: not self.app.busy)
+        self.assertIs(self.app.conversation_window, window)
+        self.assertFalse(window.winfo_exists())
+
     def test_history_is_read_only_redacted_and_bound_to_requested_task(self):
         self.add_task()
         self.fake.tasks[0]["events"] = [

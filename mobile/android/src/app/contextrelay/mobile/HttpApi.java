@@ -38,7 +38,7 @@ public final class HttpApi {
 
     public JSONObject request(String method, String path, JSONObject body) throws Exception {
         requireUnlocked();
-        if (!path.startsWith("/v1/") || path.contains("..") || path.contains("?") || path.contains("#"))
+        if (!Protocol.validApiPath(method, path))
             throw new IllegalArgumentException("Invalid API path");
         HttpsURLConnection connection = (HttpsURLConnection) new URL(endpoint + path).openConnection();
         connection.setSSLSocketFactory(ssl.getSocketFactory());

@@ -162,6 +162,8 @@ class AssessmentRecoveryTests(unittest.TestCase):
         self.client.responses["thread/read"].append(self.receipt(running, report=brief_report()))
         recovered = self.manager.reconcile(running["id"])
         self.assertEqual(recovered["state"], "paused")
+        self.assertEqual(recovered["last_message"], "")
+        self.assertEqual(recovered["last_message_kind"], "brief")
         self.assertIsNone(recovered["thread_id"])
         self.assertIsNone(recovered["analysis_thread_id"])
         self.assertEqual(recovered["goal"], original["goal"])

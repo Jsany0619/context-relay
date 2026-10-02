@@ -1,10 +1,12 @@
 """Explicit, same-process phone connection and its small desktop dialog."""
 
 import ipaddress
+from datetime import datetime
 from pathlib import Path
 import socket
 import tkinter as tk
 from tkinter import ttk
+import time
 import webbrowser
 
 
@@ -63,7 +65,8 @@ class PhoneHost:
         from .gateway import GatewayCore, RemoteGateway, ensure_certificate
         cert, key, fingerprint = ensure_certificate(self.manager.root)
         core = GatewayCore(self.manager.root, lambda request_id:
-                           self.commands.put(("remote_command", (core, request_id), {})))
+                           self.commands.put(("remote_command", (core, request_id), {})),
+                           conversation_reader=getattr(self.manager, "read_chat", None))
         server = None
         try:
             core.publish_tasks(self.manager.list_tasks(), recovery_info=self.manager.recovery_info,
@@ -92,8 +95,12 @@ class PhoneHost:
     def pair(self, task_ids=(), scope="read_only"):
         if self.core is None:
             raise ValueError("请先开启手机连接。")
-        return {**self.status(), "pairing_uri": self.core.new_pairing(
-            self.endpoint, self.fingerprint, list(task_ids), scope)}
+        from .gateway import PAIRING_TTL_SECONDS
+        created_at = time.time()
+        pairing_uri = self.core.new_pairing(
+            self.endpoint, self.fingerprint, list(task_ids), scope)
+        return {**self.status(), "pairing_uri": pairing_uri,
+                "pairing_expires_at": created_at + PAIRING_TTL_SECONDS}
 
     def revoke(self, device_id):
         if self.core is None:
@@ -132,6 +139,9 @@ class PhoneDialog(tk.Toplevel):
     def __init__(self, app):
         super().__init__(app.root)
         self.app, self.enabled, self.devices = app, False, []
+        self._pairing_request = self._pairing_snapshot = None
+        self._pairing_deadline = self._pairing_timer = None
+        self._pairing_serial = 0
         self.title("手机连接 · Context Relay")
         self.transient(app.root)
         self.geometry(f"{min(720, self.winfo_screenwidth() - 80)}x{min(580, self.winfo_screenheight() - 120)}")
@@ -161,10 +171,12 @@ class PhoneDialog(tk.Toplevel):
         self.scope_box = ttk.Combobox(permission_row, textvariable=self.scope,
                                       values=("仅查看", "查看与控制"), state="readonly", width=14)
         self.scope_box.pack(side="left", padx=8)
+        self.scope_box.bind("<<ComboboxSelected>>", self._pairing_choices_changed)
         ttk.Label(permission_row, text="控制权限可发送、暂停和审批任务。").pack(side="left")
         ttk.Label(body, text="选择这台手机可访问的任务（默认全不选）").pack(anchor="w")
         self.task_list = tk.Listbox(body, height=4, selectmode="extended", exportselection=False)
         self.task_list.pack(fill="x", pady=(3, 8))
+        self.task_list.bind("<<ListboxSelect>>", self._pairing_choices_changed)
         self.task_ids = []
         self._sync_tasks()
         buttons = ttk.Frame(body)
@@ -211,25 +223,98 @@ class PhoneDialog(tk.Toplevel):
                     if index < len(self.task_ids)}
         tasks = [task for task in self.app.tasks.values() if not task.get("archived")]
         ids = [task["id"] for task in tasks]
-        if ids == self.task_ids:
+        if ids == self.task_ids and self.task_list.size():
             return
         self.task_ids = ids
+        # A native Tk Listbox ignores content edits while disabled.
+        self.task_list.configure(state="normal")
         self.task_list.delete(0, "end")
+        if not tasks:
+            self.task_list.insert("end", "暂无可授权任务；请先在主窗口新建或导入任务。")
         for index, task in enumerate(tasks):
             self.task_list.insert("end", f"{task.get('title', '未命名任务')} · {task['id'][:8]}")
             if task["id"] in selected:
                 self.task_list.selection_set(index)
+        if self._pairing_snapshot is not None and self._choice_snapshot() != self._pairing_snapshot:
+            self._clear_pairing("任务列表已变化，请重新选择并生成配对信息。")
+
+    def _choice_snapshot(self):
+        task_ids = tuple(self.task_ids[index] for index in self.task_list.curselection()
+                         if index < len(self.task_ids))
+        scope = {"仅查看": "read_only", "查看与控制": "control"}.get(self.scope.get())
+        return task_ids, scope
+
+    def _pairing_choices_changed(self, _event=None):
+        if self._pairing_snapshot is not None and self._choice_snapshot() != self._pairing_snapshot:
+            self._clear_pairing("选择已变化，旧配对信息已清除；请重新生成。")
+        self.controls()
+
+    def _clear_pairing(self, message=None):
+        self._pairing_serial += 1
+        if self._pairing_timer is not None:
+            try:
+                self.after_cancel(self._pairing_timer)
+            except tk.TclError:
+                pass
+        self._pairing_timer = self._pairing_snapshot = self._pairing_deadline = None
+        self.pairing.configure(state="normal")
+        self.pairing.delete("1.0", "end")
+        self.pairing.configure(state="disabled")
+        if message:
+            self.info.set(message)
+
+    def _show_pairing(self, value, snapshot, deadline):
+        try:
+            deadline = float(deadline)
+        except (TypeError, ValueError):
+            self._clear_pairing("无法确认配对信息有效期，请重新生成。")
+            return
+        if deadline <= time.time():
+            self._clear_pairing("配对信息已过期，请重新生成。")
+            return
+        self._clear_pairing()
+        self._pairing_snapshot, self._pairing_deadline = snapshot, deadline
+        self.pairing.configure(state="normal")
+        self.pairing.insert("1.0", value)
+        self.pairing.configure(state="disabled")
+        serial = self._pairing_serial
+        delay = max(1, int((deadline - time.time()) * 1000))
+        self._pairing_timer = self.after(delay, self._expire_pairing, serial)
+        scope = "仅查看" if snapshot[1] == "read_only" else "查看与控制"
+        self.info.set(f"配对信息已生成：{len(snapshot[0])} 个任务 · {scope}。请在 5 分钟内到手机完成配对。")
+
+    def _expire_pairing(self, serial):
+        if serial != self._pairing_serial or self._pairing_deadline is None:
+            return
+        if self._pairing_deadline > time.time():
+            self._pairing_timer = self.after(
+                max(1, int((self._pairing_deadline - time.time()) * 1000)),
+                self._expire_pairing, serial)
+            return
+        self._clear_pairing("配对信息已过期，请重新生成。")
+        self.controls()
 
     def pair(self):
-        task_ids = [self.task_ids[index] for index in self.task_list.curselection()
-                    if index < len(self.task_ids)]
+        task_ids, scope = self._choice_snapshot()
         if not task_ids:
             self.info.set("请先选择至少一个允许手机访问的任务。")
             return
-        scope = {"仅查看": "read_only", "查看与控制": "control"}[self.scope.get()]
-        self.submit("remote_pair", task_ids, scope)
+        self._clear_pairing()
+        self._pairing_request = (task_ids, scope)
+        self.info.set("正在按当前任务和权限生成配对信息…")
+        if not self.submit("remote_pair", list(task_ids), scope):
+            self._pairing_request = None
+        self.controls()
 
     def copy(self):
+        if self._pairing_snapshot is None or self._choice_snapshot() != self._pairing_snapshot:
+            self._clear_pairing("选择已变化，旧配对信息已清除；请重新生成。")
+            self.controls()
+            return
+        if self._pairing_deadline is None or self._pairing_deadline <= time.time():
+            self._clear_pairing("配对信息已过期，请重新生成。")
+            self.controls()
+            return
         value = self.pairing.get("1.0", "end-1c")
         if value:
             self.clipboard_clear()
@@ -244,8 +329,23 @@ class PhoneDialog(tk.Toplevel):
     def open_help(self):
         webbrowser.open((Path(__file__).resolve().parents[1] / "docs/mobile.md").as_uri())
 
+    @staticmethod
+    def _expiry_label(value):
+        if not isinstance(value, str):
+            return ""
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                return ""
+            return parsed.astimezone().strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            return ""
+
     def deliver(self, result=None, error=None):
         if error:
+            if self._pairing_request is not None:
+                self._pairing_request = None
+                self._clear_pairing()
             self.info.set(error)
         elif isinstance(result, dict) and result.get("kind") == "network_diagnostics":
             addresses = "\n可用私有地址：" + "、".join(result.get("local_ipv4", [])) if result.get("local_ipv4") else ""
@@ -258,29 +358,48 @@ class PhoneDialog(tk.Toplevel):
                 state = "已撤销" if device.get("revoked") else "已过期" if device.get("expired") else "已配对"
                 scope = {"read_only": "仅查看", "control": "查看与控制"}.get(
                     device.get("scope"), "旧权限失效")
+                expiry = self._expiry_label(device.get("expires_at"))
                 self.device_list.insert("end", f"{device.get('name', '手机')} · {state} · "
                                                f"{scope} · "
-                                               f"{len(device.get('task_ids', []))} 个任务")
+                                               f"{len(device.get('task_ids', []))} 个任务"
+                                               + (f" · 到期 {expiry}" if expiry else ""))
             self.info.set((f"连接已开启：{result['endpoint']}\n"
                            "若无法连接，核对同一网络及 Windows 防火墙。关闭窗口不会关闭连接。")
                           if self.enabled else "手机连接已关闭；不会再接收手机指令。")
-            if "pairing_uri" in result or not self.enabled:
-                self.pairing.configure(state="normal")
-                self.pairing.delete("1.0", "end")
-                self.pairing.insert("1.0", result.get("pairing_uri", ""))
-                self.pairing.configure(state="disabled")
+            if "pairing_uri" in result:
+                requested, self._pairing_request = self._pairing_request, None
+                if requested is None or requested != self._choice_snapshot():
+                    self._clear_pairing("选择已变化，返回的旧配对信息已丢弃；请重新生成。")
+                else:
+                    self._show_pairing(result["pairing_uri"], requested,
+                                       result.get("pairing_expires_at"))
+            elif not self.enabled:
+                self._pairing_request = None
+                self._clear_pairing()
         self.controls()
 
     def controls(self):
         self._sync_tasks()
         available = self.app.ready and not self.app.busy and not self.app.closing and self.app.recovery_info is None
-        for widget, enabled in ((self.enable_button, not self.enabled), (self.pair_button, self.enabled),
+        selected = bool(self._choice_snapshot()[0])
+        for widget, enabled in ((self.enable_button, not self.enabled),
+                                (self.pair_button, self.enabled and selected and self._pairing_request is None),
                                 (self.stop_button, self.enabled), (self.refresh_button, True),
                                 (self.network_button, True),
                                 (self.revoke_button, self.enabled and bool(self.devices))):
             widget.configure(state="normal" if available and enabled else "disabled")
-        self.copy_button.configure(state="normal" if self.enabled and self.pairing.get("1.0", "end-1c") else "disabled")
+        self.copy_button.configure(state="normal" if self.enabled and self._pairing_snapshot is not None
+                                   and self.pairing.get("1.0", "end-1c") else "disabled")
         self.address_box.configure(state="normal" if available and not self.enabled else "disabled")
         self.port_box.configure(state="normal" if available and not self.enabled else "disabled")
         self.scope_box.configure(state="readonly" if available else "disabled")
-        self.task_list.configure(state="normal" if available else "disabled")
+        self.task_list.configure(state="normal" if available and self.task_ids else "disabled")
+
+    def destroy(self):
+        if self._pairing_timer is not None:
+            try:
+                self.after_cancel(self._pairing_timer)
+            except tk.TclError:
+                pass
+            self._pairing_timer = None
+        super().destroy()

@@ -16,6 +16,57 @@ SOURCE = "019a0000-0000-7000-8000-000000000001"
 
 
 class ImportManagerTests(unittest.TestCase):
+    def test_direct_connection_preserves_thread_and_sends_only_verbatim_input(self):
+        preview = self.preview()
+        self.read_source()
+        task = self.manager.import_thread(SOURCE, preview["fingerprint"], title="Original conversation",
+                                        goal="", source_stopped=True, direct=True)
+        self.assertEqual(task["thread_id"], SOURCE)
+        self.assertFalse(task["brief_required"])
+        self.assertFalse(self.client.calls_for("thread/resume"))
+        for action in (self.manager.analyze, self.manager.revise_from_review, self.manager.handoff):
+            with self.assertRaises(ValueError):
+                action(task["id"])
+        self.read_source()
+        self.client.responses["thread/resume"].append({"thread": {"id": SOURCE}, "cwd": str(self.project),
+            "sandbox": {"type": "readOnly"}, "approvalPolicy": "on-request", "model": "test-model"})
+        original = "  请核对我的原话\r\n不增加目标，不改写。  "
+        started = self.manager.start(task["id"], original)
+        request = self.client.calls_for("turn/start")[-1]
+        self.assertEqual(request["threadId"], SOURCE)
+        self.assertEqual(request["input"], [{"type": "text", "text": original}])
+        self.assertNotIn("outputSchema", request)
+        self.assertFalse(self.client.calls_for("thread/start"))
+        self.assertEqual(started["mode"], "read-only")
+        self.assertEqual(started["work_turns"], 0)
+
+    def test_native_text_read_does_not_resume_or_run_analysis_and_preserves_whitespace(self):
+        task = self.import_task()
+        self.source["turns"][0]["items"][1]["text"] = "  原文\n完整返回  "
+        self.read_source()
+        before = self.manager._task(task["id"])
+        page = self.manager.read_chat(task["id"])
+        self.assertEqual(page["entries"][-1]["text"], "  原文\n完整返回  ")
+        self.assertEqual(page["connection_mode"], "imported")
+        self.assertEqual(page["thread_id"], SOURCE)
+        self.assertEqual(self.manager._task(task["id"]), before)
+        self.assertFalse(self.client.calls_for("turn/start"))
+        self.assertFalse(self.client.calls_for("thread/resume"))
+
+    def test_direct_empty_message_or_unsettled_native_operations_never_start(self):
+        preview = self.preview()
+        self.read_source()
+        task = self.manager.import_thread(SOURCE, preview["fingerprint"], title="Original", goal="",
+                                         source_stopped=True, direct=True)
+        with self.assertRaises(ValueError):
+            self.manager.start(task["id"], " \n ")
+        self.source["turns"][0]["items"].append({"id": "tool", "type": "commandExecution", "status": "inProgress"})
+        self.read_source()
+        with self.assertRaises(ValueError):
+            self.manager.start(task["id"], "原样发送")
+        self.assertFalse(self.client.calls_for("thread/resume"))
+        self.assertFalse(self.client.calls_for("turn/start"))
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

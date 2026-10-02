@@ -64,6 +64,32 @@ class FakeManager:
 
 
 class GatewayTests(unittest.TestCase):
+    def test_original_conversation_read_is_scoped_and_never_enqueues_execution(self):
+        calls = []
+        original = "  中文原话\r\n末尾保留  "
+        def read(task_id, cursor):
+            calls.append((task_id, cursor))
+            return {"entries": [{"role": "assistant", "text": original}], "older_cursor": None}
+        self.core._conversation_reader = read
+        fingerprint, context = self.start_gateway()
+        paired, _, _ = self.pair(context, fingerprint, scope="read_only")
+        status, _, result = self.request(context, "GET", f"/v1/tasks/{TASK_ID}/conversation?cursor=abc%2Bdef",
+                                          token=paired["token"])
+        self.assertEqual(status, 200)
+        self.assertEqual(result["entries"][0]["text"], original)
+        self.assertEqual(calls, [(TASK_ID, "abc+def")])
+        self.assertEqual(self.enqueued, [])
+        status, _, _ = self.request(context, "GET", f"/v1/tasks/{OTHER_ID}/conversation", token=paired["token"])
+        self.assertNotEqual(status, 200)
+        self.assertEqual(len(calls), 1)
+        def revoked_read(task_id, cursor):
+            self.core.revoke_device(paired["device_id"])
+            return {"text": original}
+        self.core._conversation_reader = revoked_read
+        status, _, result = self.request(context, "GET", f"/v1/tasks/{TASK_ID}/conversation", token=paired["token"])
+        self.assertNotEqual(status, 200)
+        self.assertNotIn(original, json.dumps(result, ensure_ascii=False))
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

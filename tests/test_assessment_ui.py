@@ -1,6 +1,7 @@
 """Assessment UI contract checks with fake reports; no native client or real task library."""
 from copy import deepcopy
 import gc
+import json
 import tempfile
 import threading
 import time
@@ -8,6 +9,7 @@ import tkinter as tk
 import unittest
 
 from relay.ui import RelayApp
+from relay import ui
 from tests import test_import_ui as import_ui
 from tests import test_ui as base_ui
 
@@ -62,6 +64,11 @@ class AssessmentManager(import_ui.ImportManager):
     def revise_from_review(self, task_id):
         task = self.action("revise_from_review", task_id)
         task["review"]["decision"] = "revise"
+        return deepcopy(task)
+
+    def reconcile(self, task_id):
+        task = self.action("reconcile", task_id)
+        task.update(state="paused", purpose=None, assessment=None, analysis_thread_id=None, error="")
         return deepcopy(task)
 
 
@@ -218,6 +225,66 @@ class AssessmentUiTests(unittest.TestCase):
         self.assertEqual(len(self.fake.assessment_calls), 1)
         self.assertFalse(self.fake.starts)
 
+    def test_rejected_brief_is_readable_and_only_explicitly_retried(self):
+        raw = json.dumps(brief_record()["report"], ensure_ascii=False)
+        self.fake.tasks[0].update(last_message=raw, last_message_kind="brief", state="idle",
+                                 work_turns=0, brief_required=True,
+                                 error="chat evidence is not present in the bound source snapshot")
+        self.wait_for(lambda: self.app.tasks["task-1"].get("last_message_kind") == "brief")
+        displayed = self.app.latest_text.get("1.0", "end-1c")
+        self.assertNotIn(raw, displayed)
+        self.assertIn("未通过", displayed)
+        self.assertIn("聊天引用", displayed)
+        self.assertNotIn("chat evidence", self.app.details.get())
+        dialog = self.open_assessment()
+        self.assertIn("重新整理", dialog.task_status.get())
+        self.assertIn("模型用量", dialog.task_status.get())
+        self.assertTrue(dialog.adopt_button.instate(["disabled"]))
+        self.assertFalse(dialog.generate_brief.instate(["disabled"]))
+        self.assertEqual(dialog.goal_text.get("1.0", "end-1c"), "")
+        self.assertFalse(self.fake.assessment_calls)
+        self.assertFalse(self.fake.starts)
+        self.assertEqual(self.fake.tasks[0]["mode"], "read-only")
+
+    def test_unknown_analysis_points_to_reconcile_before_explicit_regeneration(self):
+        self.fake.tasks[0].update(last_message=json.dumps(brief_record()["report"]), last_message_kind="brief",
+                                 state="needs_reconcile", work_turns=0, brief_required=True,
+                                 purpose="brief", assessment={"kind": "brief"}, analysis_thread_id="analysis",
+                                 error="chat evidence is not present in the bound source snapshot")
+        self.wait_for(lambda: self.app.tasks["task-1"]["state"] == "needs_reconcile")
+        dialog = self.open_assessment()
+        self.assertIn("核对恢复", dialog.task_status.get())
+        self.assertTrue(dialog.generate_brief.instate(["disabled"]))
+        self.assertTrue(dialog.adopt_button.instate(["disabled"]))
+        self.assertFalse(self.app.buttons["reconcile"].instate(["disabled"]))
+        self.assertFalse(self.fake.assessment_calls)
+        self.app.buttons["reconcile"].invoke()
+        self.wait_for(lambda: not self.app.busy and self.app.tasks["task-1"]["state"] == "paused")
+        self.assertIn("重新整理", dialog.task_status.get())
+        self.assertFalse(dialog.generate_brief.instate(["disabled"]))
+        self.assertEqual([item[0] for item in self.fake.assessment_calls], ["reconcile"])
+        dialog.generate_brief.invoke()
+        self.wait_for(lambda: not self.app.busy)
+        self.assertEqual([item[0] for item in self.fake.assessment_calls], ["reconcile", "analyze"])
+        self.assertFalse(self.fake.starts)
+        self.assertEqual(self.fake.tasks[0]["mode"], "read-only")
+
+    def test_validated_brief_explains_adopt_then_start_in_current_mode(self):
+        self.fake.tasks[0].update(brief=brief_record(), last_message=json.dumps(brief_record()["report"]),
+                                 last_message_kind="brief", brief_required=True, work_turns=0)
+        self.wait_for(lambda: bool(self.app.tasks["task-1"].get("brief")))
+        displayed = self.app.latest_text.get("1.0", "end-1c")
+        self.assertIn("建议目标", displayed)
+        self.assertIn("采用", displayed)
+        self.assertNotIn('"decisions"', displayed)
+        dialog = self.open_assessment()
+        dialog.adopt_button.invoke()
+        self.wait_for(lambda: not self.app.busy and self.app.tasks["task-1"]["brief"]["decision"] == "adopted")
+        self.assertIn("启动 / 继续", dialog.task_status.get())
+        self.assertIn("只读", dialog.task_status.get())
+        self.assertFalse(self.fake.starts)
+        self.assertEqual(self.fake.tasks[0]["mode"], "read-only")
+
     def test_empty_import_goal_queues_brief_without_starting(self):
         self.app.import_button.invoke()
         dialog = self.app.import_dialog
@@ -260,6 +327,28 @@ class AssessmentUiTests(unittest.TestCase):
                         self.assertLessEqual(button.winfo_rooty() + button.winfo_height(), dialog.winfo_rooty() + dialog.winfo_height())
                         self.assertLessEqual(button.winfo_rootx() + button.winfo_width(), dialog.winfo_rootx() + dialog.winfo_width())
                 dialog.destroy()
+
+
+class AnalysisDisplayTests(unittest.TestCase):
+    def test_work_json_and_unrelated_legacy_json_are_never_hidden(self):
+        raw = json.dumps(brief_record()["report"])
+        self.assertEqual(ui.task_reply({"last_message_kind": "work", "last_message": raw,
+                                        "brief_required": True, "work_turns": 0}), raw)
+        self.assertEqual(ui.task_reply({"purpose": "work", "last_message": raw,
+                                        "brief_required": True, "work_turns": 0}), raw)
+        for value in ('{"goal":"ordinary JSON"}', '{"status":"done"}', raw):
+            self.assertEqual(ui.task_reply({"last_message": value, "work_turns": 1}), value)
+
+    def test_legacy_detection_needs_strict_shape_and_import_brief_context(self):
+        report = brief_record()["report"]
+        report["evidence"] = [{"source": "chat", "reference": "synthetic/missing", "finding": "Unverified"}]
+        raw = json.dumps(report)
+        task = {"last_message": raw, "brief_required": True, "work_turns": 0, "state": "paused"}
+        self.assertNotIn(raw, ui.task_reply(task))
+        self.assertNotIn(report["goal"], ui.task_reply(task))  # Shape recognition is not evidence acceptance.
+        for changed in (dict(report, extra="value"), dict(report, decisions="wrong type")):
+            value = json.dumps(changed)
+            self.assertEqual(ui.task_reply(dict(task, last_message=value)), value)
 
 
 if __name__ == "__main__":

@@ -4,16 +4,26 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.KeyguardManager;
 import android.content.Intent;
+import android.content.ClipData;
+import android.content.ClipDescription;
+import android.content.ClipboardManager;
 import android.graphics.Color;
+import android.graphics.Rect;
+import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PersistableBundle;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextUtils;
 import android.text.TextWatcher;
+import android.text.SpannableStringBuilder;
+import android.text.Spanned;
+import android.text.style.StyleSpan;
+import android.text.style.RelativeSizeSpan;
 import android.util.Base64;
 import android.view.View;
 import android.view.Gravity;
@@ -21,6 +31,7 @@ import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.HorizontalScrollView;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import java.net.URI;
@@ -34,6 +45,8 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.UUID;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import org.json.JSONArray;
@@ -58,16 +71,24 @@ public final class MainActivity extends Activity {
     private LinearLayout operationPanel;
     private LinearLayout root, header, composer, timeline;
     private TextView taskStatus;
-    private Button send, pause;
+    private Button send, pause, latest, requestsAction;
+    private Button originalAction, olderOriginal, newerOriginal, latestOriginal;
+    private LinearLayout originalPanel;
+    private TextView originalInfo;
+    private JSONObject originalPage;
+    private String originalCursor;
+    private boolean originalView, originalChoice;
     private ScrollView scroll;
     private EditText message;
-    private boolean busy, popup, storageFailed, pairingView, authPending, unlockApproved, offline, requestOnResume = true;
+    private boolean busy, refreshing, popup, storageFailed, pairingView, authPending, unlockApproved, offline, requestOnResume = true;
     private volatile boolean foreground, unlocked;
     private volatile int authEpoch;
+    private boolean keyboardOpen;
     private int generation;
     private String selectedId;
     private String incomingPair;
     private String timelineSignature = "";
+    private String listSignature = "";
     private String resumeTaskId;
 
     private interface Job { JSONObject run(int epoch) throws Exception; }
@@ -76,10 +97,10 @@ public final class MainActivity extends Activity {
     private final Runnable poller = new Runnable() {
         public void run() {
             if (!authorized() || isFinishing()) return;
-            if (!busy && !popup && !pairingView && connection() != null && !connection().optBoolean("needs_pairing")) {
+            if (!busy && !refreshing && !popup && !pairingView && connection() != null && !connection().optBoolean("needs_pairing")) {
                 if (pending() != null && !pending().optBoolean("rejected")
                         && (pending().optJSONObject("receipt") == null || !Protocol.terminalReceipt(pending().optJSONObject("receipt").optString("state")))) queryOperation();
-                else if (pending() == null) refresh();
+                else if (pending() == null) refresh(true);
             }
             handler.postDelayed(this, 5000);
         }
@@ -171,11 +192,18 @@ public final class MainActivity extends Activity {
         operation.setTextColor(Color.rgb(138, 59, 0));
         scroll = new ScrollView(this);
         scroll.setFillViewport(true);
+        scroll.setOnScrollChangeListener((view, x, y, oldX, oldY) -> updateLatestButton());
         content = column();
         scroll.addView(content);
         root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
         composer = column(); root.addView(composer);
         setContentView(root);
+        root.getViewTreeObserver().addOnGlobalLayoutListener(() -> {
+            if (!authorized()) return;
+            Rect visible = new Rect(); root.getWindowVisibleDisplayFrame(visible);
+            boolean open = root.getRootView().getHeight() - visible.bottom > dp(150);
+            if (open != keyboardOpen) { keyboardOpen = open; compactChat(); }
+        });
         if (connection() == null || incomingPair != null) showPairing();
         else {
             if (task != null) { selectedId = resumeTaskId; showTask(); }
@@ -216,7 +244,7 @@ public final class MainActivity extends Activity {
                 put(saved, "selected_task", selectedId == null ? JSONObject.NULL : selectedId);
                 if (task != null && connection() != null && !connection().optBoolean("needs_pairing")) {
                     JSONObject snapshot = new JSONObject();
-                    for (String name : new String[] {"id", "title", "state", "mode", "last_message", "messages", "messages_truncated", "error"})
+                    for (String name : new String[] {"id", "title", "state", "mode", "last_message", "messages", "messages_truncated", "error", "connection_mode"})
                         if (task.has(name)) put(snapshot, name, task.opt(name));
                     if (snapshot.toString().getBytes(StandardCharsets.UTF_8).length <= 512 * 1024) {
                         put(saved, "last_task", snapshot); put(saved, "last_task_pin", connection().optString("certificate_sha256"));
@@ -228,6 +256,9 @@ public final class MainActivity extends Activity {
         foreground = false; unlocked = false;
         for (AlertDialog dialog : new ArrayList<>(dialogs)) dialog.dismiss();
         saved = null; drafts = null; vault = null; task = null; tasks = new JSONArray();
+        if (timeline != null) clearTimeline();
+        if (originalPanel != null) originalPanel.removeAllViews();
+        originalPage = null; originalCursor = null; originalInfo = null; timelineSignature = "";
         selectedId = null; message = null;
         showLocked("请验证手机锁屏身份后继续。");
         super.onPause();
@@ -288,8 +319,12 @@ public final class MainActivity extends Activity {
     }
     private void clearPage() {
         generation++; content.removeAllViews(); header.removeAllViews(); composer.removeAllViews();
-        actions.clear(); message = null; timeline = null; timelineSignature = ""; operationPanel = null;
-        taskStatus = null; send = null; pause = null;
+        actions.clear(); message = null; timeline = null; timelineSignature = ""; listSignature = ""; operationPanel = null;
+        taskStatus = null; send = null; pause = null; latest = null; requestsAction = null;
+        originalAction = null; originalPanel = null; originalInfo = null;
+        olderOriginal = null; newerOriginal = null; latestOriginal = null;
+        originalPage = null; originalCursor = null; originalView = false; originalChoice = false;
+        status.setMaxLines(2); operation.setMaxLines(2);
         text(header, "Context Relay", 22);
     }
     private JSONObject connection() { return saved == null ? null : saved.optJSONObject("connection"); }
@@ -318,6 +353,9 @@ public final class MainActivity extends Activity {
     private void error(Exception ex) {
         if (!authorized()) return;
         if (ex instanceof IllegalArgumentException) { if (status != null) status.setText(safeError(ex)); return; }
+        if (ex instanceof HttpApi.ApiError && "invalid_pairing".equals(((HttpApi.ApiError) ex).code)) {
+            status.setText("配对信息无效、已使用或已过期。请在电脑重新生成配对信息，再完整复制到这里。"); return;
+        }
         offline = true;
         if (ex instanceof HttpApi.ApiError && ((HttpApi.ApiError) ex).status == 401) expireConnection();
         if (status != null) status.setText(ex instanceof HttpApi.ApiError && ((HttpApi.ApiError) ex).status == 401
@@ -345,8 +383,13 @@ public final class MainActivity extends Activity {
     }
 
     private void run(String label, Job job, Result result) {
-        if (!authorized() || busy || storageFailed || isFinishing()) return;
-        busy = true; controls(); status.setText(label);
+        run(label, job, result, false);
+    }
+
+    private void run(String label, Job job, Result result, boolean silent) {
+        if (!authorized() || busy || silent && refreshing || storageFailed || isFinishing()) return;
+        if (silent) refreshing = true;
+        else { busy = true; controls(); status.setText(label); }
         final int bound = generation;
         final int epoch = authEpoch;
         worker.execute(() -> {
@@ -358,12 +401,13 @@ public final class MainActivity extends Activity {
             final JSONObject returned = value; final Exception problem = failure;
             handler.post(() -> {
                 if (isDestroyed() || isFinishing()) return;
-                busy = false;
+                if (silent) refreshing = false; else busy = false;
                 if (!Protocol.authorized(unlocked, foreground, deviceSecure(), epoch, authEpoch)) return;
-                controls();
-                if (problem != null) { error(problem); return; }
-                // Navigation cannot happen while a request owns the view; late results never switch tasks.
+                if (silent && busy) return; // A confirmed command owns the next visible state; its queued dispatch is never dropped.
+                if (!silent) controls();
+                // Reads are bound to their original page; late results never switch tasks.
                 if (bound != generation) return;
+                if (problem != null) { error(problem); return; }
                 try { result.accept(returned); } catch (Exception ex) { error(ex); }
             });
         });
@@ -401,7 +445,8 @@ public final class MainActivity extends Activity {
     private void showPairing() {
         clearPage(); selectedId = null; task = null; pairingView = true;
         text(content, "连接自己的电脑", 22);
-        text(content, "在电脑管理器打开手机连接，复制完整配对信息。请通过可信方式传递；配对信息含一次性密钥。仅支持 HTTPS，同一网络或已配置的私有网络。", 16);
+        text(content, "1  电脑：打开手机连接，选择允许查看的任务和控制权限。\n2  电脑：复制配对信息，通过可信方式传到手机。\n3  手机：粘贴并核对电脑地址与证书指纹。", 16);
+        text(content, "手机与电脑须在同一网络或已配置的私有网络。配对信息含一次性密钥，请勿公开。", 14);
         if (pending() != null) {
             text(content, "仍有结果待核对的操作，不能替换连接或丢弃原请求。请返回查询。", 17);
             button(content, "返回原连接", true, () -> { incomingPair = null; showTasks(); });
@@ -410,17 +455,24 @@ public final class MainActivity extends Activity {
         EditText code = input(content, "粘贴 contextrelay://pair#…", incomingPair == null ? "" : incomingPair, true);
         code.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
         incomingPair = null;
+        button(content, "粘贴配对信息", true, () -> {
+            try {
+                ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                ClipData clip = clipboard == null ? null : clipboard.getPrimaryClip(); // User click only; never inspect the clipboard on resume/poll.
+                if (clip == null || clip.getItemCount() != 1 || !clip.getDescription().hasMimeType(ClipDescription.MIMETYPE_TEXT_PLAIN))
+                    throw new IllegalArgumentException("剪贴板没有一段可用的配对文字，请先复制电脑生成的配对信息。");
+                ClipData.Item item = clip.getItemAt(0);
+                if (item.getUri() != null || item.getIntent() != null || item.getHtmlText() != null)
+                    throw new IllegalArgumentException("这里只粘贴纯文字配对信息，不读取文件、网页或其他应用内容。");
+                String raw = Protocol.pairingUri(item.getText());
+                pairingInfo(raw);
+                code.setText(raw);
+                status.setText("已粘贴。点“核对并配对”检查电脑身份；尚未建立连接。");
+            } catch (Exception ex) { error(ex); }
+        });
         button(content, "核对并配对", true, () -> {
             try {
-                String raw = code.getText().toString().trim();
-                if (raw.length() > 10000) throw new IllegalArgumentException("配对信息过长。");
-                URI uri = new URI(raw);
-                if (!"contextrelay".equals(uri.getScheme()) || !"pair".equals(uri.getHost())
-                        || uri.getRawFragment() == null || uri.getRawQuery() != null || uri.getUserInfo() != null
-                        || !(uri.getPath().isEmpty() || "/".equals(uri.getPath())))
-                    throw new IllegalArgumentException("不是有效的 Context Relay 配对信息。");
-                JSONObject info = new JSONObject(new String(Base64.decode(uri.getRawFragment(), Base64.URL_SAFE | Base64.NO_WRAP), StandardCharsets.UTF_8));
-                if (info.getInt("version") != 1) throw new IllegalArgumentException("不支持此配对版本。");
+                JSONObject info = pairingInfo(Protocol.pairingUri(code.getText()));
                 String endpoint = Protocol.endpoint(info.getString("endpoint"));
                 String pin = Protocol.pin(info.getString("certificate_sha256"));
                 String secret = info.getString("secret");
@@ -443,7 +495,19 @@ public final class MainActivity extends Activity {
         if (connection() != null) button(content, "返回已有连接", true, this::showTasks);
     }
 
+    private JSONObject pairingInfo(String raw) {
+        try {
+            JSONObject info = new JSONObject(new String(Base64.decode(new URI(raw).getRawFragment(), Base64.URL_SAFE | Base64.NO_WRAP), StandardCharsets.UTF_8));
+            if (info.getInt("version") != 1) throw new IllegalArgumentException("不支持此配对版本，请更新手机 App 或重新生成配对信息。");
+            Protocol.endpoint(info.getString("endpoint")); Protocol.pin(info.getString("certificate_sha256"));
+            if (info.getString("secret").length() < 16 || info.getString("secret").length() > 512) throw new IllegalArgumentException("配对密钥无效，请在电脑重新生成。");
+            return info;
+        } catch (IllegalArgumentException ex) { throw ex; }
+        catch (Exception ex) { throw new IllegalArgumentException("配对资料不完整，请在电脑重新复制整段信息。"); }
+    }
+
     private void showTasks() {
+        int position = selectedId == null && !pairingView && !listSignature.isEmpty() ? scroll.getScrollY() : 0;
         clearPage(); selectedId = null; task = null; pairingView = false;
         text(content, "电脑已有任务", 22);
         text(content, "在电脑创建或导入任务后，在这里选择。手机不会接管同时运行的官方 Codex 聊天。", 16);
@@ -451,19 +515,28 @@ public final class MainActivity extends Activity {
             text(content, "连接授权到期：" + timeLabel(connection().optString("expires_at")), 14);
         renderOperation();
         button(content, "刷新任务列表", connection() != null, this::refresh);
+        int visible = 0;
         for (int i = 0; i < tasks.length(); i++) {
             JSONObject item = tasks.optJSONObject(i);
             if (item == null || item.optBoolean("archived")) continue;
+            visible++;
             String id = item.optString("id");
-            button(content, item.optString("title", "未命名任务") + "\n" + stateLabel(item.optString("state")), true, () -> {
+            Button row = button(content, item.optString("title", "未命名任务") + "\n" + stateLabel(item.optString("state")) + "\n" + Protocol.preview(item.optString("last_message")), true, () -> {
                 selectedId = id; task = item; showTask(); refresh();
             });
+            row.setGravity(Gravity.START | Gravity.CENTER_VERTICAL); row.setPadding(dp(12), dp(10), dp(12), dp(10));
+            row.setMaxLines(5); row.setEllipsize(TextUtils.TruncateAt.END);
         }
-        if (tasks.length() == 0) text(content, "尚无可显示的任务。", 17);
+        if (visible == 0) text(content, "列表暂无可显示的任务。先点刷新；如果连接正常但仍为空，请在电脑创建或导入任务，在手机连接中选择它，再复制新配对信息。", 17);
         button(content, "更换电脑 / 重新配对", pending() == null, this::showPairing);
+        listSignature = tasks.toString();
+        int bound = generation;
+        scroll.post(() -> { if (authorized() && bound == generation) scroll.scrollTo(0, position); });
     }
 
-    private void refresh() {
+    private void refresh() { refresh(false); }
+
+    private void refresh(boolean silent) {
         if (!authorized() || connection() == null || busy) return;
         if (connection().optBoolean("needs_pairing")) {
             offline = true; status.setText("授权已失效，请返回任务列表重新配对。未确认操作先在电脑核对。"); updateTaskControls(); return;
@@ -471,12 +544,13 @@ public final class MainActivity extends Activity {
         JSONObject target = connection();
         String id = selectedId;
         run("正在读取电脑状态…", epoch -> api(target, epoch).request("GET", id == null ? "/v1/tasks" : "/v1/tasks/" + pathId(id), null), result -> {
-            if (id == null) { tasks = result.getJSONArray("tasks"); showTasks(); }
+            if (id == null) { tasks = result.getJSONArray("tasks"); if (!tasks.toString().equals(listSignature)) showTasks(); }
             else if (id.equals(selectedId)) { task = result; if (timeline == null) showTask(); else updateTask(); }
             offline = false;
             status.setText("已连接电脑 · " + DateTimeFormatter.ofPattern("HH:mm:ss").withZone(ZoneId.systemDefault()).format(Instant.now()) + " 更新");
             updateTaskControls();
-        });
+            if (id != null && originalView && originalCursor == null) readOriginal(null, true, false);
+        }, silent);
     }
 
     private static String stateLabel(String state) {
@@ -506,10 +580,32 @@ public final class MainActivity extends Activity {
         Button more = button(navigation, "更多", true, this::showDetails);
         more.setLayoutParams(new LinearLayout.LayoutParams(dp(72), -2));
         taskStatus = text(header, "", 14); compactStatus(taskStatus);
+        requestsAction = button(header, "处理请求", true, this::showRequests);
+        requestsAction.setVisibility(View.GONE);
+        originalAction = button(header, "原始对话", true, () -> {
+            generation++; originalChoice = true; originalView = !originalView;
+            timelineSignature = ""; originalPage = null; originalCursor = null;
+            updateTask();
+            if (originalView) readOriginal(null, false, true);
+        });
+        originalPanel = column(); content.addView(originalPanel);
+        originalInfo = text(originalPanel, "原始对话尚未读取。", 13);
+        LinearLayout pages = new LinearLayout(this); originalPanel.addView(pages);
+        olderOriginal = button(pages, "较早", false, () -> readOriginal(pageCursor("older_cursor"), false, true));
+        newerOriginal = button(pages, "较新", false, () -> readOriginal(pageCursor("newer_cursor"), false, true));
+        latestOriginal = button(pages, "刷新到最新", true, () -> readOriginal(null, false, true));
+        for (Button item : new Button[] {olderOriginal, newerOriginal, latestOriginal}) {
+            item.setTextSize(14); item.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
+        }
         timeline = column(); content.addView(timeline);
         renderOperation();
         final String id = task.optString("id");
         composer.setPadding(0, dp(8), 0, 0);
+        latest = button(composer, "最新消息 ↓", true, () -> {
+            if (originalView && originalCursor != null) readOriginal(null, false, true);
+            else { scroll.scrollTo(0, Math.max(0, content.getHeight() - scroll.getHeight())); updateLatestButton(); }
+        });
+        latest.setVisibility(View.GONE);
         message = input(composer, "发送消息给电脑上的 Codex", draft(id), true);
         message.setMaxLines(4); message.setContentDescription("消息草稿，不会自动发送");
         message.addTextChangedListener(new TextWatcher() {
@@ -524,9 +620,9 @@ public final class MainActivity extends Activity {
         pause.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
         send = button(commands, "发送", false, () -> {
             try {
-                String value = draft(id).trim();
-                JSONObject payload = new JSONObject().put("message", value.isEmpty() ? JSONObject.NULL : value);
-                command(task, "start", payload, "发送给电脑", "提交到任务：" + task.optString("title") + "\n" + (value.isEmpty() ? "继续已记录目标" : value), draft(id));
+                String value = Protocol.messageInput(draft(id));
+                JSONObject payload = new JSONObject().put("message", value);
+                command(task, "start", payload, "发送给电脑", "提交到任务：" + task.optString("title") + "\n" + value, draft(id));
             } catch (Exception ex) { error(ex); }
         });
         send.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
@@ -536,16 +632,21 @@ public final class MainActivity extends Activity {
     private void updateTaskControls() {
         if (task == null || taskStatus == null || !authorized()) return;
         boolean mutable = pending() == null && !task.optBoolean("archived") && !offline && controlAllowed(task);
-        boolean waitingBrief = task.optBoolean("brief_required") && candidate(task.optJSONObject("brief"));
+        boolean waitingBrief = !"direct".equals(task.optString("connection_mode"))
+                && task.optBoolean("brief_required") && candidate(task.optJSONObject("brief"));
         send.setTag(mutable && Protocol.quiet(task.optString("state")) && !waitingBrief);
-        send.setText(task.optBoolean("brief_required") ? "整理简报" : "发送 / 继续");
+        send.setText("direct".equals(task.optString("connection_mode")) ? "原话发送" : task.optBoolean("brief_required") ? "整理简报" : "发送 / 继续");
         pause.setTag(mutable && (Protocol.active(task.optString("state")) || "blocked".equals(task.optString("state"))));
         JSONArray requests = task.optJSONArray("pending");
-        String notice = requests != null && requests.length() > 0 ? " · 有待处理请求，请点更多" : "";
+        int requestCount = requests == null ? 0 : requests.length();
+        requestsAction.setVisibility(requestCount > 0 && !keyboardOpen ? View.VISIBLE : View.GONE);
+        requestsAction.setText("处理请求（" + requestCount + "）");
+        String notice = requestCount > 0 ? " · 等待你处理请求" : "";
         if (waitingBrief) notice = " · 简报待核对，请点更多";
         if (!controlAllowed(task)) notice = " · 手机仅查看";
         taskStatus.setText((offline ? "离线快照 · " : "") + stateLabel(task.optString("state")) + " · " + ("workspace-write".equals(task.optString("mode")) ? "项目可写" : "只读") + notice
                 + (task.optString("error").isEmpty() ? "" : "\n" + task.optString("error")));
+        compactChat();
         controls();
     }
 
@@ -554,7 +655,80 @@ public final class MainActivity extends Activity {
         catch (Exception ignored) { return value == null ? "" : value; }
     }
 
-    private void chatMessage(String role, String value, String at) {
+    private void updateLatestButton() {
+        if (latest != null && timeline != null) latest.setVisibility(!keyboardOpen && (scroll.canScrollVertically(1) || originalView && originalCursor != null) ? View.VISIBLE : View.GONE);
+    }
+
+    private void compactChat() {
+        if (taskStatus == null || message == null) return;
+        // Keep the composer and its actions reachable with a keyboard and large system text.
+        // Status remains tappable for its full text; reading shortcuts return when typing ends.
+        taskStatus.setMaxLines(keyboardOpen ? 1 : 2);
+        status.setMaxLines(keyboardOpen ? 1 : 2);
+        operation.setMaxLines(keyboardOpen ? 1 : 2);
+        message.setMaxLines(keyboardOpen ? 2 : 4);
+        if (originalAction != null) originalAction.setVisibility(keyboardOpen ? View.GONE : View.VISIBLE);
+        JSONArray requests = task == null ? null : task.optJSONArray("pending");
+        requestsAction.setVisibility(!keyboardOpen && requests != null && requests.length() > 0 ? View.VISIBLE : View.GONE);
+        updateLatestButton();
+    }
+
+    private void copyText(String value, String label) {
+        if (!authorized()) return;
+        ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        if (clipboard == null) { status.setText("系统剪贴板暂不可用，请稍后重试。"); return; }
+        ClipData clip = ClipData.newPlainText(label, value);
+        PersistableBundle flags = new PersistableBundle(); flags.putBoolean("android.content.extra.IS_SENSITIVE", true);
+        clip.getDescription().setExtras(flags);
+        clipboard.setPrimaryClip(clip);
+        status.setText("已复制" + label + "。粘贴到其他应用前请核对接收方。");
+    }
+
+    private CharSequence styledText(String raw) {
+        SpannableStringBuilder styled = new SpannableStringBuilder();
+        Matcher bold = Pattern.compile("\\*\\*([^*\\n]+)\\*\\*").matcher(raw);
+        int copied = 0;
+        while (bold.find()) {
+            styled.append(raw, copied, bold.start()); int start = styled.length(); styled.append(bold.group(1));
+            styled.setSpan(new StyleSpan(Typeface.BOLD), start, styled.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            copied = bold.end();
+        }
+        styled.append(raw, copied, raw.length());
+        Matcher heading = Pattern.compile("(?m)^#{1,3} .+$").matcher(styled.toString());
+        while (heading.find()) {
+            styled.setSpan(new StyleSpan(Typeface.BOLD), heading.start(), heading.end(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            styled.setSpan(new RelativeSizeSpan(1.12f), heading.start(), heading.end(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        }
+        return styled;
+    }
+
+    private void messageBody(LinearLayout parent, String value) {
+        for (String[] block : Protocol.messageBlocks(value)) {
+            if (!"code".equals(block[0])) {
+                TextView body = text(parent, "", 17); body.setText(styledText(block[2])); body.setLineSpacing(dp(3), 1);
+                continue;
+            }
+            LinearLayout bar = new LinearLayout(this); bar.setGravity(Gravity.CENTER_VERTICAL); parent.addView(bar);
+            String language = block[1].length() > 24 ? block[1].substring(0, 24) + "…" : block[1];
+            TextView label = text(bar, language.isEmpty() ? "代码" : "代码 · " + language, 13);
+            label.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
+            Button copy = button(bar, "复制代码", true, () -> copyText(block[2], "代码"));
+            copy.setTextSize(13); copy.setLayoutParams(new LinearLayout.LayoutParams(dp(104), -2));
+            HorizontalScrollView viewport = new HorizontalScrollView(this); viewport.setFillViewport(true);
+            TextView code = new TextView(this); code.setText(block[2]); code.setTextSize(15); code.setTypeface(Typeface.MONOSPACE);
+            code.setTextColor(Color.rgb(28, 31, 36)); code.setBackgroundColor(Color.rgb(244, 246, 248));
+            code.setPadding(dp(10), dp(10), dp(10), dp(10)); code.setTextIsSelectable(true); code.setHorizontallyScrolling(true);
+            viewport.addView(code, new android.widget.FrameLayout.LayoutParams(-2, -2));
+            parent.addView(viewport, new LinearLayout.LayoutParams(-1, -2));
+            text(parent, "长行可左右滑动。复制只复制文字，不会执行代码。", 12);
+        }
+    }
+
+    private void chatMessage(String role, String value, String at, String notice) {
+        chatMessage(role, value, at, notice, false);
+    }
+
+    private void chatMessage(String role, String value, String at, String notice, boolean verbatim) {
         boolean mine = "user".equals(role);
         LinearLayout bubble = column();
         LinearLayout.LayoutParams layout = new LinearLayout.LayoutParams(-1, -2);
@@ -562,35 +736,128 @@ public final class MainActivity extends Activity {
         bubble.setPadding(dp(12), dp(8), dp(12), dp(8));
         if (mine) { GradientDrawable background = new GradientDrawable(); background.setColor(Color.rgb(238, 242, 246)); background.setCornerRadius(dp(14)); bubble.setBackground(background); }
         timeline.addView(bubble, layout);
-        TextView label = text(bubble, (mine ? "你" : "Codex") + (at.isEmpty() ? "" : " · " + timeLabel(at)), 13);
+        LinearLayout caption = new LinearLayout(this); caption.setGravity(Gravity.CENTER_VERTICAL); bubble.addView(caption);
+        TextView label = text(caption, (mine ? "你" : "Codex") + (at.isEmpty() ? "" : " · " + timeLabel(at)), 13);
+        label.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
         label.setTextColor(Color.rgb(78, 87, 98));
-        TextView body = text(bubble, value, 17); body.setLineSpacing(dp(3), 1);
+        Button copy = button(caption, "复制", true, () -> copyText(value, "消息"));
+        copy.setTextSize(13); copy.setLayoutParams(new LinearLayout.LayoutParams(dp(64), -2));
+        if (!notice.isEmpty()) text(bubble, notice, 13);
+        if (verbatim) { TextView body = text(bubble, value, 17); body.setLineSpacing(dp(3), 1); }
+        else messageBody(bubble, value);
     }
 
     private void updateTask() {
         if (!authorized() || timeline == null || task == null) return;
+        if (!originalChoice && "direct".equals(task.optString("connection_mode"))) originalView = true;
+        originalAction.setText(originalView ? "查看管理记录" : "原始对话");
+        originalPanel.setVisibility(originalView ? View.VISIBLE : View.GONE);
         updateTaskControls();
+        if (originalView) {
+            if (originalPage == null && !"original-unread".equals(timelineSignature)) {
+                clearTimeline(); timelineSignature = "original-unread";
+                originalInfo.setText("原始对话尚未读取；不会用管理摘要替代。");
+                text(timeline, "点“刷新到最新”读取原聊天文字。读取不会调用模型或发送消息。", 16);
+            }
+            return;
+        }
         JSONArray messages = task.optJSONArray("messages");
         String signature = (messages == null ? task.optString("last_message") : messages.toString())
-                + task.optBoolean("messages_truncated") + task.optString("state");
+                + task.optBoolean("messages_truncated") + task.optString("state") + task.optString("connection_mode");
         if (signature.equals(timelineSignature)) return;
         boolean follow = timelineSignature.isEmpty() || !scroll.canScrollVertically(1);
         int position = scroll.getScrollY();
-        timelineSignature = signature; timeline.removeAllViews();
+        timelineSignature = signature;
+        clearTimeline();
         if (task.optBoolean("messages_truncated")) text(timeline, "这里只显示最近的对话，较早内容请在电脑查看。", 14);
         int rendered = 0;
         if (messages != null) for (int i = 0; i < messages.length(); i++) {
             JSONObject item = messages.optJSONObject(i);
             if (item == null || !Protocol.visibleMessage(item.optString("role"), item.optString("status"), item.optString("purpose")) || item.optString("text").isEmpty()) continue;
-            String value = item.optString("text");
-            if (item.optBoolean("historical")) value = "导入的历史参考\n" + value;
-            if (item.optBoolean("truncated")) value += "\n\n内容已截短，完整资料请在电脑查看。";
-            chatMessage(item.optString("role"), value, item.optBoolean("historical") ? "" : item.optString("created_at")); rendered++;
+            String notice = item.optBoolean("historical") ? "导入的历史参考" : "";
+            if (item.optBoolean("truncated")) notice += (notice.isEmpty() ? "" : "\n") + "内容已截短，完整资料请在电脑查看。";
+            chatMessage(item.optString("role"), item.optString("text"), item.optBoolean("historical") ? "" : item.optString("created_at"), notice); rendered++;
         }
-        if (rendered == 0 && !task.optString("last_message").isEmpty()) { chatMessage("assistant", task.optString("last_message"), ""); rendered++; }
+        if (rendered == 0 && !task.optString("last_message").isEmpty()) { chatMessage("assistant", task.optString("last_message"), "", ""); rendered++; }
         if (rendered == 0) text(timeline, "对话会显示在这里。输入消息并发送，电脑处理后会自动显示回复。", 17);
         if (Protocol.active(task.optString("state"))) text(timeline, "电脑正在处理…完成后的回复会自动显示。", 15);
-        scroll.post(() -> { if (authorized()) scroll.scrollTo(0, follow ? Math.max(0, content.getHeight() - scroll.getHeight()) : position); });
+        int bound = generation;
+        scroll.post(() -> { if (authorized() && bound == generation) { scroll.scrollTo(0, follow ? Math.max(0, content.getHeight() - scroll.getHeight()) : position); updateLatestButton(); } });
+    }
+
+    private void clearTimeline() {
+        for (int i = actions.size() - 1; i >= 0; i--) {
+            android.view.ViewParent parent = actions.get(i).getParent();
+            while (parent != null && parent != timeline) parent = parent.getParent();
+            if (parent == timeline) actions.remove(i);
+        }
+        timeline.removeAllViews();
+    }
+
+    private String pageCursor(String key) {
+        return originalPage == null || originalPage.isNull(key) ? null : originalPage.optString(key, null);
+    }
+
+    private void readOriginal(String cursor, boolean silent, boolean changePage) {
+        if (!authorized() || !originalView || selectedId == null || connection() == null
+                || connection().optBoolean("needs_pairing") || busy || silent && refreshing) return;
+        String id = selectedId;
+        JSONObject target = connection();
+        run("正在只读获取原始对话…", epoch -> api(target, epoch).request("GET", Protocol.conversationPath(id, cursor), null), page -> {
+            if (!originalView || !id.equals(selectedId)) return;
+            JSONArray entries = page.getJSONArray("entries");
+            if (page.optString("thread_id").isEmpty() || entries.length() > 8)
+                throw new IllegalStateException("原文页结构不完整，未用摘要替代。");
+            int length = 0;
+            for (int i = 0; i < entries.length(); i++) {
+                JSONObject entry = entries.getJSONObject(i);
+                if (!(entry.opt("text") instanceof String)) throw new IllegalStateException("原文文字结构无效。");
+                String role = entry.getString("role"), value = entry.getString("text");
+                if (!("user".equals(role) || "assistant".equals(role))
+                        || entry.optInt("part") < 1 || entry.optInt("parts") < entry.optInt("part"))
+                    throw new IllegalStateException("原文消息结构不完整，未显示不明内容。");
+                length += value.codePointCount(0, value.length());
+            }
+            if (length > 6000) throw new IllegalStateException("原文页超过约定大小，未截断显示。");
+            boolean follow = originalPage == null || !scroll.canScrollVertically(1);
+            int position = scroll.getScrollY();
+            originalPage = page; originalCursor = cursor;
+            originalInfo.setText("原始对话 · 来源 " + page.getString("thread_id")
+                    + "\n读取时间：" + timeLabel(page.optString("checked_at")) + " · 宿主状态：" + page.optString("status", "unknown")
+                    + "\n第 " + page.optInt("page", 1) + " / " + page.optInt("pages", 1) + " 页 · 非文字记录（含附件、工具）" + page.optInt("non_text_items") + " 项未展开"
+                    + "\n" + page.optString("notice")
+                    + ("direct".equals(page.optString("connection_mode")) ? "" : "\n当前为管理任务；发送仍按管理流程处理，不代表回复来源聊天。"));
+            olderOriginal.setTag(pageCursor("older_cursor") != null);
+            newerOriginal.setTag(pageCursor("newer_cursor") != null);
+            String signature = "original:" + page.getString("thread_id") + page.optString("connection_mode") + entries.toString();
+            if (!signature.equals(timelineSignature)) {
+                timelineSignature = signature; clearTimeline();
+                for (int i = 0; i < entries.length(); i++) {
+                    JSONObject entry = entries.getJSONObject(i);
+                    String detail = "第 " + entry.getInt("part") + " / " + entry.getInt("parts") + " 段 · 轮次状态：" + entry.optString("turn_status", "unknown");
+                    if (!entry.isNull("phase") && !entry.optString("phase").isEmpty()) detail += " · " + entry.getString("phase");
+                    chatMessage(entry.getString("role"), entry.getString("text"), "", detail, true);
+                }
+                if (entries.length() == 0) text(timeline, "宿主未返回用户或助手文字。非文字记录不在此页展开。", 16);
+            }
+            controls();
+            int bound = generation;
+            scroll.post(() -> {
+                if (authorized() && bound == generation && originalView && id.equals(selectedId)) {
+                    scroll.scrollTo(0, changePage && cursor != null ? 0 : follow || changePage
+                            ? Math.max(0, content.getHeight() - scroll.getHeight()) : position);
+                    updateLatestButton();
+                }
+            });
+        }, silent);
+    }
+
+    private void showRequests() {
+        if (task == null) return;
+        LinearLayout box = column(); box.setPadding(dp(16), dp(8), dp(16), dp(8));
+        renderRequests(box, task, pending() == null && !task.optBoolean("archived") && !offline && controlAllowed(task));
+        ScrollView viewport = new ScrollView(this); viewport.addView(box);
+        showDialog(new AlertDialog.Builder(this).setTitle("处理本次请求").setView(viewport).setPositiveButton("返回对话", null).create(), true);
     }
 
     private void showDetails() {
@@ -670,8 +937,8 @@ public final class MainActivity extends Activity {
                 JSONObject answers = new JSONObject();
                 Iterator<String> ids = fields.keys();
                 while (ids.hasNext()) {
-                    String id = ids.next(); String value = ((EditText) fields.get(id)).getText().toString().trim();
-                    if (value.isEmpty()) throw new IllegalArgumentException("请回答每个问题。");
+                    String id = ids.next(); String value = ((EditText) fields.get(id)).getText().toString();
+                    if (value.trim().isEmpty()) throw new IllegalArgumentException("请回答每个问题。");
                     answers.put(id, new JSONObject().put("answers", new JSONArray().put(value)));
                 }
                 JSONObject payload = new JSONObject().put("pending_request_id", request.get("id")).put("answer", new JSONObject().put("answers", answers));
@@ -682,6 +949,10 @@ public final class MainActivity extends Activity {
     }
 
     private void renderAssessments(LinearLayout parent, JSONObject displayed, boolean quiet) {
+        if ("direct".equals(displayed.optString("connection_mode"))) {
+            text(parent, "原话连接：直接发送你的要求。需要整理、审核或修改时，请在对话输入框说明；这里不生成管理指令。", 16);
+            return;
+        }
         text(parent, "简报 / 阶段审核", 22);
         text(parent, "生成简报和审核均消耗模型用量。AI 意见不等于测试通过、人工认可或发布验收。采用前由电脑重新核验结果有效性。", 16);
         button(parent, "生成 / 重新整理只读简报", quiet, () -> analyze(displayed, "brief"));

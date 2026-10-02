@@ -78,6 +78,9 @@ def _append_message(task, role, text, *, identity=None, historical=False, create
 
 
 def _conversation(task):
+    if "last_message_kind" not in task:
+        task["last_message_kind"] = (task.get("purpose") if task.get("purpose") in ("brief", "review")
+                                     else "work" if task.get("purpose") == "work" else None)
     if "messages" not in task:
         task["messages"] = []
         source = task.get("source_snapshot") or {}
@@ -249,6 +252,25 @@ class Manager:
                               self.db.execute("SELECT at,kind,data FROM events WHERE task_id=? ORDER BY seq DESC LIMIT 100", (task_id,))]
             return task
 
+    def read_chat(self, task_id, cursor=None):
+        """Read native text only; do not resume a thread, create a turn, or save its body."""
+        from .conversation import conversation_page
+        with self._lock:
+            self._require_writable()
+            task = self._task(task_id)
+            thread_id = task.get("thread_id") or task.get("source_snapshot", {}).get("thread_id")
+            if not thread_id:
+                raise ValueError("任务尚未连接 Codex 聊天，没有原文可读取。")
+            result = self._connect().request("thread/read", {"threadId": thread_id, "includeTurns": True})
+            thread = result.get("thread", {})
+            if thread.get("id") != thread_id or not handoff_rules.same_path(thread.get("cwd", ""), task["cwd"]):
+                raise ValueError("原聊天的身份或目录不匹配，停止读取。")
+            page = conversation_page(thread, cursor)
+            page["connection_mode"] = task.get("connection_mode") or ("managed" if task.get("thread_id") else "imported")
+            if page["connection_mode"] == "imported":
+                page["notice"] += " 当前是历史导入；发送仍走任务简报流程，要原话接续请选择连接原聊天。"
+            return page
+
     def set_archived(self, task_id, archived):
         with self._lock:
             self._require_writable()
@@ -286,7 +308,8 @@ class Manager:
                     "thread_id": None, "turn_id": None, "receiver_id": None, "generation": 0,
                     "analysis_thread_id": None, "assessment": None, "brief_required": False,
                     "acceptance_criteria": [],
-                    "last_message": "", "error": "", "pending": [], "requirements": [goal.strip()],
+                    "last_message": "", "last_message_kind": None, "error": "", "pending": [],
+                    "requirements": [goal.strip()],
                     "revision": 1, "user_inputs": [], "usage": 0, "thread_usage": {}, "context_estimate": None,
                     "telemetry_model_valid": True,
                     "usage_signature": None, "stale_usage_signature": None,
@@ -371,10 +394,12 @@ class Manager:
             return source
 
     def import_thread(self, thread_id, fingerprint, *, title, goal, mode="read-only", source_stopped=False,
-                      existing_task_id=None, auto_handoff=False, max_tokens=0, max_minutes=0):
+                      existing_task_id=None, auto_handoff=False, max_tokens=0, max_minutes=0, direct=False):
         from .assessment import DEFAULT_IMPORT_GOAL
         with self._lock:
             self._require_writable()
+            if not isinstance(direct, bool) or direct and auto_handoff:
+                raise ValueError("连接原聊天时不启用自动换聊天；先保持原会话和原话传输。")
             preview = self._import_preview
             if source_stopped is not True:
                 raise ValueError("请先确认原聊天及同项目的操作已停止；导入不会自动取得原聊天执行权。")
@@ -415,6 +440,10 @@ class Manager:
             task.pop("messages", None)
             _conversation(task)
             task["source_stopped_at_import"] = True
+            if direct:
+                task.update(connection_mode="direct", thread_id=thread_id, brief_required=False,
+                            goal="接续已选 Codex 原聊天；手机消息逐字发送。", requirements=[], messages=[],
+                            messages_truncated=False)
             self._save(task, "source_import_updated" if existing else "source_imported",
                        {"thread_id": thread_id, "fingerprint": fingerprint, "mode": mode,
                         "source_stopped_at_import": True})
@@ -434,6 +463,8 @@ class Manager:
             max_tokens, max_minutes = validate_limits(max_tokens, max_minutes)
             if not isinstance(auto_handoff, bool):
                 raise ValueError("自动交接开关必须是布尔值。")
+            if task.get("connection_mode") == "direct" and auto_handoff:
+                raise ValueError("原话接续模式不自动换聊天。")
             if auto_handoff and not task.get("telemetry_model_valid", True):
                 raise ValueError("模型口径变化，不能重新开启自动交接。")
             settings = {"title": title.strip(), "max_tokens": max_tokens,
@@ -486,6 +517,8 @@ class Manager:
         from .assessment import SCHEMAS, assessment_prompt
         with self._lock:
             task = self._quiet_task(task_id)
+            if task.get("connection_mode") == "direct":
+                raise ValueError("原话接续不进入管理器简报流程；请直接把要求发给 Codex。")
             if kind not in SCHEMAS:
                 raise ValueError("只支持任务简报或阶段成果审核。")
             if kind == "review" and not task["work_turns"]:
@@ -513,22 +546,33 @@ class Manager:
                                     "kind": (task.get("assessment") or {}).get("kind")})
         task.update(analysis_thread_id=None, assessment=None)
 
-    def _assessment_ready(self, task):
+    def _assessment_ready(self, task, candidate):
         from .assessment import validate_assessment
         assessment = task["assessment"]
         self._check_import_source(task)
         if assessment["binding"] != self._assessment_binding(task):
             raise ValueError("分析期间目标或文件发生变化，本次结果不能采用；请核对后重新分析。")
-        report = validate_assessment(assessment["kind"], json.loads(task["last_message"]),
-                                     assessment["binding"]["files"], task.get("source_snapshot"))
-        handoff_rules.reject_sensitive(report)
         kind = assessment["kind"]
+        try:
+            report = validate_assessment(kind, json.loads(candidate), assessment["binding"]["files"],
+                                         task.get("source_snapshot"))
+        except ValueError:
+            self._retire_analysis(task)
+            task.update(state="idle", purpose=None, turn_id=None, intent=None, last_message="",
+                        last_message_kind=kind,
+                        error="候选简报未通过格式或证据引用校验，尚未采用；请重新整理。"
+                        if kind == "brief" else
+                        "候选审核未通过格式或证据引用校验，尚未采用；请重新审核。")
+            self._save(task, "assessment_rejected", {"kind": kind, "reason": "invalid_candidate"})
+            return
+        handoff_rules.reject_sensitive(report)
         task[kind] = {"binding": assessment["binding"], "report": report, "status": "current",
                       "decision": "pending", "at": handoff_rules.now()}
         if kind == "review":
             task[kind].update(machine_checks="not_verified", human_acceptance="pending")
         self._retire_analysis(task)
-        task.update(state="idle", purpose=None, turn_id=None, intent=None)
+        task.update(state="idle", purpose=None, turn_id=None, intent=None, last_message="",
+                    last_message_kind=kind, error="")
         self._save(task, "assessment_ready", {"kind": kind, "result": task[kind]})
 
     def _current_assessment(self, task, kind):
@@ -582,6 +626,8 @@ class Manager:
     def revise_from_review(self, task_id):
         with self._lock:
             task = self._quiet_task(task_id)
+            if task.get("connection_mode") == "direct":
+                raise ValueError("请在输入框写下返工要求，将按原话发送。")
             result = self._current_assessment(task, "review")
             if self._budget(task):
                 raise ValueError("已达到任务预算，不能启动返工。")
@@ -685,8 +731,13 @@ class Manager:
         client = self._connect()
         if thread_id not in self._loaded:
             result = client.request("thread/resume", {"threadId": thread_id, **self._thread_options(task, readonly)})
+            if result.get("thread", {}).get("id") != thread_id:
+                raise ValueError("接续回执不是选定原聊天，已停止。")
             self._validate_thread(task, result, readonly)
             self._verify_external_tools_disabled(thread_id)
+            if task.get("connection_mode") == "direct":
+                task["permission_receipt"] = {key: result[key] for key in ("cwd", "sandbox", "approvalPolicy", "model")}
+                task["model"] = result["model"]
             self._loaded.add(thread_id)
 
     def _turn(self, task, text, purpose="work", thread_id=None, schema=None):
@@ -701,7 +752,9 @@ class Manager:
             "excludeTmpdirEnvVar": True, "excludeSlashTmp": True}
         if purpose == "work":
             self._invalidate_assessments(task)
-        task.update(purpose=purpose, turn_id=None, last_message="", pending=[], inflight={},
+        task.update(purpose=purpose, turn_id=None, last_message="",
+                    last_message_kind=purpose if purpose in ("work", "brief", "review") else None,
+                    pending=[], inflight={},
                     state={"work": "running", "summary": "summarizing", "verify": "verifying",
                            "brief": "briefing", "review": "reviewing"}[purpose],
                     run_started=time.time(), native_started=False, error="",
@@ -736,6 +789,26 @@ class Manager:
             if task.get("analysis_thread_id"):
                 raise ValueError("分析会话尚未收束，请先核对恢复。")
             self._check_import_source(task)
+            if task.get("connection_mode") == "direct":
+                if not isinstance(message, str) or not message.strip() or len(message) > 4000:
+                    raise ValueError("请输入要原样发送的消息（最多 4000 字）；不会替你生成继续指令。")
+                handoff_rules.reject_sensitive(message)
+                # One explicit receiver, no analyst, goal wrapper, summary, or invented user text.
+                source = self._read_idle(task["thread_id"])
+                from .imports import normalize_thread
+                checked = normalize_thread(source, expected_id=task["thread_id"])
+                if set(checked["warnings"]) & {"unfinished_turn", "incomplete_or_unknown_history", "unfinished_action",
+                                               "active_subagent", "subagent_activity_unknown"}:
+                    raise ValueError("原聊天有活动或结果未知的操作，不能发送；请先回 Codex 核对。")
+                try:
+                    self._resume_thread(task, task["thread_id"])
+                    self._turn(task, message)
+                    _append_message(task, "user", message, identity=[task["thread_id"], task["turn_id"], "user"])
+                    self._save(task)
+                except Exception as exc:
+                    self._failed(task, exc)
+                    raise
+                return copy.deepcopy(task)
             if (task.get("brief_required") and not message and task.get("brief", {}).get("status") == "current"
                     and task["brief"].get("decision") == "pending"):
                 raise ValueError("简报已生成，请打开“简报 / 审核”核对并采用当前方向。")
@@ -851,6 +924,7 @@ class Manager:
                 raise ValueError("运行记录缺少轮次编号，无法可靠核对结果。")
             recovered_status = None
             recovered_turn = task["turn_id"]
+            assessment_kind = task["purpose"] if task["purpose"] in ("brief", "review") else None
             if recovered_turn:
                 turns = [turn for turn in thread.get("turns", []) if turn.get("id") == task["turn_id"]]
                 if len(turns) != 1 or turns[0].get("status") not in ("completed", "failed", "interrupted"):
@@ -862,7 +936,13 @@ class Manager:
                             raise ValueError("未知请求仍含未确认的工具操作。")
                         task["inflight"].pop(item["id"], None)
                     elif item.get("type") == "agentMessage" and task["purpose"] != "verify":
-                        task["last_message"] = _safe(item.get("text", ""))
+                        if assessment_kind:
+                            task["last_message"] = ""
+                            task["last_message_kind"] = assessment_kind
+                        else:
+                            task["last_message"] = _safe(item.get("text", ""))
+                            if task["purpose"] == "work":
+                                task["last_message_kind"] = "work"
                         if task["purpose"] == "work":
                             _append_message(task, "assistant", item.get("text", ""),
                                             identity=[thread["id"], task["turn_id"], item.get("id") or item.get("text")])
@@ -876,7 +956,9 @@ class Manager:
             if task["receiver_id"]:
                 task["history"].append({"thread_id": task["receiver_id"], "role": "abandoned_receiver"})
             self._retire_analysis(task)
-            task.update(state="paused", purpose=None, turn_id=None, pending=[], error="", intent=None,
+            task.update(state="paused", purpose=None, turn_id=None, pending=[],
+                        error=("已核对只读分析轮次终态；候选未自动采用，请重新整理。"
+                               if assessment_kind else ""), intent=None,
                         checkpoint=None, checkpoint_hash=None, receiver_id=None, context_estimate=None,
                         fresh_usage=False)
             self._save(task, "reconciled_read_only", {"turn_id": recovered_turn, "status": recovered_status,
@@ -918,6 +1000,8 @@ class Manager:
         with self._lock:
             self._require_writable()
             task = self._task(task_id)
+            if task.get("connection_mode") == "direct":
+                raise ValueError("原话接续模式保持原聊天，不自动或手动换聊；请在 Codex 中处理上下文。")
             if task["state"] != "idle" or task["inflight"] or task["pending"]:
                 raise ValueError("交接只能在工作轮次结束且无在途操作时进行。")
             if any(task.get(kind, {}).get("status") == "current" and task[kind].get("decision") == "pending"
@@ -1119,6 +1203,8 @@ class Manager:
             task["elapsed_seconds"] += max(0, time.time() - task["run_started"])
         was_pausing = task["state"] == "pausing"
         purpose = task["purpose"]
+        assessment_candidate = (self._messages.pop((self._active_thread(task), turn["id"]), "")
+                                if purpose in ("brief", "review") else None)
         for r in task["pending"]:
             self._raw_requests.pop(r["id"], None)
         task.update(run_started=None, pending=[])
@@ -1142,7 +1228,7 @@ class Manager:
             elif purpose == "verify":
                 self._receiver_ready(task)
             elif purpose in ("brief", "review"):
-                self._assessment_ready(task)
+                self._assessment_ready(task, assessment_candidate)
             else:
                 task.update(state="idle", turn_id=None, work_turns=task["work_turns"] + 1)
                 self._save(task, "work_finished")
@@ -1228,11 +1314,16 @@ class Manager:
                     item = params.get("item", {})
                     kind = item.get("type")
                     if kind == "agentMessage" and method == "item/completed":
-                        task["last_message"] = _safe(item.get("text", ""))
+                        if task["purpose"] in ("brief", "review"):
+                            self._messages[(tid, event_turn)] = _safe(item.get("text", ""))[-100000:]
+                        else:
+                            task["last_message"] = _safe(item.get("text", ""))
                         if task["purpose"] == "work":
+                            task["last_message_kind"] = "work"
                             _append_message(task, "assistant", item.get("text", ""),
                                             identity=[tid, event_turn, item.get("id") or item.get("text")])
-                        self._messages.pop((tid, event_turn), None)
+                        if task["purpose"] not in ("brief", "review"):
+                            self._messages.pop((tid, event_turn), None)
                     elif kind == "contextCompaction" and method == "item/completed" and task["purpose"] not in ("brief", "review"):
                         if item.get("id") and item["id"] not in task["compaction_ids"]:
                             task["compaction_ids"].append(item["id"])

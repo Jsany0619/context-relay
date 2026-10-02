@@ -57,6 +57,21 @@ class ImportManager(base_ui.FakeManager):
 
 
 class ImportUiTests(unittest.TestCase):
+    def test_direct_connection_is_explicit_and_keeps_permission_selection(self):
+        dialog = self.open_import()
+        self.preview(dialog)
+        self.assertTrue(dialog.connect_button.instate(["disabled"]))
+        dialog.source_stopped.set(True)
+        dialog.mode.set("workspace-write")
+        dialog.auto.set(True)
+        dialog.controls()
+        dialog.connect_button.invoke()
+        self.wait_for(lambda: not self.app.busy)
+        args = self.fake.import_calls[-1]
+        self.assertTrue(args[-1]["direct"])
+        self.assertFalse(args[-1]["auto_handoff"])
+        self.assertEqual(args[-1]["mode"], "workspace-write")
+
     wait_for = base_ui.TkSmokeTests.wait_for
     tearDown = base_ui.TkSmokeTests.tearDown
 

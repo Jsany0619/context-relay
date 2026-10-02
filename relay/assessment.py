@@ -263,6 +263,7 @@ def assessment_prompt(kind: str, task: Any, binding: Any) -> str:
     allowed = ("title", "goal", "requirements", "user_inputs", "acceptance_criteria",
                "source_snapshot", "brief_required")
     task_value = {key: task[key] for key in allowed if key in task}
+    task_value["allowed_chat_references"] = sorted(_chat_references(task.get("source_snapshot")))
     try:
         task_json = json.dumps(task_value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
                                allow_nan=False)
@@ -295,7 +296,7 @@ def assessment_prompt(kind: str, task: Any, binding: Any) -> str:
     instructions += (
         "\n证据引用规则：file reference 必须逐字复制当前证据绑定 files 中的实际相对路径键；"
         "不得追加 :行号，不得写绝对路径或 Markdown 链接，行号和定位说明写入 finding。"
-        "chat reference 只能逐字复制 source_snapshot.messages 中真实的 turn_id/item_id；"
+        "chat reference 必须逐字复制 allowed_chat_references 中的一个完整值，不能只写 item_id；"
         "没有 source_snapshot.messages 或没有合法引用时，不得生成 chat evidence。"
         "找不到有效引用时将 evidence 留空，并把相应事实列入 unknowns，或把检查标为 unverified；不得伪造引用。"
     )

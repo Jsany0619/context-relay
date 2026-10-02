@@ -89,12 +89,78 @@ class AssessmentManagerTests(unittest.TestCase):
         self.assertEqual(self.client.calls_for("turn/start")[-1]["sandboxPolicy"], {"type": "readOnly"})
         result = self.complete(running, brief_report())
         self.assertEqual(result["brief"]["decision"], "pending")
+        self.assertEqual(result["last_message"], "")
+        self.assertEqual(result["last_message_kind"], "brief")
         self.assertEqual(result["work_turns"], 0)
         self.assertIsNone(result["thread_id"])
         self.assertTrue(result["brief_required"])
         with self.assertRaises(ValueError):
             self.manager.start(task["id"])
         self.assertEqual(len(self.client.calls_for("turn/start")), 1)
+
+    def test_malformed_completed_assessment_is_rejected_without_an_automatic_retry(self):
+        running = self.manager.analyze(self.task()["id"], "brief")
+        item = {"id": "malformed-brief", "type": "agentMessage", "text": "{not-json"}
+        self.client.push("item/completed", {"threadId": running["analysis_thread_id"],
+                         "turnId": running["turn_id"], "item": item})
+        self.client.push("turn/completed", {"threadId": running["analysis_thread_id"],
+                         "turn": {"id": running["turn_id"], "status": "completed", "items": [item]}})
+        self.manager.poll()
+        rejected = self.manager.get_task(running["id"])
+        self.assertEqual(rejected["state"], "idle")
+        self.assertEqual(rejected["last_message"], "")
+        self.assertEqual(rejected["last_message_kind"], "brief")
+        self.assertNotIn("brief", rejected)
+        self.assertEqual(len(self.client.calls_for("turn/start")), 1)
+
+    def test_invalid_completed_brief_is_rejected_without_exposing_json_or_reconciliation(self):
+        running = self.manager.start(self.imported()["id"])
+        invalid = brief_report()
+        invalid["evidence"] = [{"source": "chat", "reference": "missing-turn/missing-item",
+                                "finding": "Not bound to the imported excerpt"}]
+        raw = json.dumps(invalid)
+        item = {"id": "invalid-brief", "type": "agentMessage", "text": raw}
+        self.client.push("item/completed", {"threadId": running["analysis_thread_id"],
+                         "turnId": running["turn_id"], "item": item})
+        self.manager.poll()
+        received = self.manager.get_task(running["id"])
+        self.assertEqual(received["state"], "briefing")
+        self.assertEqual(received["last_message_kind"], "brief")
+        self.assertNotEqual(received["last_message"], raw)
+
+        self.client.push("turn/completed", {"threadId": running["analysis_thread_id"],
+                         "turn": {"id": running["turn_id"], "status": "completed", "items": [item]}})
+        self.manager.poll()
+        rejected = self.manager.get_task(running["id"])
+        self.assertEqual(rejected["state"], "idle")
+        self.assertTrue(rejected["brief_required"])
+        self.assertEqual(rejected["work_turns"], 0)
+        self.assertEqual(rejected["mode"], "workspace-write")
+        self.assertEqual(rejected["last_message"], "")
+        self.assertEqual(rejected["last_message_kind"], "brief")
+        self.assertIsNone(rejected["analysis_thread_id"])
+        self.assertIsNone(rejected["assessment"])
+        self.assertIsNone(rejected["turn_id"])
+        self.assertNotIn("brief", rejected)
+        self.assertIn("未通过", rejected["error"])
+        event = next(event for event in rejected["events"] if event["kind"] == "assessment_rejected")
+        self.assertEqual(event["data"], {"kind": "brief", "reason": "invalid_candidate"})
+        self.assertNotIn("missing-turn", json.dumps(rejected["events"]))
+        self.assertEqual(len(self.client.calls_for("turn/start")), 1)
+
+    def test_work_response_that_is_json_remains_a_visible_work_message(self):
+        running = self.manager.start(self.task()["id"])
+        text = json.dumps({"result": "normal work JSON"})
+        item = {"id": "work-json", "type": "agentMessage", "text": text}
+        self.client.push("item/completed", {"threadId": running["thread_id"],
+                         "turnId": running["turn_id"], "item": item})
+        self.client.push("turn/completed", {"threadId": running["thread_id"],
+                         "turn": {"id": running["turn_id"], "status": "completed", "items": [item]}})
+        self.manager.poll()
+        result = self.manager.get_task(running["id"])
+        self.assertEqual(result["last_message"], text)
+        self.assertEqual(result["last_message_kind"], "work")
+        self.assertEqual(result["work_turns"], 1)
 
     def test_adopting_brief_is_local_and_work_uses_current_permissions(self):
         task = self.complete(self.manager.start(self.imported()["id"]), brief_report())

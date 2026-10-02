@@ -1,4 +1,4 @@
-"""Tk interface; every Manager call belongs to the single command worker."""
+"""Tk interface; task mutations belong to the single command worker."""
 from copy import deepcopy
 from datetime import datetime
 import json
@@ -56,6 +56,7 @@ EVENT_LABELS = {
     "source_imported": "已导入历史资料（尚未启动）",
     "source_import_updated": "已更新待启动任务的来源资料",
     "assessment_requested": "已请求只读分析", "assessment_ready": "已收到 AI 分析意见（待人工处理）",
+    "assessment_rejected": "分析候选未通过核验（未采用，可明确重新整理）",
     "assessment_stale": "分析记录已过期", "brief_adopted": "用户已采用目标与验收标准",
     "review_accepted": "用户已认可本阶段审核结果", "review_rework_requested": "已记录用户返工请求",
 }
@@ -339,7 +340,7 @@ class ImportDialog(tk.Toplevel):
         self.title_value, self.mode = tk.StringVar(), tk.StringVar(value="read-only")
         self.tokens, self.minutes = tk.StringVar(value="0"), tk.StringVar(value="0")
         self.auto, self.source_stopped = tk.BooleanVar(value=False), tk.BooleanVar(value=False)
-        self.title("导入已有 Codex 聊天 · 仅创建待启动任务")
+        self.title("连接或导入已有 Codex 聊天")
         self.geometry(f"{min(900, self.winfo_screenwidth() - 80)}x{min(820, self.winfo_screenheight() - 140)}")
         self.transient(app.root)
         footer = ttk.Frame(self, padding=10)
@@ -349,9 +350,11 @@ class ImportDialog(tk.Toplevel):
         self.close_button.pack(side="right")
         self.save_button = ttk.Button(footer, text="导入为待启动任务", command=self.save)
         self.save_button.pack(side="right", padx=8)
+        self.connect_button = ttk.Button(footer, text="连接原聊天（原话接续）", command=lambda: self.save(direct=True))
+        self.connect_button.pack(side="right", padx=8)
         top = ttk.Frame(self, padding=10)
         top.pack(fill="x")
-        ttk.Label(top, text="列出当前 Codex 环境可访问的桌面 / IDE 聊天，仅导入文字资料。旧授权不延续，原聊天不会被修改或自动启动。",
+        ttk.Label(top, text="连接原聊天：保留会话编号，消息原样发送；原桌面需停止操作，窗口未必实时同步。导入为新任务：整理资料后另起执行。两种方式均需重新选择权限，不自动开始工作。",
                   wraplength=820, justify="left").pack(fill="x", pady=(0, 8))
         search = ttk.Frame(top)
         search.pack(fill="x")
@@ -465,6 +468,7 @@ class ImportDialog(tk.Toplevel):
         self.next_button.configure(state="normal" if available and self.next_cursor else "disabled")
         self.preview_button.configure(state="normal" if available and self.selected_source else "disabled")
         self.save_button.configure(state="normal" if available and self.can_save() and self.source_stopped.get() else "disabled")
+        self.connect_button.configure(state="normal" if available and self.can_save() and self.source_stopped.get() else "disabled")
 
     def deliver(self, method, token, result=None, error=None):
         if token != (self.generation, self.selected_source):
@@ -514,7 +518,7 @@ class ImportDialog(tk.Toplevel):
             return
         self.controls()
 
-    def save(self):
+    def save(self, direct=False):
         if self.app.busy or not self.can_save() or not self.source_stopped.get():
             self.info.set("请先预览可导入来源，并确认原聊天及同项目操作已停止。")
             return
@@ -529,7 +533,8 @@ class ImportDialog(tk.Toplevel):
         existing = self.preview.get("existing_task")
         self.request("import_thread", self.selected_source, self.preview["fingerprint"], title=title, goal=goal,
                      mode=self.mode.get(), source_stopped=True, existing_task_id=existing["id"] if existing else None,
-                     max_tokens=tokens, max_minutes=minutes, auto_handoff=self.auto.get())
+                     max_tokens=tokens, max_minutes=minutes, auto_handoff=False if direct else self.auto.get(),
+                     **({"direct": True} if direct else {}))
 
 
 def assessment_content(value):
@@ -540,6 +545,89 @@ def assessment_content(value):
     if isinstance(value, list):
         return "\n".join(f"• {assessment_content(item)}" for item in value) or "未提供"
     return str(value) if value is not None else "未提供"
+
+
+def analysis_message_kind(task):
+    """Classify internal output, never validate or adopt its contents."""
+    kind = task.get("last_message_kind")
+    if kind is not None:
+        return kind if kind in ("brief", "review") else None
+    if task.get("purpose") == "work":
+        return None
+    for kind in (task.get("purpose"), (task.get("assessment") or {}).get("kind")):
+        if kind in ("brief", "review"):
+            return kind
+    # Older imported tasks lack a kind after reconciliation. Only recognize the
+    # exact brief envelope in the pre-work brief phase; ordinary JSON stays text.
+    if not task.get("brief_required") or task.get("work_turns", 0) != 0:
+        return None
+    raw = task.get("last_message") or ""
+    if len(raw) > 64 * 1024:
+        return None
+    try:
+        value = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    lists = ("decisions", "completed", "unknowns", "approaches", "acceptance")
+    if (not isinstance(value, dict) or set(value) != {*lists, "goal", "next_step", "evidence"}
+            or any(not isinstance(value.get(key), str) or not value[key].strip() for key in ("goal", "next_step"))
+            or any(not isinstance(value.get(key), list) or not all(isinstance(item, str) for item in value[key]) for key in lists)
+            or not value["acceptance"] or not isinstance(value["evidence"], list)):
+        return None
+    if any(not isinstance(item, dict) or set(item) != {"source", "reference", "finding"}
+           or item["source"] not in ("file", "chat")
+           or not all(isinstance(item[key], str) and item[key].strip() for key in ("reference", "finding"))
+           for item in value["evidence"]):
+        return None
+    return "brief"
+
+
+def task_error(task):
+    message = str(task.get("error") or "")
+    for original, readable in (
+        ("chat evidence is not present in the bound source snapshot", "分析中的聊天引用不在已导入的资料中"),
+        ("file evidence is not present in the bound workspace snapshot", "分析中的文件引用不在本次工作区记录中"),
+    ):
+        message = message.replace(original, readable)
+    return message
+
+
+def assessment_guidance(task, kind):
+    label = "简报" if kind == "brief" else "审核"
+    generate = "生成 / 重新整理简报" if kind == "brief" else "审核当前成果"
+    record = task.get(kind) or {}
+    if task.get("state") == "needs_reconcile":
+        reason = f"\n原因：{task_error(task)}" if task.get("error") else ""
+        return f"本轮{label}状态仍待核对。{reason}\n请回主窗口点击“核对恢复”；确认收束后再明确重新整理，不会自动重试或继续工作。"
+    if task.get("state") in ACTIVE:
+        return f"正在进行只读{label}分析；完成后仍需核验和人工处理，不会自动采用或开始工作。"
+    if task.get("error"):
+        return f"本次{label}未通过核验，不能采用。\n原因：{task_error(task)}\n请点击“{generate}”重新整理，会再次消耗模型用量。"
+    if record.get("status") == "current":
+        if kind == "brief":
+            if record.get("decision") == "adopted":
+                mode = "只读" if task.get("mode") == "read-only" else "项目可写"
+                return f"目标和验收标准已采用。回主窗口点击“启动 / 继续”才开始工作；当前权限仍为{mode}。"
+            return "简报已整理为候选。请打开“简报 / 审核”，核对并采用目标与验收标准，再明确启动工作。"
+        return "AI 审核意见已生成；请在“简报 / 审核”中检查。自动化验收未独立验证，人工认可与发布验收另行处理。"
+    return f"尚无通过核验的{label}结果。请点击“{generate}”重新整理，会消耗模型用量；不会自动开始工作。"
+
+
+def task_reply(task):
+    kind = analysis_message_kind(task)
+    if kind is None:
+        return task.get("last_message") or "尚无回复。"
+    lines = [assessment_guidance(task, kind)]
+    record = task.get(kind) or {}
+    if not task.get("error") and task.get("state") in ("queued", "idle", "paused") and record.get("status") == "current":
+        report = record.get("report") or {}
+        if kind == "brief":
+            lines.extend((f"\n目标\n{record.get('adopted_goal', report.get('goal', '未提供'))}",
+                          f"\n验收标准\n{assessment_content(record.get('adopted_acceptance', report.get('acceptance')))}",
+                          f"\n建议下一步\n{assessment_content(report.get('next_step'))}"))
+        else:
+            lines.append(f"\n审核摘要\n{assessment_content(report.get('summary'))}")
+    return "\n".join(lines)
 
 
 class AssessmentDialog(tk.Toplevel):
@@ -606,7 +694,8 @@ class AssessmentDialog(tk.Toplevel):
         if binding != self.last_binding:
             self.last_binding = deepcopy(binding)
             self.generation += 1
-        self.task_status.set(f"任务状态：{STATES.get(task.get('state'), '未知')} · 简报与审核使用只读权限；不会自动采用 AI 意见。")
+        kind = analysis_message_kind(task) or ("brief" if task.get("brief_required") else "review" if review else "brief")
+        self.task_status.set(f"任务状态：{STATES.get(task.get('state'), '未知')}\n{assessment_guidance(task, kind)}")
         report = brief.get("report") or {}
         fields = (brief.get("adopted_goal", report.get("goal", "")),
                   brief.get("adopted_acceptance", report.get("acceptance", [])))
@@ -640,8 +729,8 @@ class AssessmentDialog(tk.Toplevel):
                      and task.get("state") in ("queued", "idle", "paused") and task.get("run_started") is None
                      and not any(task.get(key) for key in ("inflight", "intent", "pending", "receiver_id", "analysis_thread_id", "assessment")))
         generate = available and not budget_status(task)["reached"]
-        brief_pending = available and brief.get("status") == "current" and brief.get("decision") == "pending"
-        review_pending = available and review.get("status") == "current" and review.get("decision") == "pending"
+        brief_pending = available and brief.get("status") == "current" and brief.get("decision") == "pending" and not (task.get("error") and kind == "brief")
+        review_pending = available and review.get("status") == "current" and review.get("decision") == "pending" and not (task.get("error") and kind == "review")
         for widget, allowed in ((self.generate_brief, generate), (self.generate_review, generate and task.get("work_turns", 0) > 0),
                                 (self.adopt_button, brief_pending), (self.accept_button, review_pending and report.get("verdict") == "ready_for_user"),
                                 (self.revise_button, review_pending and generate and bool(task.get("thread_id")))):
@@ -778,6 +867,7 @@ class RelayApp:
         self.goal_text = text_area(goal, 2 if compact else 3)
         latest = ttk.LabelFrame(right, text="最新回复")
         latest.pack(fill="both", expand=True, pady=6)
+        ttk.Button(latest, text="查看 Codex 原始对话", command=self.open_chat).pack(anchor="e", padx=6)
         self.latest_text = text_area(latest, 6 if compact else 8)
         pending = ttk.LabelFrame(right, text="等待审批 / 回答")
         pending.pack(fill="x", pady=(0, 6))
@@ -908,11 +998,24 @@ class RelayApp:
         if destination:
             self.submit("backup_state", destination)
 
+    def open_chat(self):
+        if self.busy or self.closing or self.selected_id not in self.visible_ids:
+            return
+        previous = getattr(self, "conversation_window", None)
+        if previous is not None and previous.winfo_exists():
+            previous.destroy()
+        self.conversation_window = tk.Toplevel(self.root)
+        self.conversation_window.title("Codex 原始对话")
+        self.conversation_window.geometry("800x650")
+        ttk.Label(self.conversation_window, text="正在读取原文…").pack(padx=16, pady=16)
+        self.submit("read_chat", self.selected_id)
+
     def _action(self, method):
         if self.selected_id not in self.visible_ids or self.buttons[method].instate(["disabled"]):
             return
         if method == "start":
-            self.submit(method, self.selected_id, self.message_text.get("1.0", "end").strip() or None)
+            raw = self.message_text.get("1.0", "end-1c")
+            self.submit(method, self.selected_id, raw if raw.strip() else None)
         elif method == "update_settings":
             TaskSettingsDialog(self.root, self.tasks[self.selected_id], self.submit)
         elif method == "set_archived":
@@ -1008,9 +1111,9 @@ class RelayApp:
                          + (f"\n预备快照：{draft.get('created_at', '时间未知')} · 仅预备，交接前须重验" if draft else "")
                          + (f"\n历史摘录来源：{source.get('thread_id', '未知')} · 可导出查看，不继承原聊天授权" if source else "")
                          + ("\n首次启动先只读整理简报，会消耗模型用量；在“简报 / 审核”采用后再执行。" if task.get("brief_required") else "")
-                         + (f"\n需要处理：{task['error']}" if task.get("error") else ""))
+                         + (f"\n需要处理：{task_error(task)}" if task.get("error") else ""))
         set_text(self.goal_text, task.get("goal"))
-        set_text(self.latest_text, task.get("last_message") or "尚无回复。", follow=True)
+        set_text(self.latest_text, task_reply(task), follow=True)
         if switched or task.get("pending", []) != self.pending_requests:
             self._render_pending(task.get("pending", []))
         elif self._current_request() and self._current_request().get("method") in APPROVALS:
@@ -1145,7 +1248,7 @@ class RelayApp:
         self.backup_button.configure(state="normal" if available and not inspection and backup_safe else "disabled")
         self.message_text.configure(state="disabled" if inspection else "normal")
         task = self.tasks.get(self.selected_id) if self.selected_id in self.visible_ids else None
-        self.assessment_button.configure(state="normal" if task and not self.closing else "disabled")
+        self.assessment_button.configure(state="normal" if task and not self.closing and task.get("connection_mode") != "direct" else "disabled")
         for task_id, dialog in list(self.assessment_dialogs.items()):
             if not dialog.winfo_exists():
                 del self.assessment_dialogs[task_id]
@@ -1176,6 +1279,8 @@ class RelayApp:
                    "update_settings": quiet and state in ("queued", "idle", "paused") and not archived}
         if budget and budget["reached"]:
             allowed["start"] = allowed["handoff"] = False
+        if task and task.get("connection_mode") == "direct":
+            allowed["handoff"] = False
         brief = (task.get("brief") or {}) if task else {}
         if task and task.get("brief_required") and brief.get("status") == "current" and brief.get("decision") == "pending":
             allowed["start"] = False
@@ -1236,18 +1341,36 @@ class RelayApp:
                 if method == "start":
                     task_id = args[0]
                     sent = (args[1] if len(args) > 1 else None) or ""
-                    if self.message_drafts.get(task_id, "").strip() == sent:
+                    if self.message_drafts.get(task_id, "") == sent:
                         self.message_drafts.pop(task_id, None)
-                    if self.rendered_task_id == task_id and self.message_text.get("1.0", "end-1c").strip() == sent:
+                    if self.rendered_task_id == task_id and self.message_text.get("1.0", "end-1c") == sent:
                         self.message_text.delete("1.0", "end")
                 if method == "get_task" and isinstance(result, dict) and not self.closing:
                     HistoryWindow(self.root, result)
+                if method == "read_chat" and isinstance(result, dict) and not self.closing:
+                    window = getattr(self, "conversation_window", None)
+                    if window is None or not window.winfo_exists() or args[0] != self.selected_id:
+                        continue
+                    for child in window.winfo_children():
+                        child.destroy()
+                    ttk.Label(window, text=f"会话：{result['thread_id']}\n读取时间：{result['checked_at']} · 第 {result['page']}/{result['pages']} 页",
+                              wraplength=760).pack(fill="x", padx=10, pady=8)
+                    body = text_area(window, 22)
+                    set_text(body, "\n\n".join(f"[{entry['role']} · {entry['part']}/{entry['parts']} 段]\n{entry['text']}"
+                                               for entry in result["entries"]))
+                    ttk.Label(window, text=result["notice"], wraplength=760).pack(fill="x", padx=10)
+                    nav = ttk.Frame(window)
+                    nav.pack(pady=8)
+                    for label, cursor in (("较早", result["older_cursor"]), ("较新", result["newer_cursor"]), ("最新", None)):
+                        ttk.Button(nav, text=label, state="normal" if cursor is not None or label == "最新" else "disabled",
+                                   command=lambda value=cursor, task_id=args[0]: self.submit("read_chat", task_id, value)).pack(side="left", padx=8)
                 if method == "backup_state" and isinstance(result, dict):
                     self.status.set(f"备份已保存：{result['path']}\n任务 {result['task_count']} · 事件 {result['event_count']} · "
                                     f"文件 {result['file_count']} · 创建时间 {result['created_at']}")
                 else:
                     self.status.set("已导出任务记录。" if method == "export_task" else
-                                    "已导入为待启动任务；原聊天未修改，尚未启动。" if method == "import_thread" else
+                                    ("已连接原聊天；发送消息时原话接续，勿在原窗口同时执行。" if result.get("connection_mode") == "direct" else
+                                     "已导入为待启动任务；原聊天未修改，尚未启动。") if method == "import_thread" else
                                     "设置已保存；未启动任务。" if method == "update_settings" else
                                     "操作已处理；以任务状态和实际回复为准。")
             elif kind in ("command_error", "poll_error", "startup_error", "close_error"):

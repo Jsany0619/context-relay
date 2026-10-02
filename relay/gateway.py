@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 from typing import Any, Callable
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 import uuid
 
 from .transport import RequestTimeout, RpcError
@@ -184,7 +184,7 @@ def ensure_certificate(root) -> tuple[Path, Path, str]:
 class GatewayCore:
     """Durable device and command journal plus immutable phone snapshots."""
 
-    def __init__(self, root, enqueue_callable: Callable[[str], None]):
+    def __init__(self, root, enqueue_callable: Callable[[str], None], conversation_reader=None):
         self.root = protected_secrets.private_directory(root)
         self.path = self.root / "remote-control.sqlite3"
         for name in (self.path.name, self.path.name + "-wal", self.path.name + "-shm"):
@@ -192,6 +192,7 @@ class GatewayCore:
             if existing.exists():
                 protected_secrets.restrict_file(existing)
         self._enqueue = enqueue_callable
+        self._conversation_reader = conversation_reader
         self._lock = threading.RLock()
         self._closed = False
         self._payloads: dict[str, dict[str, Any]] = {}
@@ -515,6 +516,11 @@ class GatewayCore:
             raise ValueError("任务快照无效。")
         messages, messages_truncated = self._messages(task.get("messages"))
         dto = {key: _json_copy(task.get(key)) for key in _TASK_FIELDS}
+        if task.get("connection_mode") == "direct":
+            dto["connection_mode"] = "direct"
+        if (task.get("last_message_kind") in {"brief", "review", "summary", "verify"}
+                or task.get("purpose") in {"brief", "review", "summary", "verify"}):
+            dto["last_message"] = "正在整理或核验资料；原始对话中可查看真实任务内容。"
         dto.update(etag=_hash({"connection_id": connection_id, "task": task}),
                    pending=self._pending(task), brief=self._assessment(task.get("brief")),
                    review=self._assessment(task.get("review")), messages=messages,
@@ -574,6 +580,24 @@ class GatewayCore:
         with self._lock:
             _, tasks = self._device_tasks(device_id)
             return {"online": not self._closed, "cursor": self._device_cursor(tasks)}
+
+    def read_conversation(self, device_id, task_id, cursor=None):
+        with self._lock:
+            self._device_access(device_id, task_id)
+            if self._closed or self._conversation_reader is None:
+                raise GatewayError("unavailable", "原文读取暂不可用，请更新并开启电脑端。", 503)
+            if task_id not in self._tasks:
+                raise KeyError(task_id)
+        try:
+            result = self._conversation_reader(task_id, cursor)
+        except ValueError as error:
+            raise GatewayError("conversation_unavailable", str(error), 409) from error
+        with self._lock:
+            # A revoked device must not receive a read that was in flight at revocation.
+            self._device_access(device_id, task_id)
+            if self._closed:
+                raise GatewayError("unavailable", "手机连接已关闭。", 503)
+            return _json_copy(result, maximum=64 * 1024)
 
     @staticmethod
     def _validate_command(body: Any) -> tuple[dict[str, Any], str]:
@@ -923,9 +947,16 @@ class _Handler(BaseHTTPRequestHandler):
             self._origin()
             device = self._device()
             parsed = urlsplit(self.path)
-            if parsed.query or parsed.fragment:
+            conversation = parsed.path.startswith("/v1/tasks/") and parsed.path.endswith("/conversation")
+            if parsed.fragment or parsed.query and not conversation:
                 raise GatewayError("not_found", "找不到接口。", 404)
-            if parsed.path == "/v1/status":
+            if conversation:
+                query = parse_qs(parsed.query, keep_blank_values=True)
+                if set(query) - {"cursor"} or "cursor" in query and (len(query["cursor"]) != 1 or len(query["cursor"][0]) > 180):
+                    raise GatewayError("invalid_cursor", "原文页码无效。")
+                task_id = parsed.path[len("/v1/tasks/"):-len("/conversation")]
+                self._send(200, self.core.read_conversation(device, task_id, query.get("cursor", [None])[0]))
+            elif parsed.path == "/v1/status":
                 self._send(200, self.core.status_snapshot(device))
             elif parsed.path == "/v1/tasks":
                 self._send(200, self.core.list_task_snapshots(device))

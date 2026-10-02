@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -59,6 +60,119 @@ class PhoneUiTests(unittest.TestCase):
         dialog.pair()
         self.assertIn("至少一个", dialog.info.get())
 
+    def test_empty_task_list_explains_next_step_and_disables_pairing(self):
+        self.app.tasks.clear()
+        with mock.patch("relay.phone.local_addresses", return_value=["127.0.0.1"]):
+            self.app.phone_button.invoke()
+        dialog = self.app.phone_dialog
+        self.wait_for(lambda: not self.app.busy)
+        dialog.deliver({"enabled": True, "endpoint": "https://127.0.0.1:8765", "devices": []})
+        self.assertEqual(dialog.task_ids, [])
+        self.assertIn("新建或导入任务", dialog.task_list.get(0))
+        self.assertEqual(dialog.task_list.cget("state"), "disabled")
+        self.assertTrue(dialog.pair_button.instate(["disabled"]))
+
+    def test_task_import_replaces_disabled_empty_state(self):
+        task = dict(self.app.tasks["task-1"])
+        self.app.tasks.clear()
+        with mock.patch("relay.phone.local_addresses", return_value=["127.0.0.1"]):
+            self.app.phone_button.invoke()
+        dialog = self.app.phone_dialog
+        self.wait_for(lambda: not self.app.busy)
+        self.assertEqual(dialog.task_list.cget("state"), "disabled")
+        self.app.tasks[task["id"]] = task
+        dialog.controls()
+        self.assertEqual(dialog.task_ids, ["task-1"])
+        self.assertIn(task["title"], dialog.task_list.get(0))
+        self.assertEqual(dialog.task_list.cget("state"), "normal")
+
+    def test_changed_choices_discard_late_pairing_reply(self):
+        with mock.patch("relay.phone.local_addresses", return_value=["127.0.0.1"]):
+            self.app.phone_button.invoke()
+        dialog = self.app.phone_dialog
+        self.wait_for(lambda: not self.app.busy)
+        dialog.deliver({"enabled": True, "endpoint": "https://127.0.0.1:8765", "devices": []})
+        dialog.task_list.selection_set(0)
+        with mock.patch.object(dialog, "submit", return_value=True):
+            dialog.pair()
+        dialog.scope.set("查看与控制")
+        dialog.scope_box.event_generate("<<ComboboxSelected>>")
+        dialog.deliver({"enabled": True, "endpoint": "https://127.0.0.1:8765", "devices": [],
+                        "pairing_uri": "contextrelay://pair#old",
+                        "pairing_expires_at": time.time() + 300})
+        self.assertEqual(dialog.pairing.get("1.0", "end-1c"), "")
+        self.assertTrue(dialog.copy_button.instate(["disabled"]))
+        self.assertIn("选择已变化", dialog.info.get())
+
+    def test_pairing_deadline_clears_secret_and_device_shows_expiry(self):
+        with mock.patch("relay.phone.local_addresses", return_value=["127.0.0.1"]):
+            self.app.phone_button.invoke()
+        dialog = self.app.phone_dialog
+        self.wait_for(lambda: not self.app.busy)
+        dialog.deliver({"enabled": True, "endpoint": "https://127.0.0.1:8765", "devices": []})
+        dialog.task_list.selection_set(0)
+        with mock.patch.object(dialog, "submit", return_value=True):
+            dialog.pair()
+        dialog.deliver({"enabled": True, "endpoint": "https://127.0.0.1:8765",
+                        "devices": [{"id": "one", "name": "Android", "revoked": False,
+                                     "expired": False, "scope": "read_only", "task_ids": ["task-1"],
+                                     "expires_at": "2030-01-02T03:04:00+00:00"}],
+                        "pairing_uri": "contextrelay://pair#expired",
+                        "pairing_expires_at": time.time() - 1})
+        self.assertEqual(dialog.pairing.get("1.0", "end-1c"), "")
+        self.assertTrue(dialog.copy_button.instate(["disabled"]))
+        self.assertIn("已过期", dialog.info.get())
+        self.assertIn("到期", dialog.device_list.get(0))
+
+    def test_live_deadline_expires_and_old_timer_cannot_clear_new_pairing(self):
+        with mock.patch("relay.phone.local_addresses", return_value=["127.0.0.1"]):
+            self.app.phone_button.invoke()
+        dialog = self.app.phone_dialog
+        self.wait_for(lambda: not self.app.busy)
+        dialog.deliver({"enabled": True, "endpoint": "https://127.0.0.1:8765", "devices": []})
+        dialog.task_list.selection_set(0)
+        with mock.patch.object(dialog, "submit", return_value=True):
+            dialog.pair()
+        dialog.deliver({"enabled": True, "endpoint": "https://127.0.0.1:8765", "devices": [],
+                        "pairing_uri": "contextrelay://pair#short",
+                        "pairing_expires_at": time.time() + 0.06})
+        self.assertIn("#short", dialog.pairing.get("1.0", "end-1c"))
+        self.wait_for(lambda: not dialog.pairing.get("1.0", "end-1c"))
+        self.assertIn("已过期", dialog.info.get())
+
+        with mock.patch.object(dialog, "submit", return_value=True):
+            dialog.pair()
+        dialog.deliver({"enabled": True, "endpoint": "https://127.0.0.1:8765", "devices": [],
+                        "pairing_uri": "contextrelay://pair#first",
+                        "pairing_expires_at": time.time() + 300})
+        old_serial = dialog._pairing_serial
+        with mock.patch.object(dialog, "submit", return_value=True):
+            dialog.pair()
+        dialog.deliver({"enabled": True, "endpoint": "https://127.0.0.1:8765", "devices": [],
+                        "pairing_uri": "contextrelay://pair#second",
+                        "pairing_expires_at": time.time() + 300})
+        dialog._expire_pairing(old_serial)
+        self.assertIn("#second", dialog.pairing.get("1.0", "end-1c"))
+
+    def test_copy_rechecks_choices_even_without_selection_event(self):
+        with mock.patch("relay.phone.local_addresses", return_value=["127.0.0.1"]):
+            self.app.phone_button.invoke()
+        dialog = self.app.phone_dialog
+        self.wait_for(lambda: not self.app.busy)
+        dialog.deliver({"enabled": True, "endpoint": "https://127.0.0.1:8765", "devices": []})
+        dialog.task_list.selection_set(0)
+        with mock.patch.object(dialog, "submit", return_value=True):
+            dialog.pair()
+        dialog.deliver({"enabled": True, "endpoint": "https://127.0.0.1:8765", "devices": [],
+                        "pairing_uri": "contextrelay://pair#current",
+                        "pairing_expires_at": time.time() + 300})
+        dialog.scope.set("查看与控制")  # Programmatic change deliberately emits no Tk event.
+        with mock.patch.object(dialog, "clipboard_append") as copied:
+            dialog.copy()
+        copied.assert_not_called()
+        self.assertEqual(dialog.pairing.get("1.0", "end-1c"), "")
+        self.assertIn("选择已变化", dialog.info.get())
+
     def test_network_diagnostics_do_not_replace_connection_or_devices(self):
         with mock.patch("relay.phone.local_addresses", return_value=["127.0.0.1"]):
             self.app.phone_button.invoke()
@@ -66,9 +180,11 @@ class PhoneUiTests(unittest.TestCase):
         self.wait_for(lambda: not self.app.busy)
         connected = {"enabled": True, "endpoint": "https://127.0.0.1:8765",
                      "devices": [{"id": "one", "name": "Android", "revoked": False,
-                                  "expired": False, "scope": "read_only", "task_ids": ["task-1"]}]}
+                                  "expired": False, "scope": "read_only", "task_ids": ["task-1"],
+                                  "expires_at": "2030-01-02T03:04:00+00:00"}]}
         dialog.deliver(connected)
         self.assertIn("仅查看", dialog.device_list.get(0))
+        self.assertIn("到期", dialog.device_list.get(0))
         self.assertNotIn("read_only", dialog.device_list.get(0))
         dialog.deliver({"kind": "network_diagnostics", "state": "connected",
                         "local_ipv4": ["100.64.1.2"], "online_peers": 1, "detail": "Connected"})
@@ -82,8 +198,11 @@ class PhoneUiTests(unittest.TestCase):
         core.local_status.return_value = {"devices": []}
         core.new_pairing.return_value = "contextrelay://pair#secret"
         host.core, host.endpoint, host.fingerprint = core, "https://127.0.0.1:8765", "a" * 64
+        before = time.time()
         result = host.pair(["task-1"], "control")
         self.assertEqual(result["pairing_uri"], "contextrelay://pair#secret")
+        self.assertGreaterEqual(result["pairing_expires_at"], before + 299)
+        self.assertLessEqual(result["pairing_expires_at"], time.time() + 300)
         core.new_pairing.assert_called_once_with(host.endpoint, host.fingerprint, ["task-1"], "control")
 
     def test_phone_dialog_maps_chinese_scope_to_protocol_value(self):

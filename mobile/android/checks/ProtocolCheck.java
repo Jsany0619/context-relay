@@ -36,6 +36,24 @@ public final class ProtocolCheck {
         check(Protocol.knownReceipt("unknown")); check(!Protocol.knownReceipt("made_up"));
         check(Protocol.clearSentDraft("old", "old")); check(!Protocol.clearSentDraft("new edit", "old"));
         check(!Protocol.clearSentDraft(null, "old")); check(!Protocol.clearSentDraft("old", null));
+        String exact = "  用户原话\n**保留标记**\n```\n  x = 1\n```\n\t🙂 ";
+        check(exact.equals(Protocol.messageInput(exact)));
+        for (String blank : new String[] {"", " \t\r\n", "\u3000\u00a0"}) rejects(() -> Protocol.messageInput(blank));
+        rejects(() -> Protocol.messageInput(null));
+        check("/v1/tasks/task_1/conversation".equals(Protocol.conversationPath("task_1", null)));
+        check("/v1/tasks/task_1/conversation?cursor=a%2Bb%2F%3D%26%3F%23+%E4%B8%AD".equals(Protocol.conversationPath("task_1", "a+b/=&?# 中")));
+        rejects(() -> Protocol.conversationPath("../other", null));
+        rejects(() -> Protocol.conversationPath("task_1", ""));
+        rejects(() -> Protocol.conversationPath("task_1", new String(new char[181])));
+        check(Protocol.validApiPath("GET", Protocol.conversationPath("task_1", "opaque+&?#/..")));
+        check(Protocol.validApiPath("GET", "/v1/tasks/task_1"));
+        check(Protocol.validApiPath("POST", "/v1/commands"));
+        for (String bad : new String[] {"/v1/tasks/task_1?cursor=x", "/v1/tasks/task_1/conversation?x=1",
+                "/v1/tasks/task_1/conversation?cursor=", "/v1/tasks/task_1/conversation?cursor=x&extra=y",
+                "/v1/tasks/task_1/conversation?cursor=%ZZ", "/v1/tasks/task_1/conversation?cursor=%1",
+                "/v1/tasks/task_1/conversation?cursor=x#fragment", "/v1/tasks/../conversation?cursor=x"}) check(!Protocol.validApiPath("GET", bad));
+        check(!Protocol.validApiPath("POST", "/v1/tasks/task_1/conversation?cursor=x"));
+        check(!Protocol.validApiPath("GET", null));
         check(Protocol.authorized(true, true, true, 2, 2));
         check(!Protocol.authorized(false, true, true, 2, 2));
         check(!Protocol.authorized(true, false, true, 2, 2));
@@ -48,6 +66,22 @@ public final class ProtocolCheck {
         check(!Protocol.visibleMessage("assistant", "in_progress", "work"));
         check(!Protocol.visibleMessage("assistant", "completed", "review"));
         check(!Protocol.visibleMessage("system", "completed", "work"));
+        check("contextrelay://pair#YWJj".equals(Protocol.pairingUri("  contextrelay://pair#YWJj  ")));
+        for (String value : new String[] {"", "https://computer", "contextrelay://pair#", "contextrelay://pair?secret=x#YWJj",
+                "contextrelay://user@pair#YWJj", "contextrelay://pair:12#YWJj", "contextrelay://pair#YWJj%20", "contextrelay://pair#YWJj\nabc"}) rejects(() -> Protocol.pairingUri(value));
+        rejects(() -> Protocol.pairingUri(null)); rejects(() -> Protocol.pairingUri(new String(new char[10001]).replace('\0', 'a')));
+        check("a b c".equals(Protocol.preview("a\nb  c")));
+        check(Protocol.preview(new String(new char[120]).replace('\0', 'a')).length() == 101);
+        check(!Protocol.preview(null).isEmpty());
+        String raw = "# Result\n**done**\n```python\nprint('hello')\n  exact indent\n```\nplain <script>keep text</script>";
+        java.util.List<String[]> blocks = Protocol.messageBlocks(raw);
+        check(blocks.size() == 3 && "code".equals(blocks.get(1)[0]));
+        check("python".equals(blocks.get(1)[1]));
+        check("print('hello')\n  exact indent".equals(blocks.get(1)[2]));
+        check(blocks.get(2)[2].contains("<script>keep text</script>"));
+        check(Protocol.messageBlocks("```unterminated\nkeep **literal**").get(0)[2].equals("```unterminated\nkeep **literal**"));
+        String repeated = new String(new char[100]).replace("\0", "```\nx\n```\n");
+        check(Protocol.messageBlocks(repeated).size() <= 22);
         X509Certificate cert;
         try (FileInputStream input = new FileInputStream(args[0])) {
             cert = (X509Certificate) CertificateFactory.getInstance("X.509").generateCertificate(input);

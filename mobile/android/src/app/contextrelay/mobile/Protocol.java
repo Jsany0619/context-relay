@@ -1,7 +1,10 @@
 package app.contextrelay.mobile;
 
 import java.net.URI;
+import java.net.URLEncoder;
 import java.util.Locale;
+import java.util.ArrayList;
+import java.util.List;
 
 /** Pure rules shared by the UI/transport and host-side checks. */
 public final class Protocol {
@@ -56,6 +59,41 @@ public final class Protocol {
         return current != null && sent != null && current.equals(sent);
     }
 
+    public static String messageInput(String value) {
+        if (value == null || value.codePoints().allMatch(c -> Character.isWhitespace(c) || Character.isSpaceChar(c)))
+            throw new IllegalArgumentException("请先输入要发送的消息；空白内容不会发送。");
+        return value;
+    }
+
+    public static String conversationPath(String taskId, String cursor) {
+        if (taskId == null || !taskId.matches("[A-Za-z0-9_-]{1,128}")) throw new IllegalArgumentException("任务编号无效。");
+        String path = "/v1/tasks/" + taskId + "/conversation";
+        if (cursor == null) return path;
+        if (cursor.isEmpty() || cursor.length() > 180) throw new IllegalArgumentException("原文页码无效，请刷新到最新。");
+        try { return path + "?cursor=" + URLEncoder.encode(cursor, "UTF-8"); }
+        catch (java.io.UnsupportedEncodingException impossible) { throw new IllegalStateException(impossible); }
+    }
+
+    public static boolean validApiPath(String method, String path) {
+        if (path == null || !path.startsWith("/v1/") || path.contains("#")) return false;
+        int query = path.indexOf('?');
+        String route = query < 0 ? path : path.substring(0, query);
+        if (route.contains("..")) return false;
+        if (query < 0) return true;
+        if (!"GET".equals(method) || !route.matches("/v1/tasks/[A-Za-z0-9_-]{1,128}/conversation")) return false;
+        String parameters = path.substring(query + 1);
+        if (!parameters.startsWith("cursor=") || parameters.length() <= 7 || parameters.length() > 2167) return false;
+        for (int i = 7; i < parameters.length(); i++) {
+            char c = parameters.charAt(i);
+            if (c == '%') {
+                if (i + 2 >= parameters.length() || Character.digit(parameters.charAt(i + 1), 16) < 0
+                        || Character.digit(parameters.charAt(i + 2), 16) < 0) return false;
+                i += 2;
+            } else if (!(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || "._*~+-".indexOf(c) >= 0)) return false;
+        }
+        return true;
+    }
+
     public static boolean authorized(boolean unlocked, boolean foreground, boolean secure, int requestEpoch, int currentEpoch) {
         return unlocked && foreground && secure && requestEpoch == currentEpoch;
     }
@@ -64,5 +102,52 @@ public final class Protocol {
 
     public static boolean visibleMessage(String role, String status, String purpose) {
         return ("user".equals(role) || "assistant".equals(role)) && "completed".equals(status) && "work".equals(purpose);
+    }
+
+    public static String pairingUri(CharSequence value) {
+        if (value == null || value.length() == 0) throw new IllegalArgumentException("请先复制电脑上的配对信息，再粘贴到这里。");
+        if (value.length() > 10000) throw new IllegalArgumentException("配对信息过长，请重新复制电脑生成的完整配对信息。");
+        String raw = value.toString().trim();
+        try {
+            URI uri = new URI(raw);
+            if (!"contextrelay".equals(uri.getScheme()) || !"pair".equals(uri.getHost())
+                    || uri.getPort() != -1 || uri.getRawQuery() != null || uri.getUserInfo() != null
+                    || !(uri.getPath().isEmpty() || "/".equals(uri.getPath()))
+                    || uri.getRawFragment() == null || !uri.getRawFragment().matches("[A-Za-z0-9_-]+={0,2}")) throw new IllegalArgumentException();
+            return raw;
+        } catch (Exception ex) { throw new IllegalArgumentException("这不是完整配对信息。请复制以 contextrelay://pair# 开头的一整段文字。"); }
+    }
+
+    public static String preview(String value) {
+        if (value == null || value.trim().isEmpty()) return "尚无回复，打开后可发送消息。";
+        String line = value.replaceAll("\\s+", " ").trim();
+        return line.codePointCount(0, line.length()) > 100 ? line.substring(0, line.offsetByCodePoints(0, 100)) + "…" : line;
+    }
+
+    /** Only closed triple-backtick fences are styled; everything else stays selectable text. */
+    public static List<String[]> messageBlocks(String value) {
+        List<String[]> blocks = new ArrayList<>();
+        String[] lines = value.split("\\n", -1);
+        StringBuilder plain = new StringBuilder();
+        boolean fences = true;
+        for (int i = 0; i < lines.length; i++) {
+            String opening = lines[i].trim();
+            int end = i + 1;
+            if (fences && opening.startsWith("```") && !opening.substring(3).contains("`") && blocks.size() < 20) {
+                while (end < lines.length && !"```".equals(lines[end].trim())) end++;
+                if (end < lines.length) {
+                    if (plain.length() > 0) { blocks.add(new String[] {"text", "", plain.toString()}); plain.setLength(0); }
+                    StringBuilder code = new StringBuilder();
+                    for (int row = i + 1; row < end; row++) { if (row > i + 1) code.append('\n'); code.append(lines[row]); }
+                    blocks.add(new String[] {"code", opening.substring(3).trim(), code.toString()});
+                    i = end; continue;
+                }
+                fences = false;
+            }
+            if (plain.length() > 0) plain.append('\n');
+            plain.append(lines[i]);
+        }
+        if (plain.length() > 0 || blocks.isEmpty()) blocks.add(new String[] {"text", "", plain.toString()});
+        return blocks;
     }
 }
