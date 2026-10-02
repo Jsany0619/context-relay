@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 
-from .budget import budget_status, validate_limits
+from .budget import budget_message, budget_status, validate_limits
 
 
 _spec = importlib.util.spec_from_file_location(
@@ -524,7 +524,7 @@ class Manager:
             if kind == "review" and not task["work_turns"]:
                 raise ValueError("先产生一轮候选成果，再审核。已有项目可先整理简报。")
             if self._budget(task):
-                raise ValueError("已达到任务预算，整理与审核也会消耗模型用量。")
+                raise ValueError(budget_message(task) + "整理与审核也会消耗模型用量。")
             self._check_import_source(task)
             binding = self._assessment_binding(task)
             task["assessment"] = {"kind": kind, "binding": binding}
@@ -630,7 +630,7 @@ class Manager:
                 raise ValueError("请在输入框写下返工要求，将按原话发送。")
             result = self._current_assessment(task, "review")
             if self._budget(task):
-                raise ValueError("已达到任务预算，不能启动返工。")
+                raise ValueError(budget_message(task))
             if not task["thread_id"]:
                 raise ValueError("没有可继续的执行会话。")
             self._read_idle(task["thread_id"])
@@ -744,7 +744,7 @@ class Manager:
         if self.stop_requested.is_set():
             raise RuntimeError("管理器正在关闭，尚未发送的执行请求已取消。")
         if self._budget(task):
-            raise ValueError("已达到任务预算，不能启动下一步。")
+            raise ValueError(budget_message(task))
         thread_id = thread_id or task["thread_id"]
         readonly = purpose != "work" or task["mode"] == "read-only"
         policy = {"type": "readOnly"} if readonly else {
@@ -785,7 +785,7 @@ class Manager:
                 raise ValueError("任务还不能继续，请先暂停或核对恢复。")
             self._assert_workspace(task)
             if self._budget(task):
-                raise ValueError("任务已达到预算。")
+                raise ValueError(budget_message(task))
             if task.get("analysis_thread_id"):
                 raise ValueError("分析会话尚未收束，请先核对恢复。")
             self._check_import_source(task)
@@ -1363,8 +1363,19 @@ class Manager:
                     continue
                 self._save(task)
             for task in self.list_tasks():
-                if task["state"] in ("running", "summarizing", "verifying", "briefing", "reviewing") and task["turn_id"] and self._budget(task):
-                    self.pause(task["id"])
+                if task["state"] in ("running", "summarizing", "verifying", "briefing", "reviewing") and task["turn_id"]:
+                    status = budget_status(task)
+                    if status["reached"]:
+                        task = self._task(task["id"])
+                        task["error"] = budget_message(task, status, automatic=True)
+                        reason = ("tokens_and_minutes" if status["token_reached"] and status["minutes_reached"]
+                                  else "tokens" if status["token_reached"] else "minutes")
+                        self._save(task, "budget_pause_requested", {
+                            "reason": reason, "elapsed_seconds": status["elapsed_seconds"],
+                            "usage": task.get("usage", 0), "max_tokens": task.get("max_tokens", 0),
+                            "max_minutes": task.get("max_minutes", 0),
+                        })
+                        self.pause(task["id"])
 
     def finish(self, task_id):
         with self._lock:

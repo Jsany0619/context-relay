@@ -61,6 +61,14 @@ public final class ProtocolCheck {
         check(!Protocol.conversationPageFailure(409, "other_conflict"));
         check(!Protocol.conversationPageFailure(400, "invalid_command"));
         check(!Protocol.conversationPageFailure(409, null));
+        check(Protocol.failureNotice("failed", false, "任务已达到预算。").startsWith("操作失败：任务已达到预算。"));
+        check(Protocol.failureNotice("failed", false, "任务已达到预算。").contains("未自动重发"));
+        check(Protocol.failureNotice("failed", false, "任务已达到预算。").contains("保留确定结果"));
+        check(Protocol.failureNotice("", true, "此设备仅有只读权限。").startsWith("提交被拒绝：此设备仅有只读权限。"));
+        check(!Protocol.failureNotice("failed", false, null).isEmpty());
+        check(Protocol.failureNotice("failed", false, " \n ").contains("未提供具体原因"));
+        for (String state : new String[] {"unknown", "accepted", "running", "succeeded", ""})
+            check(Protocol.failureNotice(state, false, "不得把未知或未完成结果改为失败").isEmpty());
         check(Protocol.authorized(true, true, true, 2, 2));
         check(!Protocol.authorized(false, true, true, 2, 2));
         check(!Protocol.authorized(true, false, true, 2, 2));

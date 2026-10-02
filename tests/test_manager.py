@@ -326,9 +326,36 @@ class ManagerContractTests(unittest.TestCase):
         self.usage(task, last=100, total=100)
         self.complete(task)
         before = len(self.client.calls_for("turn/start"))
-        with self.assertRaises((ValueError, RuntimeError)):
+        with self.assertRaisesRegex(ValueError, r"Token 预算.*累计 100 / 上限 100"):
             self.manager.start(task["id"])
         self.assertEqual(before, len(self.client.calls_for("turn/start")))
+
+    def test_elapsed_budget_auto_pause_keeps_reason_and_blocks_restart_without_native_call(self):
+        with patch("relay.manager.time.time", return_value=1000):
+            task = self.start_task(max_minutes=5)
+        with patch("relay.manager.time.time", return_value=1300.425):
+            self.manager.poll()
+            pausing = self.manager.get_task(task["id"])
+            self.assertEqual("pausing", pausing["state"])
+            self.assertIn("时间预算", pausing["error"])
+            self.assertIn("累计 5.01 分钟 / 上限 5 分钟", pausing["error"])
+            self.assertIn("已因预算请求暂停", pausing["error"])
+            self.assertIn("停止是否完成请看任务状态", pausing["error"])
+            self.assertNotIn("已自动暂停", pausing["error"])
+            budget_events = [event for event in pausing["events"] if event["kind"] == "budget_pause_requested"]
+            self.assertEqual(1, len(budget_events))
+            self.assertEqual("minutes", budget_events[0]["data"]["reason"])
+            self.assertAlmostEqual(300.425, budget_events[0]["data"]["elapsed_seconds"])
+            self.assertEqual(1, len(self.client.calls_for("turn/interrupt")))
+
+            self.manager.poll()
+            paused = self.manager.get_task(task["id"])
+            self.assertEqual("paused", paused["state"])
+            self.assertIn("已因预算请求暂停", paused["error"])
+            before = len(self.client.calls_for("turn/start"))
+            with self.assertRaisesRegex(ValueError, r"时间预算.*累计 5\.01 分钟 / 上限 5 分钟"):
+                self.manager.start(task["id"])
+            self.assertEqual(before, len(self.client.calls_for("turn/start")))
 
     def test_invalid_permission_mode_cannot_create_task(self):
         with self.assertRaises((ValueError, RuntimeError)):

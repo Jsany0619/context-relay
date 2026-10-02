@@ -79,6 +79,13 @@ public final class Protocol {
                 || status == 400 && "invalid_cursor".equals(code);
     }
 
+    public static String failureNotice(String state, boolean rejected, String reason) {
+        if (!rejected && !"failed".equals(state)) return "";
+        String detail = reason == null || reason.trim().isEmpty() ? "电脑未提供具体原因，请查看完整回执。" : reason.trim();
+        return (rejected ? "提交被拒绝：" : "操作失败：") + detail
+                + "\n未自动重发；已保留确定结果，请核对后返回任务。";
+    }
+
     public static boolean validApiPath(String method, String path) {
         if (path == null || !path.startsWith("/v1/") || path.contains("#")) return false;
         int query = path.indexOf('?');

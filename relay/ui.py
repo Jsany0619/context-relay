@@ -44,6 +44,7 @@ EVENT_LABELS = {
     "turn_requested": "已请求启动轮次", "turn_started": "已收到启动回执（不代表已实际开始）",
     "native_turn_started": "原生轮次已开始", "turn_completed": "已收到轮次终态", "work_finished": "工作轮次结束",
     "interrupt_requested": "已记录暂停请求", "paused": "已暂停", "draft_saved": "已保存预备快照",
+    "budget_pause_requested": "已因预算请求暂停（以任务状态确认是否停止）",
     "requires_reconciliation": "需要核对恢复", "restart_requires_reconciliation": "重启后需要核对恢复",
     "reconciled_read_only": "已完成只读恢复核对", "handoff_requested": "已请求交接",
     "handoff_unnecessary": "无需交接", "checkpoint_frozen": "已冻结检查点", "ownership_transferred": "已移交执行权",

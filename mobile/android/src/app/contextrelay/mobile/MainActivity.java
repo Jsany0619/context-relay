@@ -329,6 +329,19 @@ public final class MainActivity extends Activity {
     }
     private JSONObject connection() { return saved == null ? null : saved.optJSONObject("connection"); }
     private JSONObject pending() { return saved == null ? null : saved.optJSONObject("pending"); }
+    private String pendingFailure() {
+        JSONObject current = pending();
+        if (current == null) return "";
+        JSONObject receipt = current.optJSONObject("receipt");
+        JSONObject failure = receipt == null ? null : receipt.optJSONObject("error");
+        boolean rejected = current.optBoolean("rejected");
+        return Protocol.failureNotice(receipt == null ? "" : receipt.optString("state"), rejected,
+                rejected ? current.optString("rejection") : failure == null ? "" : failure.optString("message"));
+    }
+    private void statusWithFailure(String value) {
+        String failure = pendingFailure();
+        status.setText(failure.isEmpty() ? value : failure);
+    }
     private boolean controlAllowed(JSONObject value) {
         return connection() != null && !connection().optBoolean("needs_pairing")
                 && "control".equals(value.optString("remote_access", connection().optString("scope", "read_only")));
@@ -547,7 +560,7 @@ public final class MainActivity extends Activity {
             if (id == null) { tasks = result.getJSONArray("tasks"); if (!tasks.toString().equals(listSignature)) showTasks(); }
             else if (id.equals(selectedId)) { task = result; if (timeline == null) showTask(); else updateTask(); }
             offline = false;
-            status.setText("已连接电脑 · " + DateTimeFormatter.ofPattern("HH:mm:ss").withZone(ZoneId.systemDefault()).format(Instant.now()) + " 更新");
+            statusWithFailure("已连接电脑 · " + DateTimeFormatter.ofPattern("HH:mm:ss").withZone(ZoneId.systemDefault()).format(Instant.now()) + " 更新");
             updateTaskControls();
             if (id != null && originalView && originalCursor == null) readOriginal(null, true, false);
         }, silent);
@@ -815,7 +828,7 @@ public final class MainActivity extends Activity {
             if (!originalView || !id.equals(selectedId)) return;
             if (page.has("conversation_error")) {
                 originalInfo.setText("原文暂不可读，保留上次内容；可刷新到最新重读。\n" + page.getString("conversation_error"));
-                status.setText("原文未更新；任务连接状态和手机权限未改变。");
+                statusWithFailure("原文未更新；任务连接状态和手机权限未改变。");
                 controls();
                 return;
             }
@@ -1047,7 +1060,7 @@ public final class MainActivity extends Activity {
                     if (result.optBoolean("rejected")) {
                         if (result.optInt("http_status") == 401) expireConnection();
                         record.put("rejected", true).put("rejection", result.optString("message"));
-                        persist(); renderCurrent(); status.setText("电脑明确拒绝了提交；草稿已保留。");
+                        persist(); renderCurrent(); statusWithFailure("电脑明确拒绝了提交；草稿已保留。");
                     } else receiveReceipt(result);
                 });
             } catch (Exception ex) { error(ex); }
@@ -1116,7 +1129,7 @@ public final class MainActivity extends Activity {
         }
         if (!persist()) return;
         renderOperation();
-        status.setText("succeeded".equals(state) ? "电脑已处理本次命令；模型工作是否完成请看任务最新状态。" : "已核对操作回执：" + state);
+        statusWithFailure("succeeded".equals(state) ? "电脑已处理本次命令；模型工作是否完成请看任务最新状态。" : "已核对操作回执：" + state);
         updateTaskControls();
     }
 
@@ -1134,7 +1147,8 @@ public final class MainActivity extends Activity {
         JSONObject body = current.optJSONObject("body");
         JSONObject receipt = current.optJSONObject("receipt");
         String state = receipt == null ? "结果尚未确认" : receipt.optString("state");
-        operation.setText("本次操作：" + (body == null ? "记录不完整" : body.optString("command")) + " · " + state
+        String failure = pendingFailure();
+        operation.setText((failure.isEmpty() ? "本次操作：" + (body == null ? "记录不完整" : body.optString("command")) + " · " + state : failure)
                 + "\n请求编号：" + (body == null ? "未知" : body.optString("request_id")));
         text(operationPanel, "操作回执\n" + (current.optBoolean("rejected") ? current.optString("rejection") : receipt == null
                 ? "请求已在本机密封保存。失去连接或退出后只查询原请求，不自动重发。" : pretty(receipt.opt("error"))), 15);

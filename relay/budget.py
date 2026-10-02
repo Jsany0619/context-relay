@@ -27,3 +27,21 @@ def budget_status(task, now=None):
     minutes_reached = bool(task.get("max_minutes") and elapsed >= task["max_minutes"] * 60)
     return {"elapsed_seconds": elapsed, "token_reached": token_reached,
             "minutes_reached": minutes_reached, "reached": token_reached or minutes_reached}
+
+
+def budget_message(task, status=None, automatic=False):
+    status = budget_status(task) if status is None else status
+    details = []
+    if status["token_reached"]:
+        details.append(f"Token 累计 {task.get('usage', 0)} / 上限 {task.get('max_tokens', 0)}")
+    if status["minutes_reached"]:
+        details.append(f"时间累计 {status['elapsed_seconds'] / 60:.2f} 分钟 / 上限 "
+                       f"{task.get('max_minutes', 0):g} 分钟")
+    message = "任务已达到" + ("和".join(
+        [name for hit, name in ((status["token_reached"], "Token 预算"),
+                                (status["minutes_reached"], "时间预算")) if hit]))
+    if details:
+        message += "：" + "；".join(details)
+    if automatic:
+        return message + "，已因预算请求暂停；停止是否完成请看任务状态。不会自动继续。请在电脑调整预算后再继续。"
+    return message + "。请在电脑调整预算后再继续。"
