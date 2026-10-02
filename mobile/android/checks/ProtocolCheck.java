@@ -54,6 +54,13 @@ public final class ProtocolCheck {
                 "/v1/tasks/task_1/conversation?cursor=x#fragment", "/v1/tasks/../conversation?cursor=x"}) check(!Protocol.validApiPath("GET", bad));
         check(!Protocol.validApiPath("POST", "/v1/tasks/task_1/conversation?cursor=x"));
         check(!Protocol.validApiPath("GET", null));
+        check(Protocol.conversationPageFailure(409, "conversation_unavailable"));
+        check(Protocol.conversationPageFailure(400, "invalid_cursor"));
+        for (int status : new int[] {0, 401, 403, 404, 429, 500, 503})
+            check(!Protocol.conversationPageFailure(status, "conversation_unavailable"));
+        check(!Protocol.conversationPageFailure(409, "other_conflict"));
+        check(!Protocol.conversationPageFailure(400, "invalid_command"));
+        check(!Protocol.conversationPageFailure(409, null));
         check(Protocol.authorized(true, true, true, 2, 2));
         check(!Protocol.authorized(false, true, true, 2, 2));
         check(!Protocol.authorized(true, false, true, 2, 2));

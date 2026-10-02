@@ -631,20 +631,22 @@ public final class MainActivity extends Activity {
 
     private void updateTaskControls() {
         if (task == null || taskStatus == null || !authorized()) return;
-        boolean mutable = pending() == null && !task.optBoolean("archived") && !offline && controlAllowed(task);
+        boolean control = controlAllowed(task);
+        boolean mutable = pending() == null && !task.optBoolean("archived") && !offline && control;
         boolean waitingBrief = !"direct".equals(task.optString("connection_mode"))
                 && task.optBoolean("brief_required") && candidate(task.optJSONObject("brief"));
         send.setTag(mutable && Protocol.quiet(task.optString("state")) && !waitingBrief);
-        send.setText("direct".equals(task.optString("connection_mode")) ? "原话发送" : task.optBoolean("brief_required") ? "整理简报" : "发送 / 继续");
+        send.setText(!control ? "仅查看" : "direct".equals(task.optString("connection_mode")) ? "原话发送" : task.optBoolean("brief_required") ? "整理简报" : "发送 / 继续");
         pause.setTag(mutable && (Protocol.active(task.optString("state")) || "blocked".equals(task.optString("state"))));
+        pause.setText(!control ? "仅查看" : Protocol.quiet(task.optString("state")) ? "未运行" : "暂停");
         JSONArray requests = task.optJSONArray("pending");
         int requestCount = requests == null ? 0 : requests.length();
         requestsAction.setVisibility(requestCount > 0 && !keyboardOpen ? View.VISIBLE : View.GONE);
         requestsAction.setText("处理请求（" + requestCount + "）");
         String notice = requestCount > 0 ? " · 等待你处理请求" : "";
         if (waitingBrief) notice = " · 简报待核对，请点更多";
-        if (!controlAllowed(task)) notice = " · 手机仅查看";
-        taskStatus.setText((offline ? "离线快照 · " : "") + stateLabel(task.optString("state")) + " · " + ("workspace-write".equals(task.optString("mode")) ? "项目可写" : "只读") + notice
+        taskStatus.setText((control ? "" : "手机仅查看：请在电脑选择任务，并以“查看与控制”重新配对。\n")
+                + (offline ? "离线快照 · " : "") + stateLabel(task.optString("state")) + " · " + ("workspace-write".equals(task.optString("mode")) ? "项目可写" : "项目只读") + notice
                 + (task.optString("error").isEmpty() ? "" : "\n" + task.optString("error")));
         compactChat();
         controls();
@@ -803,8 +805,20 @@ public final class MainActivity extends Activity {
                 || connection().optBoolean("needs_pairing") || busy || silent && refreshing) return;
         String id = selectedId;
         JSONObject target = connection();
-        run("正在只读获取原始对话…", epoch -> api(target, epoch).request("GET", Protocol.conversationPath(id, cursor), null), page -> {
+        run("正在只读获取原始对话…", epoch -> {
+            try { return api(target, epoch).request("GET", Protocol.conversationPath(id, cursor), null); }
+            catch (HttpApi.ApiError ex) {
+                if (!Protocol.conversationPageFailure(ex.status, ex.code)) throw ex;
+                return new JSONObject().put("conversation_error", ex.getMessage());
+            }
+        }, page -> {
             if (!originalView || !id.equals(selectedId)) return;
+            if (page.has("conversation_error")) {
+                originalInfo.setText("原文暂不可读，保留上次内容；可刷新到最新重读。\n" + page.getString("conversation_error"));
+                status.setText("原文未更新；任务连接状态和手机权限未改变。");
+                controls();
+                return;
+            }
             JSONArray entries = page.getJSONArray("entries");
             if (page.optString("thread_id").isEmpty() || entries.length() > 8)
                 throw new IllegalStateException("原文页结构不完整，未用摘要替代。");

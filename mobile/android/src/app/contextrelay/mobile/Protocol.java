@@ -74,6 +74,11 @@ public final class Protocol {
         catch (java.io.UnsupportedEncodingException impossible) { throw new IllegalStateException(impossible); }
     }
 
+    public static boolean conversationPageFailure(int status, String code) {
+        return status == 409 && "conversation_unavailable".equals(code)
+                || status == 400 && "invalid_cursor".equals(code);
+    }
+
     public static boolean validApiPath(String method, String path) {
         if (path == null || !path.startsWith("/v1/") || path.contains("#")) return false;
         int query = path.indexOf('?');
