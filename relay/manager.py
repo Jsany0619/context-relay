@@ -58,6 +58,42 @@ def _safe(value):
     return value
 
 
+def _append_message(task, role, text, *, identity=None, historical=False, created_at=None):
+    """Keep a bounded display history, separate from native execution/authority records."""
+    if not isinstance(text, str) or not text.strip():
+        return
+    messages = task.setdefault("messages", [])
+    message_id = handoff_rules.digest(identity) if identity else uuid.uuid4().hex
+    if any(message["id"] == message_id for message in messages):
+        return
+    safe = _safe(text)
+    shortened = len(safe) > 16000
+    messages.append({"id": message_id, "role": role, "text": safe[:16000],
+                     "created_at": created_at or handoff_rules.now(), "status": "completed", "purpose": "work",
+                     "historical": historical, "truncated": shortened})
+    task["messages_truncated"] = bool(task.get("messages_truncated") or shortened)
+    while len(messages) > 100 or sum(len(m["text"].encode("utf-8")) for m in messages) > 256 * 1024:
+        messages.pop(0)
+        task["messages_truncated"] = True
+
+
+def _conversation(task):
+    if "messages" not in task:
+        task["messages"] = []
+        source = task.get("source_snapshot") or {}
+        recorded_at = task.get("updated_at") or task.get("created_at") or "unknown"
+        task["messages_truncated"] = bool(source.get("omitted_messages") or source.get("truncated_messages"))
+        for index, message in enumerate(source.get("messages", [])):
+            if message.get("role") in ("user", "assistant"):
+                _append_message(task, message["role"], message.get("text"),
+                                identity=["import", index, message.get("item_id")], historical=True, created_at=recorded_at)
+        _append_message(task, "user", task.get("goal"), identity=["goal", task["id"]],
+                        created_at=task.get("created_at") or "unknown")
+        if task.get("purpose") not in ("brief", "review", "summary", "verify") and not task.get("assessment"):
+            _append_message(task, "assistant", task.get("last_message"), identity=["legacy-result", task["id"]], created_at=recorded_at)
+    return task
+
+
 def workspace_snapshot(cwd):
     """Bounded content snapshot; never save source bytes or follow junctions."""
     root = Path(cwd).resolve(strict=True)
@@ -98,8 +134,15 @@ def workspace_snapshot(cwd):
 class Manager:
     def __init__(self, state_dir=None, client=None):
         default = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / ".local/share"))) / "ContextRelay"
-        self.root = Path(state_dir or default).resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
+        requested_root = Path(state_dir or default)
+        if os.name == "nt":
+            from .secrets import private_directory
+            # Validate the original path before resolving junctions or touching a database.
+            # Recovery data stays query-only; its private directory receives the same ACL protection.
+            self.root = private_directory(requested_root)
+        else:
+            self.root = requested_root.resolve()
+            self.root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._closed = False
         self.stop_requested = threading.Event()
@@ -131,6 +174,12 @@ class Manager:
                     raise ValueError("恢复库只读标记无效。")
                 self.db.execute("PRAGMA query_only=ON")
             else:
+                if os.name == "nt":
+                    from .secrets import restrict_file
+                    for name in ("tasks.sqlite3", "tasks.sqlite3-wal", "tasks.sqlite3-shm", "manager.lock"):
+                        path = self.root / name
+                        if path.exists():
+                            restrict_file(path)
                 self.db.execute("PRAGMA journal_mode=WAL")
                 self.db.execute("PRAGMA synchronous=FULL")
                 self.db.execute("CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, data TEXT NOT NULL)")
@@ -187,11 +236,11 @@ class Manager:
         row = self.db.execute("SELECT data FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
             raise ValueError("找不到任务。")
-        return json.loads(row[0])
+        return _conversation(json.loads(row[0]))
 
     def list_tasks(self):
         with self._lock:
-            return [json.loads(r[0]) for r in self.db.execute("SELECT data FROM tasks ORDER BY rowid DESC")]
+            return [_conversation(json.loads(r[0])) for r in self.db.execute("SELECT data FROM tasks ORDER BY rowid DESC")]
 
     def get_task(self, task_id):
         with self._lock:
@@ -246,7 +295,7 @@ class Manager:
                     "purpose": None, "work_turns": 0, "handoff_work_turns": 0, "elapsed_seconds": 0,
                     "run_started": None, "native_started": False, "history": [], "intent": None,
                     "created_at": handoff_rules.now()}
-            return task
+            return _conversation(task)
 
     def create_task(self, title, cwd, goal, mode="read-only", auto_handoff=False, max_tokens=0, max_minutes=0):
         with self._lock:
@@ -363,6 +412,8 @@ class Manager:
                     task["acceptance_criteria"] = existing.get("acceptance_criteria", [])
                 self._invalidate_assessments(task)
             task["source_snapshot"] = source
+            task.pop("messages", None)
+            _conversation(task)
             task["source_stopped_at_import"] = True
             self._save(task, "source_import_updated" if existing else "source_imported",
                        {"thread_id": thread_id, "fingerprint": fingerprint, "mode": mode,
@@ -690,11 +741,14 @@ class Manager:
                 raise ValueError("简报已生成，请打开“简报 / 审核”核对并采用当前方向。")
             if message:
                 handoff_rules.reject_sensitive(message)
+                _append_message(task, "user", message)
                 task["requirements"].append(message)
                 task["revision"] += 1
                 task["checkpoint"] = None
                 self._invalidate_assessments(task)
                 self._save(task, "user_instruction", {"text": message})
+            elif task.get("thread_id") and not task.get("brief_required"):
+                _append_message(task, "user", "继续当前任务")
             if task.get("brief_required"):
                 return self.analyze(task_id, "brief")
             try:
@@ -809,6 +863,9 @@ class Manager:
                         task["inflight"].pop(item["id"], None)
                     elif item.get("type") == "agentMessage" and task["purpose"] != "verify":
                         task["last_message"] = _safe(item.get("text", ""))
+                        if task["purpose"] == "work":
+                            _append_message(task, "assistant", item.get("text", ""),
+                                            identity=[thread["id"], task["turn_id"], item.get("id") or item.get("text")])
             if task["inflight"]:
                 raise ValueError("有结果未知的工具操作；请在原会话核对实际结果，不能自动重放。")
             if recovered_status == "completed" and task["purpose"] == "work":
@@ -1172,6 +1229,9 @@ class Manager:
                     kind = item.get("type")
                     if kind == "agentMessage" and method == "item/completed":
                         task["last_message"] = _safe(item.get("text", ""))
+                        if task["purpose"] == "work":
+                            _append_message(task, "assistant", item.get("text", ""),
+                                            identity=[tid, event_turn, item.get("id") or item.get("text")])
                         self._messages.pop((tid, event_turn), None)
                     elif kind == "contextCompaction" and method == "item/completed" and task["purpose"] not in ("brief", "review"):
                         if item.get("id") and item["id"] not in task["compaction_ids"]:

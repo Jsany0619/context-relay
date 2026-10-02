@@ -36,6 +36,18 @@ public final class ProtocolCheck {
         check(Protocol.knownReceipt("unknown")); check(!Protocol.knownReceipt("made_up"));
         check(Protocol.clearSentDraft("old", "old")); check(!Protocol.clearSentDraft("new edit", "old"));
         check(!Protocol.clearSentDraft(null, "old")); check(!Protocol.clearSentDraft("old", null));
+        check(Protocol.authorized(true, true, true, 2, 2));
+        check(!Protocol.authorized(false, true, true, 2, 2));
+        check(!Protocol.authorized(true, false, true, 2, 2));
+        check(!Protocol.authorized(true, true, false, 2, 2));
+        check(!Protocol.authorized(true, true, true, 1, 2));
+        check(Protocol.autoArchiveReceipt("succeeded"));
+        for (String state : new String[] {"accepted", "running", "unknown", "failed", ""}) check(!Protocol.autoArchiveReceipt(state));
+        check(Protocol.visibleMessage("user", "completed", "work"));
+        check(Protocol.visibleMessage("assistant", "completed", "work"));
+        check(!Protocol.visibleMessage("assistant", "in_progress", "work"));
+        check(!Protocol.visibleMessage("assistant", "completed", "review"));
+        check(!Protocol.visibleMessage("system", "completed", "work"));
         X509Certificate cert;
         try (FileInputStream input = new FileInputStream(args[0])) {
             cert = (X509Certificate) CertificateFactory.getInstance("X.509").generateCertificate(input);

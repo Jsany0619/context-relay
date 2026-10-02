@@ -55,4 +55,14 @@ public final class Protocol {
     public static boolean clearSentDraft(String current, String sent) {
         return current != null && sent != null && current.equals(sent);
     }
+
+    public static boolean authorized(boolean unlocked, boolean foreground, boolean secure, int requestEpoch, int currentEpoch) {
+        return unlocked && foreground && secure && requestEpoch == currentEpoch;
+    }
+
+    public static boolean autoArchiveReceipt(String state) { return "succeeded".equals(state); }
+
+    public static boolean visibleMessage(String role, String status, String purpose) {
+        return ("user".equals(role) || "assistant".equals(role)) && "completed".equals(status) && "work".equals(purpose);
+    }
 }

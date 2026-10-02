@@ -7,6 +7,7 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.security.cert.Certificate;
 import java.security.cert.X509Certificate;
+import java.util.function.BooleanSupplier;
 import javax.net.ssl.HttpsURLConnection;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManager;
@@ -18,8 +19,11 @@ public final class HttpApi {
     private final SSLContext ssl;
     private final PinnedTrust trust;
     private final String host;
+    private final BooleanSupplier permitted;
 
-    public HttpApi(JSONObject connection) throws Exception {
+    public HttpApi(JSONObject connection, BooleanSupplier permitted) throws Exception {
+        this.permitted = permitted;
+        requireUnlocked();
         endpoint = Protocol.endpoint(connection.getString("endpoint"));
         token = connection.optString("token", "");
         host = new URL(endpoint).getHost();
@@ -28,7 +32,12 @@ public final class HttpApi {
         ssl.init(null, new TrustManager[] { trust }, null);
     }
 
+    private void requireUnlocked() {
+        if (!permitted.getAsBoolean()) throw new IllegalStateException("手机已锁定，未继续发送。已发送的请求需重新解锁后核对结果。");
+    }
+
     public JSONObject request(String method, String path, JSONObject body) throws Exception {
+        requireUnlocked();
         if (!path.startsWith("/v1/") || path.contains("..") || path.contains("?") || path.contains("#"))
             throw new IllegalArgumentException("Invalid API path");
         HttpsURLConnection connection = (HttpsURLConnection) new URL(endpoint + path).openConnection();
@@ -59,8 +68,10 @@ public final class HttpApi {
                 connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
                 connection.setFixedLengthStreamingMode(encoded.length);
                 // TLS + certificate + hostname verification precede all secret/body transmission.
-                try (OutputStream out = connection.getOutputStream()) { out.write(encoded); }
+                requireUnlocked();
+                try (OutputStream out = connection.getOutputStream()) { requireUnlocked(); out.write(encoded); }
             }
+            requireUnlocked();
             int status = connection.getResponseCode();
             if (status >= 300 && status < 400) throw new IllegalStateException("已拒绝地址重定向；请在电脑重新生成配对信息。");
             InputStream input = status >= 400 ? connection.getErrorStream() : connection.getInputStream();

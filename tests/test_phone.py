@@ -56,6 +56,47 @@ class PhoneUiTests(unittest.TestCase):
         self.assertIn("私有", dialog.info.get())
         self.assertIsNone(self.app.worker.phone.core)
         self.assertFalse(self.fake.starts)
+        dialog.pair()
+        self.assertIn("至少一个", dialog.info.get())
+
+    def test_network_diagnostics_do_not_replace_connection_or_devices(self):
+        with mock.patch("relay.phone.local_addresses", return_value=["127.0.0.1"]):
+            self.app.phone_button.invoke()
+        dialog = self.app.phone_dialog
+        self.wait_for(lambda: not self.app.busy)
+        connected = {"enabled": True, "endpoint": "https://127.0.0.1:8765",
+                     "devices": [{"id": "one", "name": "Android", "revoked": False,
+                                  "expired": False, "scope": "read_only", "task_ids": ["task-1"]}]}
+        dialog.deliver(connected)
+        self.assertIn("仅查看", dialog.device_list.get(0))
+        self.assertNotIn("read_only", dialog.device_list.get(0))
+        dialog.deliver({"kind": "network_diagnostics", "state": "connected",
+                        "local_ipv4": ["100.64.1.2"], "online_peers": 1, "detail": "Connected"})
+        self.assertTrue(dialog.enabled)
+        self.assertEqual(dialog.devices, connected["devices"])
+        self.assertIn("100.64.1.2", dialog.info.get())
+
+    def test_phone_host_pair_forwards_only_explicit_tasks_and_scope(self):
+        host = PhoneHost(self.fake, self.app.worker.commands)
+        core = mock.Mock()
+        core.local_status.return_value = {"devices": []}
+        core.new_pairing.return_value = "contextrelay://pair#secret"
+        host.core, host.endpoint, host.fingerprint = core, "https://127.0.0.1:8765", "a" * 64
+        result = host.pair(["task-1"], "control")
+        self.assertEqual(result["pairing_uri"], "contextrelay://pair#secret")
+        core.new_pairing.assert_called_once_with(host.endpoint, host.fingerprint, ["task-1"], "control")
+
+    def test_phone_dialog_maps_chinese_scope_to_protocol_value(self):
+        with mock.patch("relay.phone.local_addresses", return_value=["127.0.0.1"]):
+            self.app.phone_button.invoke()
+        dialog = self.app.phone_dialog
+        self.wait_for(lambda: not self.app.busy)
+        dialog.enabled = True
+        dialog.task_list.selection_set(0)
+        dialog.scope.set("查看与控制")
+        with mock.patch.object(dialog, "submit") as submit:
+            dialog.pair()
+        submit.assert_called_once_with("remote_pair", [dialog.task_ids[0]], "control")
 
     def test_recovery_inspection_disables_phone_control(self):
         base_ui.TkSmokeTests.set_inspection(self)

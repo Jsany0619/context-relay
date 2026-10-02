@@ -2,8 +2,10 @@ package app.contextrelay.mobile;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.KeyguardManager;
 import android.content.Intent;
 import android.graphics.Color;
+import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -14,6 +16,7 @@ import android.text.TextUtils;
 import android.text.TextWatcher;
 import android.util.Base64;
 import android.view.View;
+import android.view.Gravity;
 import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.EditText;
@@ -23,6 +26,10 @@ import android.widget.TextView;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.time.OffsetDateTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
@@ -33,9 +40,13 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 public final class MainActivity extends Activity {
+    // Operate: familiar native chat, real completed messages, a stable composer, and explicit approvals.
+    // White reading surface, neutral user bubbles, system type; no invented streaming or decorations.
+    private static final int UNLOCK_REQUEST = 701;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final List<Button> actions = new ArrayList<>();
+    private final List<AlertDialog> dialogs = new ArrayList<>();
     private Vault vault;
     private JSONObject saved;
     private JSONObject drafts;
@@ -45,23 +56,30 @@ public final class MainActivity extends Activity {
     private TextView operation;
     private LinearLayout content;
     private LinearLayout operationPanel;
+    private LinearLayout root, header, composer, timeline;
+    private TextView taskStatus;
+    private Button send, pause;
     private ScrollView scroll;
     private EditText message;
-    private boolean busy, foreground, popup, storageFailed, pairingView;
+    private boolean busy, popup, storageFailed, pairingView, authPending, unlockApproved, offline, requestOnResume = true;
+    private volatile boolean foreground, unlocked;
+    private volatile int authEpoch;
     private int generation;
     private String selectedId;
     private String incomingPair;
+    private String timelineSignature = "";
+    private String resumeTaskId;
 
-    private interface Job { JSONObject run() throws Exception; }
+    private interface Job { JSONObject run(int epoch) throws Exception; }
     private interface Result { void accept(JSONObject value) throws Exception; }
 
     private final Runnable poller = new Runnable() {
         public void run() {
-            if (!foreground || isFinishing()) return;
-            if (!busy && !popup && !pairingView && connection() != null) {
+            if (!authorized() || isFinishing()) return;
+            if (!busy && !popup && !pairingView && connection() != null && !connection().optBoolean("needs_pairing")) {
                 if (pending() != null && !pending().optBoolean("rejected")
                         && (pending().optJSONObject("receipt") == null || !Protocol.terminalReceipt(pending().optJSONObject("receipt").optString("state")))) queryOperation();
-                else if (pending() == null && !editing()) refresh();
+                else if (pending() == null) refresh();
             }
             handler.postDelayed(this, 5000);
         }
@@ -71,11 +89,64 @@ public final class MainActivity extends Activity {
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         getWindow().setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE);
+        getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+        readIntent(getIntent());
+        showLocked("请验证手机锁屏身份后继续。");
+    }
+
+    private boolean deviceSecure() {
+        KeyguardManager manager = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
+        return manager != null && manager.isDeviceSecure();
+    }
+
+    private boolean authorized() { return Protocol.authorized(unlocked, foreground, deviceSecure(), authEpoch, authEpoch); }
+
+    private void showLocked(String reason) {
+        LinearLayout box = column(); box.setPadding(dp(24), dp(32), dp(24), dp(24));
+        text(box, "Context Relay 已锁定", 24);
+        text(box, reason + "\n离开 App 后再次进入需要重新验证。未确认的操作仍保留，不会自动重发。", 17);
+        Button unlock = new Button(this); unlock.setText("验证手机身份");
+        unlock.setOnClickListener(v -> requestUnlock()); box.addView(unlock);
+        setContentView(box);
+    }
+
+    private void requestUnlock() {
+        if (!foreground || authPending || storageFailed) return;
+        requestOnResume = false;
+        KeyguardManager manager = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
+        if (manager == null || !manager.isDeviceSecure()) {
+            showLocked("请先在手机系统设置中启用锁屏密码、PIN 或图案。未设置安全锁时，不能读取连接或操作电脑。");
+            return;
+        }
+        Intent intent = manager.createConfirmDeviceCredentialIntent("解锁 Context Relay", "验证手机锁屏身份后查看对话和控制电脑");
+        if (intent == null) { showLocked("系统暂时无法验证身份，请检查手机锁屏设置后重试。"); return; }
+        authPending = true;
+        try { startActivityForResult(intent, UNLOCK_REQUEST); }
+        catch (Exception ex) { authPending = false; showLocked("无法打开系统身份验证，请稍后重试。"); }
+    }
+
+    @Override protected void onActivityResult(int request, int result, Intent data) {
+        super.onActivityResult(request, result, data);
+        if (request == UNLOCK_REQUEST) {
+            authPending = false;
+            unlockApproved = result == RESULT_OK && deviceSecure();
+            if (!unlockApproved) showLocked("身份验证未完成，连接和任务保持锁定。");
+        }
+    }
+
+    private void openUnlocked() {
         try {
             vault = new Vault(this);
             saved = vault.read();
             drafts = saved.optJSONObject("drafts");
             if (drafts == null) { drafts = new JSONObject(); saved.put("drafts", drafts); }
+            resumeTaskId = saved.optString("selected_task", "");
+            if (resumeTaskId.isEmpty()) resumeTaskId = null;
+            task = saved.optJSONObject("last_task");
+            if (task != null && (!task.optString("id").equals(resumeTaskId) || connection() == null
+                    || connection().optBoolean("needs_pairing")
+                    || !saved.optString("last_task_pin").equals(connection().optString("certificate_sha256")))) task = null;
+            offline = true; // A sealed snapshot is display-only until the computer answers again.
         } catch (Exception ex) {
             storageFailed = true;
             LinearLayout box = column();
@@ -84,14 +155,15 @@ public final class MainActivity extends Activity {
             setContentView(box);
             return;
         }
-        LinearLayout root = column();
+        root = column();
+        root.setBackgroundColor(Color.WHITE);
         root.setPadding(dp(14), dp(12), dp(14), dp(8));
         root.setOnApplyWindowInsetsListener((view, insets) -> {
             view.setPadding(dp(14) + insets.getSystemWindowInsetLeft(), dp(8) + insets.getSystemWindowInsetTop(),
                     dp(14) + insets.getSystemWindowInsetRight(), dp(8) + insets.getSystemWindowInsetBottom());
             return insets;
         });
-        text(root, "Context Relay", 24);
+        header = column(); root.addView(header);
         status = text(root, "手机操作 · 电脑执行", 15);
         compactStatus(status);
         operation = text(root, "", 14);
@@ -102,17 +174,21 @@ public final class MainActivity extends Activity {
         content = column();
         scroll.addView(content);
         root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
+        composer = column(); root.addView(composer);
         setContentView(root);
-        readIntent(getIntent());
         if (connection() == null || incomingPair != null) showPairing();
-        else { showTasks(); refresh(); }
+        else {
+            if (task != null) { selectedId = resumeTaskId; showTask(); }
+            else { showTasks(); selectedId = resumeTaskId; }
+            if (pending() != null) queryOperation(); else refresh();
+        }
     }
 
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
         readIntent(intent);
-        if (!storageFailed && incomingPair != null) showPairing();
+        if (authorized() && !storageFailed && incomingPair != null) showPairing();
     }
 
     private void readIntent(Intent intent) {
@@ -125,13 +201,35 @@ public final class MainActivity extends Activity {
     @Override protected void onResume() {
         super.onResume();
         foreground = true;
-        if (!storageFailed) { handler.removeCallbacks(poller); handler.postDelayed(poller, 500); }
+        if (unlockApproved && deviceSecure()) {
+            unlockApproved = false; unlocked = true; openUnlocked();
+            handler.removeCallbacks(poller); handler.postDelayed(poller, 500);
+        } else if (requestOnResume && !authPending && !storageFailed) requestUnlock();
     }
     @Override protected void onPause() {
-        foreground = false;
+        authEpoch++; generation++; // Invalidate in-flight permits before disk writes can delay the foreground transition.
         handler.removeCallbacks(poller);
         handler.removeCallbacks(saveDrafts);
-        if (!storageFailed) persist();
+        if (unlocked) {
+            resumeTaskId = selectedId; requestOnResume = true;
+            if (saved != null) {
+                put(saved, "selected_task", selectedId == null ? JSONObject.NULL : selectedId);
+                if (task != null && connection() != null && !connection().optBoolean("needs_pairing")) {
+                    JSONObject snapshot = new JSONObject();
+                    for (String name : new String[] {"id", "title", "state", "mode", "last_message", "messages", "messages_truncated", "error"})
+                        if (task.has(name)) put(snapshot, name, task.opt(name));
+                    if (snapshot.toString().getBytes(StandardCharsets.UTF_8).length <= 512 * 1024) {
+                        put(saved, "last_task", snapshot); put(saved, "last_task_pin", connection().optString("certificate_sha256"));
+                    } else { saved.remove("last_task"); saved.remove("last_task_pin"); }
+                }
+            }
+            if (!storageFailed) persist();
+        }
+        foreground = false; unlocked = false;
+        for (AlertDialog dialog : new ArrayList<>(dialogs)) dialog.dismiss();
+        saved = null; drafts = null; vault = null; task = null; tasks = new JSONArray();
+        selectedId = null; message = null;
+        showLocked("请验证手机锁屏身份后继续。");
         super.onPause();
     }
     @Override protected void onDestroy() {
@@ -140,7 +238,7 @@ public final class MainActivity extends Activity {
         super.onDestroy();
     }
     @Override public void onBackPressed() {
-        if (selectedId != null && !busy) { selectedId = null; task = null; showTasks(); refresh(); }
+        if (authorized() && selectedId != null && !busy) { selectedId = null; task = null; showTasks(); refresh(); }
         else super.onBackPressed();
     }
 
@@ -149,6 +247,7 @@ public final class MainActivity extends Activity {
     private TextView text(LinearLayout parent, String value, int size) {
         TextView view = new TextView(this);
         view.setText(value); view.setTextSize(size); view.setTextIsSelectable(true);
+        view.setTextColor(Color.rgb(28, 31, 36));
         view.setPadding(0, dp(5), 0, dp(5));
         parent.addView(view, new LinearLayout.LayoutParams(-1, -2));
         return view;
@@ -176,30 +275,56 @@ public final class MainActivity extends Activity {
     private Button button(LinearLayout parent, String label, boolean enabled, Runnable callback) {
         Button view = new Button(this);
         view.setText(label); view.setAllCaps(false); view.setTextSize(16);
-        view.setEnabled(enabled && !busy && !storageFailed);
+        view.setEnabled(enabled && !busy && !storageFailed && authorized());
+        view.setMinHeight(dp(48));
         view.setTag(enabled);
-        view.setOnClickListener(v -> { try { callback.run(); } catch (Exception ex) { error(ex); } });
+        view.setOnClickListener(v -> { if (authorized()) try { callback.run(); } catch (Exception ex) { error(ex); } });
         parent.addView(view, new LinearLayout.LayoutParams(-1, -2));
         actions.add(view);
         return view;
     }
     private void controls() {
-        for (Button item : actions) item.setEnabled(Boolean.TRUE.equals(item.getTag()) && !busy && !storageFailed);
+        for (Button item : actions) item.setEnabled(Boolean.TRUE.equals(item.getTag()) && !busy && !storageFailed && authorized());
     }
-    private void clearPage() { generation++; content.removeAllViews(); actions.clear(); message = null; }
+    private void clearPage() {
+        generation++; content.removeAllViews(); header.removeAllViews(); composer.removeAllViews();
+        actions.clear(); message = null; timeline = null; timelineSignature = ""; operationPanel = null;
+        taskStatus = null; send = null; pause = null;
+        text(header, "Context Relay", 22);
+    }
     private JSONObject connection() { return saved == null ? null : saved.optJSONObject("connection"); }
     private JSONObject pending() { return saved == null ? null : saved.optJSONObject("pending"); }
-    private boolean editing() { View focus = getCurrentFocus(); return focus instanceof EditText; }
+    private boolean controlAllowed(JSONObject value) {
+        return connection() != null && !connection().optBoolean("needs_pairing")
+                && "control".equals(value.optString("remote_access", connection().optString("scope", "read_only")));
+    }
+    private void expireConnection() {
+        if (connection() == null) return;
+        connection().remove("token"); put(connection(), "needs_pairing", true); offline = true;
+        saved.remove("last_task"); saved.remove("last_task_pin"); saved.remove("selected_task");
+        task = null; tasks = new JSONArray(); resumeTaskId = null; selectedId = null;
+        persist(); showTasks();
+    }
     private String draftKey(String id) { return (connection() == null ? "" : connection().optString("certificate_sha256")) + ":" + id; }
     private String draft(String id) { return drafts.optString(draftKey(id), ""); }
     private void put(JSONObject object, String key, Object value) {
         try { object.put(key, value); } catch (Exception ex) { throw new IllegalStateException(ex); }
     }
     private boolean persist() {
+        if (!authorized() || vault == null || saved == null) return false;
         try { vault.write(saved); return true; }
         catch (Exception ex) { storageFailed = true; if (status != null) status.setText("本机保存失败；已停止发送。请在电脑核对。" + safeError(ex)); controls(); return false; }
     }
-    private void error(Exception ex) { if (status != null) status.setText(safeError(ex)); }
+    private void error(Exception ex) {
+        if (!authorized()) return;
+        if (ex instanceof IllegalArgumentException) { if (status != null) status.setText(safeError(ex)); return; }
+        offline = true;
+        if (ex instanceof HttpApi.ApiError && ((HttpApi.ApiError) ex).status == 401) expireConnection();
+        if (status != null) status.setText(ex instanceof HttpApi.ApiError && ((HttpApi.ApiError) ex).status == 401
+                ? "连接授权已到期或被撤销。请在电脑重新配对；未确认操作先在电脑核对。"
+                : "连接未更新 · 保留最后内容\n" + safeError(ex));
+        updateTaskControls();
+    }
     private static String safeError(Exception ex) {
         String value = ex.getMessage();
         if (value == null || value.isEmpty()) value = ex.getClass().getSimpleName();
@@ -215,17 +340,27 @@ public final class MainActivity extends Activity {
     }
     private static String pathId(String value) throws Exception { return URLEncoder.encode(value, "UTF-8"); }
 
+    private HttpApi api(JSONObject target, int epoch) throws Exception {
+        return new HttpApi(target, () -> Protocol.authorized(unlocked, foreground, deviceSecure(), epoch, authEpoch));
+    }
+
     private void run(String label, Job job, Result result) {
-        if (busy || storageFailed || isFinishing()) return;
+        if (!authorized() || busy || storageFailed || isFinishing()) return;
         busy = true; controls(); status.setText(label);
         final int bound = generation;
+        final int epoch = authEpoch;
         worker.execute(() -> {
             JSONObject value = null; Exception failure = null;
-            try { value = job.run(); } catch (Exception ex) { failure = ex; }
+            try {
+                if (!Protocol.authorized(unlocked, foreground, deviceSecure(), epoch, authEpoch)) throw new IllegalStateException("手机已锁定，未开始发送。");
+                value = job.run(epoch);
+            } catch (Exception ex) { failure = ex; }
             final JSONObject returned = value; final Exception problem = failure;
             handler.post(() -> {
                 if (isDestroyed() || isFinishing()) return;
-                busy = false; controls();
+                busy = false;
+                if (!Protocol.authorized(unlocked, foreground, deviceSecure(), epoch, authEpoch)) return;
+                controls();
                 if (problem != null) { error(problem); return; }
                 // Navigation cannot happen while a request owns the view; late results never switch tasks.
                 if (bound != generation) return;
@@ -235,14 +370,22 @@ public final class MainActivity extends Activity {
     }
 
     private void confirm(String title, String detail, Runnable action) {
+        if (!authorized()) return;
         popup = true;
         AlertDialog dialog = new AlertDialog.Builder(this).setTitle(title).setMessage(detail)
-                .setNegativeButton("取消", null).setPositiveButton("确认本次操作", (d, which) -> action.run()).create();
+                .setNegativeButton("取消", null).setPositiveButton("确认本次操作", (d, which) -> {
+                    if (!authorized()) return;
+                    for (AlertDialog open : new ArrayList<>(dialogs)) open.dismiss();
+                    action.run();
+                }).create();
         dialog.setOnDismissListener(d -> popup = false);
         showDialog(dialog, false);
     }
 
     private void showDialog(AlertDialog dialog, boolean inputForm) {
+        if (!authorized()) return;
+        dialogs.add(dialog); popup = true;
+        dialog.setOnDismissListener(d -> { dialogs.remove(dialog); popup = !dialogs.isEmpty(); });
         dialog.getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
         if (inputForm) dialog.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
                 | WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
@@ -285,8 +428,13 @@ public final class MainActivity extends Activity {
                 JSONObject target = new JSONObject().put("endpoint", endpoint).put("certificate_sha256", pin);
                 JSONObject body = new JSONObject().put("secret", secret).put("device_name", Build.MANUFACTURER + " " + Build.MODEL);
                 confirm("确认电脑身份", endpoint + "\n证书 SHA-256：\n" + pin + "\n请与电脑显示的内容核对。", () ->
-                    run("正在配对…", () -> new HttpApi(target).request("POST", "/v1/pair", body), result -> {
+                    run("正在配对…", epoch -> api(target, epoch).request("POST", "/v1/pair", body), result -> {
                         target.put("token", result.getString("token")).put("device_id", result.getString("device_id"));
+                        if (result.has("expires_at")) target.put("expires_at", result.get("expires_at"));
+                        target.put("scope", result.optString("scope", "read_only"));
+                        if (result.has("task_ids")) target.put("task_ids", result.get("task_ids"));
+                        saved.remove("last_task"); saved.remove("last_task_pin"); saved.remove("selected_task"); resumeTaskId = null;
+                        tasks = new JSONArray(); task = null; selectedId = null; offline = true;
                         saved.put("connection", target);
                         if (persist()) { code.setText(""); showTasks(); refresh(); }
                     }));
@@ -299,6 +447,8 @@ public final class MainActivity extends Activity {
         clearPage(); selectedId = null; task = null; pairingView = false;
         text(content, "电脑已有任务", 22);
         text(content, "在电脑创建或导入任务后，在这里选择。手机不会接管同时运行的官方 Codex 聊天。", 16);
+        if (connection() != null && connection().has("expires_at"))
+            text(content, "连接授权到期：" + timeLabel(connection().optString("expires_at")), 14);
         renderOperation();
         button(content, "刷新任务列表", connection() != null, this::refresh);
         for (int i = 0; i < tasks.length(); i++) {
@@ -314,13 +464,18 @@ public final class MainActivity extends Activity {
     }
 
     private void refresh() {
-        if (connection() == null || busy) return;
+        if (!authorized() || connection() == null || busy) return;
+        if (connection().optBoolean("needs_pairing")) {
+            offline = true; status.setText("授权已失效，请返回任务列表重新配对。未确认操作先在电脑核对。"); updateTaskControls(); return;
+        }
         JSONObject target = connection();
         String id = selectedId;
-        run("正在读取电脑状态…", () -> new HttpApi(target).request("GET", id == null ? "/v1/tasks" : "/v1/tasks/" + pathId(id), null), result -> {
+        run("正在读取电脑状态…", epoch -> api(target, epoch).request("GET", id == null ? "/v1/tasks" : "/v1/tasks/" + pathId(id), null), result -> {
             if (id == null) { tasks = result.getJSONArray("tasks"); showTasks(); }
-            else if (id.equals(selectedId)) { task = result; showTask(); }
-            status.setText("已从电脑更新 · 草稿只在明确发送后提交");
+            else if (id.equals(selectedId)) { task = result; if (timeline == null) showTask(); else updateTask(); }
+            offline = false;
+            status.setText("已连接电脑 · " + DateTimeFormatter.ofPattern("HH:mm:ss").withZone(ZoneId.systemDefault()).format(Instant.now()) + " 更新");
+            updateTaskControls();
         });
     }
 
@@ -337,72 +492,149 @@ public final class MainActivity extends Activity {
     }
 
     private void showTask() {
-        if (task == null) return;
+        if (!authorized() || task == null) return;
         pairingView = false;
-        int position = scroll.getScrollY();
         clearPage();
-        final JSONObject displayed = task;
-        final String id = displayed.optString("id");
-        text(content, displayed.optString("title"), 22);
-        text(content, stateLabel(displayed.optString("state")) + " · " + ("workspace-write".equals(displayed.optString("mode")) ? "项目可写" : "只读"), 17);
-        text(content, "目标\n" + displayed.optString("goal", "待整理简报"), 17);
-        text(content, "累计记录 Token：" + pretty(displayed.opt("usage")) + "\n软预算：" + displayed.optLong("max_tokens")
-                + " Token / " + displayed.optDouble("max_minutes", 0) + " 分钟（0 为不限；不是当前上下文占用）", 14);
-        if (!displayed.optString("error").isEmpty()) text(content, "需要注意\n" + displayed.optString("error"), 17);
-        text(content, "最新回复\n" + displayed.optString("last_message", "暂无"), 18);
+        header.removeAllViews();
+        LinearLayout navigation = new LinearLayout(this); navigation.setGravity(Gravity.CENTER_VERTICAL);
+        header.addView(navigation);
+        Button back = button(navigation, "返回", true, () -> { selectedId = null; task = null; showTasks(); refresh(); });
+        back.setLayoutParams(new LinearLayout.LayoutParams(dp(72), -2));
+        TextView title = text(navigation, task.optString("title", "对话"), 19);
+        title.setMaxLines(2); title.setEllipsize(TextUtils.TruncateAt.END);
+        title.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
+        Button more = button(navigation, "更多", true, this::showDetails);
+        more.setLayoutParams(new LinearLayout.LayoutParams(dp(72), -2));
+        taskStatus = text(header, "", 14); compactStatus(taskStatus);
+        timeline = column(); content.addView(timeline);
         renderOperation();
-        button(content, "刷新 / 核对最新显示", true, this::refresh);
-        message = input(content, "补充指令或回复草稿（不会自动发送）", draft(id), true);
+        final String id = task.optString("id");
+        composer.setPadding(0, dp(8), 0, 0);
+        message = input(composer, "发送消息给电脑上的 Codex", draft(id), true);
+        message.setMaxLines(4); message.setContentDescription("消息草稿，不会自动发送");
         message.addTextChangedListener(new TextWatcher() {
             public void beforeTextChanged(CharSequence s, int start, int count, int after) { }
             public void onTextChanged(CharSequence s, int start, int before, int count) {
-                put(drafts, draftKey(id), s.toString()); handler.removeCallbacks(saveDrafts); handler.postDelayed(saveDrafts, 600);
+                if (authorized() && drafts != null) { put(drafts, draftKey(id), s.toString()); handler.removeCallbacks(saveDrafts); handler.postDelayed(saveDrafts, 600); }
             }
             public void afterTextChanged(Editable value) { }
         });
-        boolean mutable = pending() == null && !displayed.optBoolean("archived");
-        boolean quiet = mutable && Protocol.quiet(displayed.optString("state"));
-        boolean waitingBrief = displayed.optBoolean("brief_required") && candidate(displayed.optJSONObject("brief"));
-        text(content, "执行中不能追加启动：可以保留草稿，先暂停并确认结果，再明确继续。手机端不修改任务的权限范围。", 15);
-        button(content, displayed.optBoolean("brief_required") ? "开始只读整理简报（耗模型用量）" : "明确发送 / 启动或继续", quiet && !waitingBrief, () -> {
+        LinearLayout commands = new LinearLayout(this); composer.addView(commands);
+        pause = button(commands, "暂停", false, () -> command(task, "pause", new JSONObject(), "暂停任务", "请求电脑暂停；收到原生终态之前不能假定已停止。", null));
+        pause.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
+        send = button(commands, "发送", false, () -> {
             try {
                 String value = draft(id).trim();
                 JSONObject payload = new JSONObject().put("message", value.isEmpty() ? JSONObject.NULL : value);
-                command(displayed, "start", payload, "启动 / 继续", "提交到电脑任务：" + displayed.optString("title") + "\n" + (value.isEmpty() ? "继续已记录目标" : value), draft(id));
+                command(task, "start", payload, "发送给电脑", "提交到任务：" + task.optString("title") + "\n" + (value.isEmpty() ? "继续已记录目标" : value), draft(id));
             } catch (Exception ex) { error(ex); }
         });
-        button(content, "暂停并核对在途结果", mutable && (Protocol.active(displayed.optString("state")) || "blocked".equals(displayed.optString("state"))),
-                () -> command(displayed, "pause", new JSONObject(), "暂停任务", "请求电脑暂停；收到原生终态之前不能假定已停止。", null));
-        button(content, "只读核对恢复", mutable && !Protocol.active(displayed.optString("state")),
+        send.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
+        updateTask();
+    }
+
+    private void updateTaskControls() {
+        if (task == null || taskStatus == null || !authorized()) return;
+        boolean mutable = pending() == null && !task.optBoolean("archived") && !offline && controlAllowed(task);
+        boolean waitingBrief = task.optBoolean("brief_required") && candidate(task.optJSONObject("brief"));
+        send.setTag(mutable && Protocol.quiet(task.optString("state")) && !waitingBrief);
+        send.setText(task.optBoolean("brief_required") ? "整理简报" : "发送 / 继续");
+        pause.setTag(mutable && (Protocol.active(task.optString("state")) || "blocked".equals(task.optString("state"))));
+        JSONArray requests = task.optJSONArray("pending");
+        String notice = requests != null && requests.length() > 0 ? " · 有待处理请求，请点更多" : "";
+        if (waitingBrief) notice = " · 简报待核对，请点更多";
+        if (!controlAllowed(task)) notice = " · 手机仅查看";
+        taskStatus.setText((offline ? "离线快照 · " : "") + stateLabel(task.optString("state")) + " · " + ("workspace-write".equals(task.optString("mode")) ? "项目可写" : "只读") + notice
+                + (task.optString("error").isEmpty() ? "" : "\n" + task.optString("error")));
+        controls();
+    }
+
+    private static String timeLabel(String value) {
+        try { return DateTimeFormatter.ofPattern("MM-dd HH:mm").withZone(ZoneId.systemDefault()).format(OffsetDateTime.parse(value).toInstant()); }
+        catch (Exception ignored) { return value == null ? "" : value; }
+    }
+
+    private void chatMessage(String role, String value, String at) {
+        boolean mine = "user".equals(role);
+        LinearLayout bubble = column();
+        LinearLayout.LayoutParams layout = new LinearLayout.LayoutParams(-1, -2);
+        layout.setMargins(mine ? dp(32) : 0, dp(8), mine ? 0 : dp(8), dp(12));
+        bubble.setPadding(dp(12), dp(8), dp(12), dp(8));
+        if (mine) { GradientDrawable background = new GradientDrawable(); background.setColor(Color.rgb(238, 242, 246)); background.setCornerRadius(dp(14)); bubble.setBackground(background); }
+        timeline.addView(bubble, layout);
+        TextView label = text(bubble, (mine ? "你" : "Codex") + (at.isEmpty() ? "" : " · " + timeLabel(at)), 13);
+        label.setTextColor(Color.rgb(78, 87, 98));
+        TextView body = text(bubble, value, 17); body.setLineSpacing(dp(3), 1);
+    }
+
+    private void updateTask() {
+        if (!authorized() || timeline == null || task == null) return;
+        updateTaskControls();
+        JSONArray messages = task.optJSONArray("messages");
+        String signature = (messages == null ? task.optString("last_message") : messages.toString())
+                + task.optBoolean("messages_truncated") + task.optString("state");
+        if (signature.equals(timelineSignature)) return;
+        boolean follow = timelineSignature.isEmpty() || !scroll.canScrollVertically(1);
+        int position = scroll.getScrollY();
+        timelineSignature = signature; timeline.removeAllViews();
+        if (task.optBoolean("messages_truncated")) text(timeline, "这里只显示最近的对话，较早内容请在电脑查看。", 14);
+        int rendered = 0;
+        if (messages != null) for (int i = 0; i < messages.length(); i++) {
+            JSONObject item = messages.optJSONObject(i);
+            if (item == null || !Protocol.visibleMessage(item.optString("role"), item.optString("status"), item.optString("purpose")) || item.optString("text").isEmpty()) continue;
+            String value = item.optString("text");
+            if (item.optBoolean("historical")) value = "导入的历史参考\n" + value;
+            if (item.optBoolean("truncated")) value += "\n\n内容已截短，完整资料请在电脑查看。";
+            chatMessage(item.optString("role"), value, item.optBoolean("historical") ? "" : item.optString("created_at")); rendered++;
+        }
+        if (rendered == 0 && !task.optString("last_message").isEmpty()) { chatMessage("assistant", task.optString("last_message"), ""); rendered++; }
+        if (rendered == 0) text(timeline, "对话会显示在这里。输入消息并发送，电脑处理后会自动显示回复。", 17);
+        if (Protocol.active(task.optString("state"))) text(timeline, "电脑正在处理…完成后的回复会自动显示。", 15);
+        scroll.post(() -> { if (authorized()) scroll.scrollTo(0, follow ? Math.max(0, content.getHeight() - scroll.getHeight()) : position); });
+    }
+
+    private void showDetails() {
+        if (task == null) return;
+        final JSONObject displayed = task;
+        LinearLayout box = column(); box.setPadding(dp(16), dp(8), dp(16), dp(8));
+        text(box, "目标\n" + displayed.optString("goal", "待整理简报"), 17);
+        text(box, "累计记录 Token：" + pretty(displayed.opt("usage")) + "\n软预算：" + displayed.optLong("max_tokens")
+                + " Token / " + displayed.optDouble("max_minutes", 0) + " 分钟（0 为不限；不是当前上下文占用）", 14);
+        text(box, "执行时可先写草稿。要追加指令，请先暂停并核对结果。手机不会扩大电脑任务权限。", 15);
+        boolean mutable = pending() == null && !displayed.optBoolean("archived") && !offline && controlAllowed(displayed);
+        boolean quiet = mutable && Protocol.quiet(displayed.optString("state"));
+        button(box, "刷新当前对话", true, this::refresh);
+        button(box, "只读核对恢复", mutable && !Protocol.active(displayed.optString("state")),
                 () -> command(displayed, "reconcile", new JSONObject(), "核对恢复", "只读查询已知执行结果。不会自动继续或重试未知操作。", null));
-        renderRequests(displayed, mutable);
-        renderAssessments(displayed, quiet);
-        button(content, "返回任务列表", true, () -> { selectedId = null; task = null; showTasks(); refresh(); });
-        scroll.post(() -> scroll.scrollTo(0, position));
+        renderRequests(box, displayed, mutable);
+        renderAssessments(box, displayed, quiet);
+        ScrollView viewport = new ScrollView(this); viewport.addView(box);
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("任务与审批").setView(viewport).setPositiveButton("返回对话", null).create();
+        showDialog(dialog, true);
     }
 
     private boolean candidate(JSONObject value) { return value != null && "current".equals(value.optString("status")) && "pending".equals(value.optString("decision")); }
 
-    private void renderRequests(JSONObject displayed, boolean mutable) {
+    private void renderRequests(LinearLayout parent, JSONObject displayed, boolean mutable) {
         JSONArray requests = displayed.optJSONArray("pending");
         if (requests == null || requests.length() == 0) return;
-        text(content, "待处理请求", 22);
+        text(parent, "待处理请求", 22);
         for (int i = 0; i < requests.length(); i++) {
             JSONObject request = requests.optJSONObject(i);
             if (request == null) continue;
             JSONObject params = request.optJSONObject("params");
             if (params == null) params = new JSONObject();
             String method = request.optString("method");
-            text(content, "请求 " + pretty(request.opt("id")) + "\n" + pretty(params), 16);
+            text(parent, "请求 " + pretty(request.opt("id")) + "\n" + pretty(params), 16);
             if ("item/commandExecution/requestApproval".equals(method) || "item/fileChange/requestApproval".equals(method)) {
-                if (!request.optBoolean("can_approve")) text(content, "动作证据不完整或不支持，只能拒绝。请在电脑核对。", 17);
-                button(content, "仅允许本次动作", mutable && request.optBoolean("can_approve"), () -> answerApproval(displayed, request, true));
-                button(content, "拒绝本次动作", mutable, () -> answerApproval(displayed, request, false));
+                if (!request.optBoolean("can_approve")) text(parent, "动作证据不完整或不支持，只能拒绝。请在电脑核对。", 17);
+                button(parent, "仅允许本次动作", mutable && request.optBoolean("can_approve"), () -> answerApproval(displayed, request, true));
+                button(parent, "拒绝本次动作", mutable, () -> answerApproval(displayed, request, false));
             } else if ("item/tool/requestUserInput".equals(method)) {
                 final JSONObject questions = params;
-                button(content, "填写本次问题回答", mutable && request.optBoolean("can_approve"), () -> questions(displayed, request, questions));
-                if (!request.optBoolean("can_approve")) text(content, "问题资料不完整或包含秘密字段，不在手机收集。请在电脑处理或暂停。", 16);
-            } else text(content, "手机不支持此类授权，请在电脑处理。", 16);
+                button(parent, "填写本次问题回答", mutable && request.optBoolean("can_approve"), () -> questions(displayed, request, questions));
+                if (!request.optBoolean("can_approve")) text(parent, "问题资料不完整或包含秘密字段，不在手机收集。请在电脑处理或暂停。", 16);
+            } else text(parent, "手机不支持此类授权，请在电脑处理。", 16);
         }
     }
 
@@ -449,26 +681,26 @@ public final class MainActivity extends Activity {
         });
     }
 
-    private void renderAssessments(JSONObject displayed, boolean quiet) {
-        text(content, "简报 / 阶段审核", 22);
-        text(content, "生成简报和审核均消耗模型用量。AI 意见不等于测试通过、人工认可或发布验收。采用前由电脑重新核验结果有效性。", 16);
-        button(content, "生成 / 重新整理只读简报", quiet, () -> analyze(displayed, "brief"));
+    private void renderAssessments(LinearLayout parent, JSONObject displayed, boolean quiet) {
+        text(parent, "简报 / 阶段审核", 22);
+        text(parent, "生成简报和审核均消耗模型用量。AI 意见不等于测试通过、人工认可或发布验收。采用前由电脑重新核验结果有效性。", 16);
+        button(parent, "生成 / 重新整理只读简报", quiet, () -> analyze(displayed, "brief"));
         JSONObject brief = displayed.optJSONObject("brief");
         if (brief != null) {
-            text(content, "简报 · " + brief.optString("decision") + " · 采用前须重验\n" + pretty(brief.opt("report")), 16);
-            button(content, "编辑并采用简报", quiet && candidate(brief), () -> adoptBrief(displayed, brief));
+            text(parent, "简报 · " + brief.optString("decision") + " · 采用前须重验\n" + pretty(brief.opt("report")), 16);
+            button(parent, "编辑并采用简报", quiet && candidate(brief), () -> adoptBrief(displayed, brief));
         }
-        button(content, "按需审核阶段成果", quiet && displayed.optInt("work_turns") > 0, () -> analyze(displayed, "review"));
+        button(parent, "按需审核阶段成果", quiet && displayed.optInt("work_turns") > 0, () -> analyze(displayed, "review"));
         JSONObject review = displayed.optJSONObject("review");
         if (review != null) {
-            text(content, "AI 审查意见\n" + pretty(review.opt("report")), 16);
-            text(content, "自动化验收：未独立验证；已有测试报告仅作参考。\n人工认可："
+            text(parent, "AI 审查意见\n" + pretty(review.opt("report")), 16);
+            text(parent, "自动化验收：未独立验证；已有测试报告仅作参考。\n人工认可："
                     + ("accepted".equals(review.optString("human_acceptance")) ? "已认可本阶段" : "尚未认可")
                     + "\n发布验收另行完成。结果状态：" + review.optString("status") + "（操作前由电脑重验）", 16);
             JSONObject report = review.optJSONObject("report");
             boolean accept = candidate(review) && report != null && "ready_for_user".equals(report.optString("verdict"));
-            button(content, "人工认可本阶段结果", quiet && accept, () -> command(displayed, "accept_review", new JSONObject(), "人工认可", "记录你对本阶段结果的认可；这不代表正式发布验收。不会自动继续任务。", null));
-            button(content, "按审核意见启动返工", quiet && candidate(review), () -> command(displayed, "revise_from_review", new JSONObject(), "确认启动一轮返工", "将在原授权范围内启动一轮核对和返工，消耗模型用量。未知项应先核对，审核意见不扩大权限。", null));
+            button(parent, "人工认可本阶段结果", quiet && accept, () -> command(displayed, "accept_review", new JSONObject(), "人工认可", "记录你对本阶段结果的认可；这不代表正式发布验收。不会自动继续任务。", null));
+            button(parent, "按审核意见启动返工", quiet && candidate(review), () -> command(displayed, "revise_from_review", new JSONObject(), "确认启动一轮返工", "将在原授权范围内启动一轮核对和返工，消耗模型用量。未知项应先核对，审核意见不扩大权限。", null));
         }
     }
 
@@ -507,6 +739,8 @@ public final class MainActivity extends Activity {
     }
 
     private void command(JSONObject displayed, String name, JSONObject payload, String title, String description, String sentDraft) {
+        if (!authorized()) return;
+        if (!controlAllowed(displayed)) { status.setText("此手机没有当前任务的控制权限，请在电脑重新授权配对。"); return; }
         if (pending() != null || busy || storageFailed) { status.setText("先查询原操作结果，不能另发一次。"); return; }
         confirm(title, description, () -> {
             try {
@@ -517,15 +751,16 @@ public final class MainActivity extends Activity {
                 if (!persist()) return; // Durable identity must exist before the first byte can be sent.
                 JSONObject target = connection();
                 renderOperation();
-                run("已保存请求编号；正在明确提交…", () -> {
-                    try { return new HttpApi(target).request("POST", "/v1/commands", body); }
+                run("已保存请求编号；正在明确提交…", epoch -> {
+                    try { return api(target, epoch).request("POST", "/v1/commands", body); }
                     catch (HttpApi.ApiError ex) {
                         // A definitive HTTP rejection is visible; transport errors remain unresolved and query-only.
-                        if (ex.status >= 400 && ex.status < 500) return new JSONObject().put("rejected", true).put("message", ex.getMessage());
+                        if (ex.status >= 400 && ex.status < 500) return new JSONObject().put("rejected", true).put("message", ex.getMessage()).put("http_status", ex.status);
                         throw ex;
                     }
                 }, result -> {
                     if (result.optBoolean("rejected")) {
+                        if (result.optInt("http_status") == 401) expireConnection();
                         record.put("rejected", true).put("rejection", result.optString("message"));
                         persist(); renderCurrent(); status.setText("电脑明确拒绝了提交；草稿已保留。");
                     } else receiveReceipt(result);
@@ -535,13 +770,17 @@ public final class MainActivity extends Activity {
     }
 
     private void queryOperation() {
+        if (!authorized()) return;
+        if (connection() == null || connection().optBoolean("needs_pairing")) {
+            status.setText("授权已失效，无法核实原请求。请先在电脑核对，再解除等待并重新配对。"); return;
+        }
         JSONObject current = pending();
         if (current == null || busy) return;
         JSONObject target = connection();
         JSONObject body = current.optJSONObject("body");
         if (body == null) { status.setText("本地请求记录损坏，不能自动重试。请在电脑核对。"); return; }
-        run("只查询原请求结果，不重发…", () -> {
-            try { return new HttpApi(target).request("GET", "/v1/commands/" + pathId(body.getString("request_id")), null); }
+        run("只查询原请求结果，不重发…", epoch -> {
+            try { return api(target, epoch).request("GET", "/v1/commands/" + pathId(body.getString("request_id")), null); }
             catch (HttpApi.ApiError ex) {
                 if (ex.status == 401 || ex.status == 403 || ex.status == 404)
                     return new JSONObject().put("lookup_unknown", true).put("lookup_status", ex.status);
@@ -549,6 +788,7 @@ public final class MainActivity extends Activity {
             }
         }, value -> {
             if (value.optBoolean("lookup_unknown")) {
+                if (value.optInt("lookup_status") == 401) expireConnection();
                 current.put("lookup_unknown", true);
                 current.put("lookup_status", value.optInt("lookup_status"));
                 if (persist()) { renderCurrent(); status.setText(value.optInt("lookup_status") == 404
@@ -559,6 +799,7 @@ public final class MainActivity extends Activity {
     }
 
     private void receiveReceipt(JSONObject receipt) throws Exception {
+        if (!authorized()) return;
         JSONObject current = pending();
         if (current == null) return;
         JSONObject body = current.getJSONObject("body");
@@ -579,10 +820,19 @@ public final class MainActivity extends Activity {
             }
             current.put("draft_cleared", true);
         }
+        if (Protocol.autoArchiveReceipt(state)) {
+            rememberOperation(current);
+            saved.remove("pending");
+            if (!persist()) return;
+            renderOperation(); updateTaskControls();
+            status.setText("电脑已接收操作，正在更新对话…");
+            refresh();
+            return;
+        }
         if (!persist()) return;
         renderOperation();
         status.setText("succeeded".equals(state) ? "电脑已处理本次命令；模型工作是否完成请看任务最新状态。" : "已核对操作回执：" + state);
-        if (Protocol.terminalReceipt(state)) renderCurrent();
+        updateTaskControls();
     }
 
     private void renderCurrent() { if (selectedId == null) showTasks(); else showTask(); }
@@ -594,7 +844,8 @@ public final class MainActivity extends Activity {
         operationPanel = column();
         content.addView(operationPanel, 0);
         JSONObject current = pending();
-        if (current == null) { operation.setText(""); return; }
+        if (current == null) { operation.setText(""); operation.setVisibility(View.GONE); return; }
+        operation.setVisibility(View.VISIBLE);
         JSONObject body = current.optJSONObject("body");
         JSONObject receipt = current.optJSONObject("receipt");
         String state = receipt == null ? "结果尚未确认" : receipt.optString("state");
@@ -602,7 +853,7 @@ public final class MainActivity extends Activity {
                 + "\n请求编号：" + (body == null ? "未知" : body.optString("request_id")));
         text(operationPanel, "操作回执\n" + (current.optBoolean("rejected") ? current.optString("rejection") : receipt == null
                 ? "请求已在本机密封保存。失去连接或退出后只查询原请求，不自动重发。" : pretty(receipt.opt("error"))), 15);
-        button(operationPanel, "只查询这个请求的结果", !current.optBoolean("rejected"), this::queryOperation);
+        button(operationPanel, "只查询这个请求的结果", !current.optBoolean("rejected") && connection() != null && !connection().optBoolean("needs_pairing"), this::queryOperation);
         boolean terminal = current.optBoolean("rejected") || receipt != null && Protocol.terminalReceipt(receipt.optString("state"));
         button(operationPanel, "已读此确定结果，返回任务", terminal, () -> {
             rememberOperation(current);

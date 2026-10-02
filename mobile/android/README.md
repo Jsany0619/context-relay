@@ -20,6 +20,23 @@ python build.py --jdk C:\path\to\jdk-17 --android-jar C:\Android\Sdk\platforms\a
 
 已有同结构缓存时也可传 `--sdk-cache PATH`；只读取其 `platform/**/android.jar` 和 `build-tools/**/aapt2.exe`。构建在临时目录采用相对资源路径，避免部分 Windows Android 工具无法读取中文绝对路径的问题。
 
-输出 `build/context-relay.apk`、SHA-256 和 `build-report.json`。脚本在仓库外 `%LOCALAPPDATA%/ContextRelayAndroid/signing/local-debug.p12` 创建独立的本地测试签名身份；它使用公开的测试口令，不是应用商店或正式发行身份。也可用 `--keystore` 指定仓库外的同格式测试密钥。升级 APK 必须使用相同签名；请勿提交或发布密钥、配对内容、设备数据和构建临时文件。
+输出 `build/context-relay.apk`、SHA-256 和 `build-report.json`，其中包含公开的签名证书 SHA-256。正常构建使用仓库外 `%LOCALAPPDATA%/ContextRelayAndroid/release-signing/signing.dpapi`；可通过 `--signing-dir` 指定另一处本机私有目录。签名材料和强随机口令一并由 Windows 当前用户 DPAPI 密封，目录及文件 DACL 只授权当前用户、SYSTEM 与管理员。构建时在私有临时目录解密 PKCS12，结束清理；清理失败会报错。此保护不能阻止同一登录用户下的恶意程序、管理员或进程内存读取。
+
+首次使用新版构建脚本，必须先明确处理签名身份。已有安装包必须迁移其原密钥，不能另建密钥，否则覆盖安装会被 Android 拒绝。对于旧版本生成的测试密钥，可在本目录执行下面的**一次迁移**；示例中的旧口令是旧构建器公开使用的测试值，不能继续当正式口令使用：
+
+```powershell
+$env:CR_LEGACY_SIGN_PASSWORD = 'android'
+try {
+    python build.py --jdk C:\path\to\jdk-17 --migrate-keystore "$env:LOCALAPPDATA\ContextRelayAndroid\signing\local-debug.p12" --legacy-password-env CR_LEGACY_SIGN_PASSWORD --signing-only
+} finally {
+    Remove-Item Env:CR_LEGACY_SIGN_PASSWORD -ErrorAction SilentlyContinue
+}
+```
+
+其他来源的密钥应在指定环境变量中提供其实际口令，不写入命令行、仓库或日志。迁移核对原证书 DER、新口令密钥和密封文件回读结果；全部通过并清理临时文件后，才移除指定旧 PKCS12。失败保留旧密钥并拒绝构建；旧文件移除失败时需重试同一显式迁移，不能绕过错误。迁移不会更换原证书的名称或签名身份，也无法撤回之前已经复制出去的旧密钥。签名身份不等于应用商店审核。
+
+**仅在从未发布、没有需要兼容的已有安装时**，使用 `python build.py --jdk C:\path\to\jdk-17 --initialize-signing --signing-only` 创建新身份。之后按上面的常规构建命令编译，无需再次迁移或初始化。新版不再接受 `--keystore` 或默认创建弱口令测试密钥。
+
+请妥善保护 Windows 用户资料与签名密封文件。DPAPI 文件不是可以直接跨电脑导入的备份，丢失原账户的解密能力可能失去后续签名能力；脚本不实现签名密钥导出或恢复服务。不要提交或发布密钥、口令、配对内容、设备数据和临时文件。密码通过官方支持的 [`keytool` 环境变量参数](https://docs.oracle.com/en/java/javase/17/docs/specs/man/keytool.html) 与 [`apksigner` 的 `env:` 参数](https://developer.android.com/tools/apksigner) 传递，不放在子进程命令行中。
 
 构建会执行 `ProtocolCheck` 的主机 JVM 断言，并检查 APK 签名、包信息和权限。这些检查不等于 Android 运行时、Android 真机、跨网络或视觉验收。模拟器和真机验证分别在项目验收记录中报告。

@@ -7,8 +7,10 @@ from collections import defaultdict, deque
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
+import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -25,12 +27,19 @@ from urllib.parse import urlsplit
 import uuid
 
 from .transport import RequestTimeout, RpcError
+from . import secrets as protected_secrets
 
 
 MAX_BODY_BYTES = 64 * 1024
 RATE_LIMIT = 60
 RATE_WINDOW_SECONDS = 60
 PAIRING_TTL_SECONDS = 5 * 60
+DEVICE_TTL_SECONDS = 7 * 24 * 60 * 60
+MAX_DEVICE_TASKS = 25
+MAX_MESSAGES = 40
+MAX_MESSAGE_TEXT = 3000
+MAX_MESSAGES_BYTES = 48 * 1024
+DEVICE_SCOPES = {"read_only", "control"}
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 _TASK_FIELDS = (
     "id", "title", "state", "goal", "mode", "last_message", "error", "usage",
@@ -120,27 +129,55 @@ def _certificate_fingerprint(path: Path) -> str:
 
 
 def ensure_certificate(root) -> tuple[Path, Path, str]:
-    """Create or reuse the gateway's self-signed leaf certificate."""
-    directory = Path(root).resolve()
-    directory.mkdir(parents=True, exist_ok=True)
-    certificate, key = directory / "gateway-cert.pem", directory / "gateway-key.pem"
-    if certificate.exists() != key.exists():
+    """Preserve the certificate identity; keep its key in current-user DPAPI."""
+    directory = protected_secrets.private_directory(root)
+    private = protected_secrets.private_directory(directory / "secrets")
+    certificate = directory / "gateway-cert.pem"
+    legacy = directory / "gateway-key.pem"
+    key = private / "gateway-key.dpapi"
+    if certificate.exists() != (key.exists() or legacy.exists()):
         raise ValueError("手机网关证书或私钥缺失，不能静默替换。")
-    if not certificate.exists():
-        command = [_openssl_command(), "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-nodes",
-                   "-days", "3650", "-subj", "/CN=Context Relay", "-keyout", str(key),
-                   "-out", str(certificate)]
-        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-        completed = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, creationflags=flags, timeout=30, check=False)
-        if completed.returncode != 0 or not certificate.is_file() or not key.is_file():
-            certificate.unlink(missing_ok=True)
-            key.unlink(missing_ok=True)
-            raise ValueError("OpenSSL 未能生成手机网关证书。")
-        try:
-            os.chmod(key, 0o600)
-        except OSError:
-            pass
+    if certificate.exists():
+        protected_secrets.restrict_file(certificate)
+        old_raw = protected_secrets.restrict_file(legacy).read_bytes() if legacy.exists() else None
+        if key.exists():
+            protected_secrets.restrict_file(key)
+            raw = protected_secrets.load(key, "gateway-tls-key")
+            if old_raw is not None and not hmac.compare_digest(old_raw, raw):
+                raise ValueError("现有明文私钥与受保护私钥不同，保留原文件并拒绝开启。")
+        else:
+            raw = old_raw
+        with protected_secrets.private_temporary_directory(private) as temporary:
+            check_key = temporary / "key.pem"
+            protected_secrets.write_private(check_key, raw)
+            ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(str(certificate), str(check_key))
+        if not key.exists():
+            protected_secrets.save(key, raw, "gateway-tls-key")
+        if not hmac.compare_digest(protected_secrets.load(key, "gateway-tls-key"), raw):
+            raise ValueError("受保护私钥回读失败，保留原文件并拒绝开启。")
+        if old_raw is not None:
+            if not hmac.compare_digest(legacy.read_bytes(), old_raw):
+                raise ValueError("迁移期间原私钥发生变化，保留原文件并拒绝开启。")
+            try:
+                legacy.unlink()
+            except OSError as error:
+                raise ValueError("无法移除已迁移的明文私钥，拒绝开启。") from error
+    else:
+        with protected_secrets.private_temporary_directory(private) as temporary:
+            temp_cert, temp_key = temporary / "cert.pem", temporary / "key.pem"
+            command = [_openssl_command(), "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-nodes",
+                       "-days", "3650", "-subj", "/CN=Context Relay", "-keyout", str(temp_key),
+                       "-out", str(temp_cert)]
+            completed = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE,
+                                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                                       timeout=30, check=False)
+            if completed.returncode != 0 or not temp_cert.is_file() or not temp_key.is_file():
+                raise ValueError("OpenSSL 未能生成手机网关证书。")
+            protected_secrets.restrict_file(temp_key)
+            ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(str(temp_cert), str(temp_key))
+            protected_secrets.save(key, temp_key.read_bytes(), "gateway-tls-key")
+            protected_secrets.write_private(certificate, temp_cert.read_bytes())
     return certificate, key, _certificate_fingerprint(certificate)
 
 
@@ -148,9 +185,12 @@ class GatewayCore:
     """Durable device and command journal plus immutable phone snapshots."""
 
     def __init__(self, root, enqueue_callable: Callable[[str], None]):
-        self.root = Path(root).resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.root = protected_secrets.private_directory(root)
         self.path = self.root / "remote-control.sqlite3"
+        for name in (self.path.name, self.path.name + "-wal", self.path.name + "-shm"):
+            existing = self.root / name
+            if existing.exists():
+                protected_secrets.restrict_file(existing)
         self._enqueue = enqueue_callable
         self._lock = threading.RLock()
         self._closed = False
@@ -184,15 +224,26 @@ class GatewayCore:
             db.execute("PRAGMA synchronous=FULL")
             db.execute("""CREATE TABLE IF NOT EXISTS devices (
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,
-                created_at TEXT NOT NULL, revoked_at TEXT)""")
+                created_at TEXT NOT NULL, revoked_at TEXT, scope TEXT NOT NULL,
+                task_ids_json TEXT NOT NULL, expires_at REAL NOT NULL)""")
             db.execute("""CREATE TABLE IF NOT EXISTS pairings (
                 secret_hash TEXT PRIMARY KEY, endpoint TEXT NOT NULL, certificate_sha256 TEXT NOT NULL,
-                expires_at REAL NOT NULL, used_at TEXT)""")
+                expires_at REAL NOT NULL, used_at TEXT, scope TEXT NOT NULL,
+                task_ids_json TEXT NOT NULL)""")
             db.execute("""CREATE TABLE IF NOT EXISTS commands (
                 request_id TEXT PRIMARY KEY, device_id TEXT NOT NULL, task_id TEXT NOT NULL,
                 command TEXT NOT NULL, payload_hash TEXT NOT NULL, expected_etag TEXT NOT NULL,
                 state TEXT NOT NULL, result_json TEXT, error_code TEXT, error_message TEXT,
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+            device_columns = {row[1] for row in db.execute("PRAGMA table_info(devices)")}
+            pairing_columns = {row[1] for row in db.execute("PRAGMA table_info(pairings)")}
+            for name, column_type in (("scope", "TEXT"), ("task_ids_json", "TEXT"),
+                                      ("expires_at", "REAL")):
+                if name not in device_columns:
+                    db.execute(f"ALTER TABLE devices ADD COLUMN {name} {column_type}")
+            for name in ("scope", "task_ids_json"):
+                if name not in pairing_columns:
+                    db.execute(f"ALTER TABLE pairings ADD COLUMN {name} TEXT")
             now = _now()
             db.execute("""UPDATE commands SET state='unknown', error_code='outcome_unknown',
                 error_message='电脑端在完成前停止；请核对任务状态，不要重发原操作。', updated_at=?
@@ -208,9 +259,43 @@ class GatewayCore:
                 raise GatewayError("rate_limited", "请求过于频繁，请稍后再试。", 429)
             window.append(now)
 
-    def new_pairing(self, endpoint, certificate_sha256) -> str:
-        if self._closed:
-            raise ValueError("手机网关已经关闭。")
+    @staticmethod
+    def _task_permissions(value) -> list[str] | None:
+        if isinstance(value, str):
+            if len(value) > 8192:
+                return None
+            try:
+                value = json.loads(value)
+            except (TypeError, json.JSONDecodeError):
+                return None
+        if (not isinstance(value, list) or not 1 <= len(value) <= MAX_DEVICE_TASKS
+                or any(not isinstance(item, str) or not item or len(item) > 128 for item in value)
+                or len(set(value)) != len(value)):
+            return None
+        return list(value)
+
+    def _device_access(self, device_id, task_id=None, *, control=False) -> dict[str, Any]:
+        if not isinstance(device_id, str):
+            raise GatewayError("unauthorized", "设备凭据无效。", 401)
+        with self._database() as db:
+            row = db.execute("SELECT * FROM devices WHERE id=?", (device_id,)).fetchone()
+        if not row or row["revoked_at"] is not None:
+            raise GatewayError("unauthorized", "设备已撤销或不存在。", 401)
+        task_ids = self._task_permissions(row["task_ids_json"])
+        if (row["scope"] not in DEVICE_SCOPES or task_ids is None
+                or not isinstance(row["expires_at"], (int, float)) or isinstance(row["expires_at"], bool)
+                or not math.isfinite(row["expires_at"])):
+            raise GatewayError("reauthorization_required", "旧设备权限已失效，请重新配对。", 401)
+        if row["expires_at"] <= time.time():
+            raise GatewayError("device_expired", "设备令牌已过期，请重新配对。", 401)
+        if task_id is not None and task_id not in task_ids:
+            raise KeyError(task_id)
+        if control and row["scope"] != "control":
+            raise GatewayError("read_only_device", "此设备仅有只读权限，不能提交命令。", 403)
+        return {"id": row["id"], "scope": row["scope"], "task_ids": task_ids,
+                "expires_at": row["expires_at"]}
+
+    def new_pairing(self, endpoint, certificate_sha256, task_ids, scope="read_only") -> str:
         if not isinstance(endpoint, str) or len(endpoint) > 2048:
             raise ValueError("配对地址无效。")
         parsed = urlsplit(endpoint)
@@ -219,17 +304,29 @@ class GatewayCore:
             raise ValueError("配对地址必须是 HTTPS 主机地址。")
         if not isinstance(certificate_sha256, str) or not _HEX64.fullmatch(certificate_sha256):
             raise ValueError("证书指纹无效。")
+        permissions = self._task_permissions(list(task_ids) if isinstance(task_ids, (list, tuple)) else task_ids)
+        if permissions is None:
+            raise ValueError("请选择 1 到 25 个允许手机访问的任务。")
+        if scope not in DEVICE_SCOPES:
+            raise ValueError("设备权限必须是 read_only 或 control。")
         secret = _random_token()
         with self._lock, self._database() as db:
-            db.execute("INSERT INTO pairings VALUES (?,?,?,?,NULL)",
+            if self._closed:
+                raise ValueError("手机网关已经关闭。")
+            if any(task_id not in self._tasks for task_id in permissions):
+                raise ValueError("所选任务已经变化，请刷新后重选。")
+            db.execute("""INSERT INTO pairings
+                (secret_hash,endpoint,certificate_sha256,expires_at,used_at,scope,task_ids_json)
+                VALUES (?,?,?,?,NULL,?,?)""",
                        (_credential_hash(secret), endpoint.rstrip("/"), certificate_sha256,
-                        time.time() + PAIRING_TTL_SECONDS))
+                        time.time() + PAIRING_TTL_SECONDS, scope,
+                        json.dumps(permissions, ensure_ascii=False, separators=(",", ":"))))
         value = {"version": 1, "endpoint": endpoint.rstrip("/"),
                  "certificate_sha256": certificate_sha256, "secret": secret}
         fragment = base64.urlsafe_b64encode(_canonical(value)).rstrip(b"=").decode("ascii")
         return "contextrelay://pair#" + fragment
 
-    def pair(self, secret, device_name) -> dict[str, str]:
+    def pair(self, secret, device_name) -> dict[str, Any]:
         if self._closed:
             raise GatewayError("unavailable", "手机网关已经关闭。", 503)
         if (not isinstance(secret, str) or not secret or len(secret) > 256
@@ -238,16 +335,28 @@ class GatewayCore:
         digest, now = _credential_hash(secret), time.time()
         token, device_id, at = _random_token(), uuid.uuid4().hex, _now()
         with self._lock, self._database() as db:
-            row = db.execute("SELECT expires_at,used_at FROM pairings WHERE secret_hash=?", (digest,)).fetchone()
-            if not row or row["used_at"] is not None or row["expires_at"] < now:
+            row = db.execute("SELECT * FROM pairings WHERE secret_hash=?", (digest,)).fetchone()
+            permissions = self._task_permissions(row["task_ids_json"]) if row else None
+            if (not row or row["used_at"] is not None
+                    or not isinstance(row["expires_at"], (int, float)) or isinstance(row["expires_at"], bool)
+                    or not math.isfinite(row["expires_at"])
+                    or row["expires_at"] < now
+                    or row["scope"] not in DEVICE_SCOPES or permissions is None
+                    or any(task_id not in self._tasks for task_id in permissions)):
                 raise GatewayError("invalid_pairing", "配对码无效或已经过期。", 401)
             updated = db.execute("UPDATE pairings SET used_at=? WHERE secret_hash=? AND used_at IS NULL",
                                  (at, digest)).rowcount
             if updated != 1:
                 raise GatewayError("invalid_pairing", "配对码已经使用。", 401)
-            db.execute("INSERT INTO devices VALUES (?,?,?,?,NULL)",
-                       (device_id, device_name.strip(), _credential_hash(token), at))
-        return {"device_id": device_id, "token": token}
+            device_expires = now + DEVICE_TTL_SECONDS
+            db.execute("""INSERT INTO devices
+                (id,name,token_hash,created_at,revoked_at,scope,task_ids_json,expires_at)
+                VALUES (?,?,?,?,NULL,?,?,?)""",
+                       (device_id, device_name.strip(), _credential_hash(token), at, row["scope"],
+                        json.dumps(permissions, ensure_ascii=False, separators=(",", ":")), device_expires))
+        return {"device_id": device_id, "token": token, "scope": row["scope"],
+                "task_ids": permissions,
+                "expires_at": datetime.fromtimestamp(device_expires, timezone.utc).isoformat()}
 
     def authenticate(self, token) -> str:
         if self._closed:
@@ -255,18 +364,33 @@ class GatewayCore:
         if not isinstance(token, str) or not token or len(token) > 256:
             raise GatewayError("unauthorized", "设备令牌无效。", 401)
         with self._lock, self._database() as db:
-            row = db.execute("SELECT id FROM devices WHERE token_hash=? AND revoked_at IS NULL",
-                             (_credential_hash(token),)).fetchone()
+            row = db.execute("SELECT id FROM devices WHERE token_hash=?", (_credential_hash(token),)).fetchone()
         if not row:
             raise GatewayError("unauthorized", "设备令牌无效或已撤销。", 401)
+        self._device_access(row["id"])
         return row["id"]
 
     def local_status(self) -> dict[str, Any]:
         with self._lock, self._database() as db:
-            rows = db.execute("SELECT id,name,created_at,revoked_at FROM devices ORDER BY created_at").fetchall()
-        return {"devices": [{"id": row["id"], "name": row["name"], "created_at": row["created_at"],
-                              "revoked": row["revoked_at"] is not None,
-                              "revoked_at": row["revoked_at"]} for row in rows]}
+            rows = db.execute("SELECT * FROM devices ORDER BY created_at").fetchall()
+        devices = []
+        for row in rows:
+            task_ids = self._task_permissions(row["task_ids_json"])
+            valid_expiry = (isinstance(row["expires_at"], (int, float))
+                            and not isinstance(row["expires_at"], bool) and math.isfinite(row["expires_at"]))
+            legacy = row["scope"] not in DEVICE_SCOPES or task_ids is None or not valid_expiry
+            expired = legacy or row["expires_at"] <= time.time()
+            expires_at = None
+            if valid_expiry:
+                try:
+                    expires_at = datetime.fromtimestamp(row["expires_at"], timezone.utc).isoformat()
+                except (OSError, OverflowError, ValueError):
+                    expired = True
+            devices.append({"id": row["id"], "name": row["name"], "created_at": row["created_at"],
+                            "revoked": row["revoked_at"] is not None, "revoked_at": row["revoked_at"],
+                            "expired": expired, "scope": row["scope"] if row["scope"] in DEVICE_SCOPES else None,
+                            "task_ids": task_ids or [], "expires_at": expires_at})
+        return {"devices": devices}
 
     def revoke_device(self, device_id):
         if not isinstance(device_id, str):
@@ -353,13 +477,50 @@ class GatewayCore:
                                or method == _USER_INPUT and cls._answerable_questions(clean.get("questions"))))})
         return result
 
-    def _task_dto(self, task: dict[str, Any], connection_id: str | None) -> dict[str, Any]:
+    @staticmethod
+    def _messages(value) -> tuple[list[dict[str, Any]], bool]:
+        if not isinstance(value, list):
+            return [], value is not None
+        result, size, truncated = [], 2, False
+        for item in reversed(value):
+            if len(result) >= MAX_MESSAGES:
+                truncated = True
+                break
+            if (not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"]
+                    or item.get("role") not in {"user", "assistant"}
+                    or not isinstance(item.get("text"), str) or not isinstance(item.get("created_at"), str)
+                    or item.get("status") != "completed" or item.get("purpose") != "work"):
+                truncated = True
+                continue
+            text = item["text"]
+            item_truncated = item.get("truncated") is True
+            if len(text) > MAX_MESSAGE_TEXT:
+                text, item_truncated = text[:MAX_MESSAGE_TEXT], True
+            clean = {"id": item["id"], "role": item["role"], "text": text,
+                     "created_at": item["created_at"], "status": "completed", "purpose": "work",
+                     "historical": item.get("historical") is True, "truncated": item_truncated}
+            encoded = _canonical(clean)
+            if size + len(encoded) + 1 > MAX_MESSAGES_BYTES:
+                truncated = True
+                break
+            result.append(clean)
+            size += len(encoded) + 1
+            truncated = truncated or item_truncated
+        result.reverse()
+        return result, truncated
+
+    def _task_dto(self, task: dict[str, Any], connection_id: str | None,
+                  remote_access=None) -> dict[str, Any]:
         if not isinstance(task, dict) or not isinstance(task.get("id"), str):
             raise ValueError("任务快照无效。")
+        messages, messages_truncated = self._messages(task.get("messages"))
         dto = {key: _json_copy(task.get(key)) for key in _TASK_FIELDS}
         dto.update(etag=_hash({"connection_id": connection_id, "task": task}),
                    pending=self._pending(task), brief=self._assessment(task.get("brief")),
-                   review=self._assessment(task.get("review")))
+                   review=self._assessment(task.get("review")), messages=messages,
+                   messages_truncated=messages_truncated or task.get("messages_truncated") is True)
+        if remote_access is not None:
+            dto["remote_access"] = remote_access
         return dto
 
     def publish_tasks(self, raw_tasks, recovery_info=None, connection_id=None):
@@ -379,21 +540,40 @@ class GatewayCore:
             self._connection_id = connection_id
             return self._cursor
 
-    def list_task_snapshots(self) -> dict[str, Any]:
-        with self._lock:
-            return {"tasks": _json_copy(list(self._tasks.values()), maximum=1024 * 1024),
-                    "cursor": self._cursor}
+    def _device_tasks(self, device_id) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        access = self._device_access(device_id)
+        tasks = []
+        for task_id in access["task_ids"]:
+            if task_id in self._tasks:
+                task = _json_copy(self._tasks[task_id], maximum=1024 * 1024)
+                task["remote_access"] = access["scope"]
+                tasks.append(task)
+        return access, tasks
 
-    def get_task_snapshot(self, task_id) -> dict[str, Any]:
+    @staticmethod
+    def _device_cursor(tasks) -> int:
+        return int(_hash(tasks)[:15], 16)
+
+    def list_task_snapshots(self, device_id) -> dict[str, Any]:
         with self._lock:
+            _, tasks = self._device_tasks(device_id)
+            return {"tasks": _json_copy(tasks, maximum=2 * 1024 * 1024),
+                    "cursor": self._device_cursor(tasks)}
+
+    def get_task_snapshot(self, device_id, task_id) -> dict[str, Any]:
+        with self._lock:
+            access = self._device_access(device_id, task_id)
             value = self._tasks.get(task_id)
             if value is None:
                 raise KeyError(task_id)
-            return _json_copy(value, maximum=1024 * 1024)
+            result = _json_copy(value, maximum=1024 * 1024)
+            result["remote_access"] = access["scope"]
+            return result
 
-    def status_snapshot(self) -> dict[str, Any]:
+    def status_snapshot(self, device_id) -> dict[str, Any]:
         with self._lock:
-            return {"online": not self._closed, "cursor": self._cursor}
+            _, tasks = self._device_tasks(device_id)
+            return {"online": not self._closed, "cursor": self._device_cursor(tasks)}
 
     @staticmethod
     def _validate_command(body: Any) -> tuple[dict[str, Any], str]:
@@ -429,17 +609,12 @@ class GatewayCore:
         copied = _json_copy(body)
         return copied, _hash(copied)
 
-    def _device_exists(self, device_id: str) -> bool:
-        with self._database() as db:
-            return db.execute("SELECT 1 FROM devices WHERE id=? AND revoked_at IS NULL", (device_id,)).fetchone() is not None
-
     def submit_command(self, device_id, body) -> dict[str, Any]:
         command, payload_hash = self._validate_command(body)
         with self._lock:
             if self._closed:
                 raise GatewayError("unavailable", "手机网关已经关闭。", 503)
-            if not isinstance(device_id, str) or not self._device_exists(device_id):
-                raise GatewayError("unauthorized", "设备已经撤销。", 401)
+            self._device_access(device_id, command["task_id"], control=True)
             with self._database() as db:
                 existing = db.execute("SELECT * FROM commands WHERE request_id=?", (command["request_id"],)).fetchone()
                 if existing:
@@ -481,9 +656,12 @@ class GatewayCore:
 
     def command_status(self, device_id, request_id) -> dict[str, Any]:
         with self._lock, self._database() as db:
+            access = self._device_access(device_id)
             row = db.execute("SELECT * FROM commands WHERE request_id=? AND device_id=?",
                              (request_id, device_id)).fetchone()
             if not row:
+                raise KeyError(request_id)
+            if row["task_id"] not in access["task_ids"]:
                 raise KeyError(request_id)
             return self._receipt(row)
 
@@ -521,6 +699,14 @@ class GatewayCore:
                 raise KeyError(request_id)
             if row["state"] != "accepted":
                 return self._receipt(row)
+            try:
+                access = self._device_access(row["device_id"], row["task_id"], control=True)
+            except (GatewayError, KeyError) as error:
+                code = error.code if isinstance(error, GatewayError) else "task_access_revoked"
+                self._finish(request_id, "unknown", error_code=code,
+                             error_message="设备权限已撤销或过期；命令没有执行。",
+                             expected_state="accepted")
+                return self._command_receipt(request_id)
             if self._closed:
                 self._finish(request_id, "unknown", error_code="outcome_unknown",
                              error_message="手机网关已关闭；请核对任务状态，不要重发原操作。",
@@ -584,7 +770,8 @@ class GatewayCore:
                 self._finish(request_id, "unknown", error_code="outcome_unknown",
                              error_message="电脑端需要核对原生结果；不要重发原操作。", expected_state="running")
                 return self._command_receipt(request_id)
-            dto = self._task_dto(_json_copy(current, maximum=1024 * 1024), self._connection_id)
+            dto = self._task_dto(_json_copy(current, maximum=1024 * 1024), self._connection_id,
+                                  access["scope"])
             self._finish(request_id, "succeeded", {"task": dto}, expected_state="running")
         except Exception as error:
             unknown = isinstance(error, (RequestTimeout, RpcError))
@@ -739,11 +926,11 @@ class _Handler(BaseHTTPRequestHandler):
             if parsed.query or parsed.fragment:
                 raise GatewayError("not_found", "找不到接口。", 404)
             if parsed.path == "/v1/status":
-                self._send(200, self.core.status_snapshot())
+                self._send(200, self.core.status_snapshot(device))
             elif parsed.path == "/v1/tasks":
-                self._send(200, self.core.list_task_snapshots())
+                self._send(200, self.core.list_task_snapshots(device))
             elif parsed.path.startswith("/v1/tasks/"):
-                self._send(200, self.core.get_task_snapshot(parsed.path[len("/v1/tasks/"):]))
+                self._send(200, self.core.get_task_snapshot(device, parsed.path[len("/v1/tasks/"):]))
             elif parsed.path.startswith("/v1/commands/"):
                 self._send(200, self.core.command_status(device, parsed.path[len("/v1/commands/"):]))
             else:
@@ -789,7 +976,8 @@ class RemoteGateway:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         try:
-            context.load_cert_chain(str(self.cert_file), str(self.key_file))
+            with protected_secrets.plaintext_file(self.key_file, "gateway-tls-key") as temporary_key:
+                context.load_cert_chain(str(self.cert_file), str(temporary_key))
             server.socket = context.wrap_socket(
                 server.socket, server_side=True, do_handshake_on_connect=False)
         except Exception:

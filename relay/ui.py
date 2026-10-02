@@ -123,7 +123,7 @@ class CommandWorker(threading.Thread):
                 else:
                     phone_actions = {"remote_enable": self.phone.enable, "remote_disable": self.phone.close,
                                      "remote_status": self.phone.status, "remote_pair": self.phone.pair,
-                                     "remote_revoke": self.phone.revoke}
+                                     "remote_revoke": self.phone.revoke, "remote_network": self.phone.network_status}
                     try:
                         action = phone_actions[method] if method in phone_actions else getattr(manager, method)
                         result = action(*args, **kwargs)
@@ -813,7 +813,7 @@ class RelayApp:
             self.status.set("恢复库为永久只读检视，不能继续任务或修改记录。")
             return False
         if method not in ("create_task", "backup_state", "list_import_threads", "preview_import", "import_thread",
-                          "remote_enable", "remote_disable", "remote_status", "remote_pair", "remote_revoke") and args and args[0] not in self.visible_ids:
+                          "remote_enable", "remote_disable", "remote_status", "remote_pair", "remote_revoke", "remote_network") and args and args[0] not in self.visible_ids:
             return False
         if _before_enqueue is not None:
             _before_enqueue()

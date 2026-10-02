@@ -1,9 +1,11 @@
 """Explicit, same-process phone connection and its small desktop dialog."""
 
 import ipaddress
+from pathlib import Path
 import socket
 import tkinter as tk
 from tkinter import ttk
+import webbrowser
 
 
 def private_address(value):
@@ -76,17 +78,22 @@ class PhoneHost:
         self.core, self.server = core, server
         self.endpoint = f"https://{host}:{server.port}"
         self.fingerprint = fingerprint
-        return self.pair()
+        return self.status()
 
     def status(self):
         if self.core is None:
             return {"enabled": False, "devices": []}
         return {**self.core.local_status(), "enabled": True, "endpoint": self.endpoint}
 
-    def pair(self):
+    def network_status(self):
+        from .network import diagnostics
+        return diagnostics()
+
+    def pair(self, task_ids=(), scope="read_only"):
         if self.core is None:
             raise ValueError("请先开启手机连接。")
-        return {**self.status(), "pairing_uri": self.core.new_pairing(self.endpoint, self.fingerprint)}
+        return {**self.status(), "pairing_uri": self.core.new_pairing(
+            self.endpoint, self.fingerprint, list(task_ids), scope)}
 
     def revoke(self, device_id):
         if self.core is None:
@@ -147,11 +154,24 @@ class PhoneDialog(tk.Toplevel):
         self.port_box.pack(side="left", padx=8)
         self.info = tk.StringVar(value="连接未开启。配对信息只发给自己的手机，不要公开分享。")
         ttk.Label(body, textvariable=self.info, wraplength=650, justify="left").pack(fill="x", pady=10)
+        permission_row = ttk.Frame(body)
+        permission_row.pack(fill="x", pady=(0, 6))
+        ttk.Label(permission_row, text="手机权限").pack(side="left")
+        self.scope = tk.StringVar(value="仅查看")
+        self.scope_box = ttk.Combobox(permission_row, textvariable=self.scope,
+                                      values=("仅查看", "查看与控制"), state="readonly", width=14)
+        self.scope_box.pack(side="left", padx=8)
+        ttk.Label(permission_row, text="控制权限可发送、暂停和审批任务。").pack(side="left")
+        ttk.Label(body, text="选择这台手机可访问的任务（默认全不选）").pack(anchor="w")
+        self.task_list = tk.Listbox(body, height=4, selectmode="extended", exportselection=False)
+        self.task_list.pack(fill="x", pady=(3, 8))
+        self.task_ids = []
+        self._sync_tasks()
         buttons = ttk.Frame(body)
         buttons.pack(fill="x")
-        self.enable_button = ttk.Button(buttons, text="开启连接并生成配对信息", command=self.enable)
+        self.enable_button = ttk.Button(buttons, text="开启手机连接", command=self.enable)
         self.enable_button.pack(side="left")
-        self.pair_button = ttk.Button(buttons, text="重新生成", command=lambda: self.submit("remote_pair"))
+        self.pair_button = ttk.Button(buttons, text="按所选权限生成配对信息", command=self.pair)
         self.pair_button.pack(side="left", padx=6)
         self.stop_button = ttk.Button(buttons, text="关闭手机连接", command=lambda: self.submit("remote_disable"))
         self.stop_button.pack(side="left")
@@ -166,8 +186,11 @@ class PhoneDialog(tk.Toplevel):
         actions.pack(fill="x", pady=(8, 0))
         self.refresh_button = ttk.Button(actions, text="刷新设备", command=lambda: self.submit("remote_status"))
         self.refresh_button.pack(side="left")
+        self.network_button = ttk.Button(actions, text="异地连接检查", command=lambda: self.submit("remote_network"))
+        self.network_button.pack(side="left", padx=8)
         self.revoke_button = ttk.Button(actions, text="撤销所选设备", command=self.revoke)
-        self.revoke_button.pack(side="left", padx=8)
+        self.revoke_button.pack(side="left")
+        ttk.Button(actions, text="使用说明 / 费用", command=self.open_help).pack(side="left", padx=8)
         ttk.Button(actions, text="关闭此窗口", command=self.destroy).pack(side="right")
         self.controls()
         self.submit("remote_status")
@@ -183,6 +206,29 @@ class PhoneDialog(tk.Toplevel):
             return
         self.submit("remote_enable", host, port)
 
+    def _sync_tasks(self):
+        selected = {self.task_ids[index] for index in self.task_list.curselection()
+                    if index < len(self.task_ids)}
+        tasks = [task for task in self.app.tasks.values() if not task.get("archived")]
+        ids = [task["id"] for task in tasks]
+        if ids == self.task_ids:
+            return
+        self.task_ids = ids
+        self.task_list.delete(0, "end")
+        for index, task in enumerate(tasks):
+            self.task_list.insert("end", f"{task.get('title', '未命名任务')} · {task['id'][:8]}")
+            if task["id"] in selected:
+                self.task_list.selection_set(index)
+
+    def pair(self):
+        task_ids = [self.task_ids[index] for index in self.task_list.curselection()
+                    if index < len(self.task_ids)]
+        if not task_ids:
+            self.info.set("请先选择至少一个允许手机访问的任务。")
+            return
+        scope = {"仅查看": "read_only", "查看与控制": "control"}[self.scope.get()]
+        self.submit("remote_pair", task_ids, scope)
+
     def copy(self):
         value = self.pairing.get("1.0", "end-1c")
         if value:
@@ -195,15 +241,26 @@ class PhoneDialog(tk.Toplevel):
         if selected:
             self.submit("remote_revoke", self.devices[selected[0]]["id"])
 
+    def open_help(self):
+        webbrowser.open((Path(__file__).resolve().parents[1] / "docs/mobile.md").as_uri())
+
     def deliver(self, result=None, error=None):
         if error:
             self.info.set(error)
+        elif isinstance(result, dict) and result.get("kind") == "network_diagnostics":
+            addresses = "\n可用私有地址：" + "、".join(result.get("local_ipv4", [])) if result.get("local_ipv4") else ""
+            self.info.set(result.get("detail", "未获取到网络诊断。") + addresses)
         elif isinstance(result, dict):
             self.enabled = result.get("enabled", False)
             self.devices = result.get("devices", [])
             self.device_list.delete(0, "end")
             for device in self.devices:
-                self.device_list.insert("end", f"{device.get('name', '手机')} · {'已撤销' if device.get('revoked') else '已配对'}")
+                state = "已撤销" if device.get("revoked") else "已过期" if device.get("expired") else "已配对"
+                scope = {"read_only": "仅查看", "control": "查看与控制"}.get(
+                    device.get("scope"), "旧权限失效")
+                self.device_list.insert("end", f"{device.get('name', '手机')} · {state} · "
+                                               f"{scope} · "
+                                               f"{len(device.get('task_ids', []))} 个任务")
             self.info.set((f"连接已开启：{result['endpoint']}\n"
                            "若无法连接，核对同一网络及 Windows 防火墙。关闭窗口不会关闭连接。")
                           if self.enabled else "手机连接已关闭；不会再接收手机指令。")
@@ -215,11 +272,15 @@ class PhoneDialog(tk.Toplevel):
         self.controls()
 
     def controls(self):
+        self._sync_tasks()
         available = self.app.ready and not self.app.busy and not self.app.closing and self.app.recovery_info is None
         for widget, enabled in ((self.enable_button, not self.enabled), (self.pair_button, self.enabled),
                                 (self.stop_button, self.enabled), (self.refresh_button, True),
+                                (self.network_button, True),
                                 (self.revoke_button, self.enabled and bool(self.devices))):
             widget.configure(state="normal" if available and enabled else "disabled")
         self.copy_button.configure(state="normal" if self.enabled and self.pairing.get("1.0", "end-1c") else "disabled")
         self.address_box.configure(state="normal" if available and not self.enabled else "disabled")
         self.port_box.configure(state="normal" if available and not self.enabled else "disabled")
+        self.scope_box.configure(state="readonly" if available else "disabled")
+        self.task_list.configure(state="normal" if available else "disabled")
