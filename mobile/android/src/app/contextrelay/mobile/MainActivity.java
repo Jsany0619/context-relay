@@ -406,6 +406,40 @@ public final class MainActivity extends Activity {
         spacing(view, 12, 8, 12, 8); view.setStateListAnimator(null);
         buttonColors(view, primary);
     }
+    private android.graphics.drawable.Drawable controlIcon(Button button, boolean back) {
+        android.graphics.drawable.Drawable icon = new android.graphics.drawable.Drawable() {
+            private final android.graphics.Paint paint = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+            private int alpha = 255;
+            @Override public void draw(android.graphics.Canvas canvas) {
+                Rect bounds = getBounds();
+                int restore = canvas.save();
+                canvas.translate(bounds.left, bounds.top); canvas.scale(bounds.width() / 24f, bounds.height() / 24f);
+                if (back && button.getLayoutDirection() == View.LAYOUT_DIRECTION_RTL) { canvas.translate(24, 0); canvas.scale(-1, 1); }
+                paint.setColor(button.getCurrentTextColor()); paint.setAlpha(alpha);
+                paint.setStyle(android.graphics.Paint.Style.STROKE); paint.setStrokeWidth(1.8f);
+                paint.setStrokeCap(android.graphics.Paint.Cap.ROUND);
+                if (back) {
+                    canvas.drawLine(11, 5, 4, 12, paint); canvas.drawLine(4, 12, 11, 19, paint);
+                    canvas.drawLine(4, 12, 20, 12, paint);
+                } else {
+                    canvas.drawLine(6, 6, 18, 18, paint); canvas.drawLine(18, 6, 6, 18, paint);
+                }
+                canvas.restoreToCount(restore);
+            }
+            @Override public boolean isStateful() { return true; }
+            @Override protected boolean onStateChange(int[] state) { invalidateSelf(); return true; }
+            @Override public void setAlpha(int value) { alpha = value; invalidateSelf(); }
+            @Override public void setColorFilter(android.graphics.ColorFilter filter) { paint.setColorFilter(filter); invalidateSelf(); }
+            @Override public int getOpacity() { return android.graphics.PixelFormat.TRANSLUCENT; }
+        };
+        icon.setBounds(0, 0, dp(20), dp(20)); return icon;
+    }
+    private void labelControl(Button view, boolean back) {
+        android.graphics.drawable.Drawable[] current = view.getCompoundDrawablesRelative();
+        view.setCompoundDrawablesRelative(controlIcon(view, back), current[1], current[2], current[3]);
+        view.setCompoundDrawablePadding(dp(6));
+        view.setMinHeight(dp(48)); view.setMinimumHeight(dp(48));
+    }
     private void buttonColors(Button view, boolean primary) {
         int[][] states = new int[][] {new int[] {-android.R.attr.state_enabled}, new int[] {}};
         view.setTextColor(new ColorStateList(states, new int[] {color("muted"), primary ? Color.WHITE : color("ink")}));
@@ -684,6 +718,9 @@ public final class MainActivity extends Activity {
         metadataText(view, label); styleButton(view, false);
         view.setEnabled(enabled && !busy && !storageFailed && authorized());
         view.setMinHeight(dp(48));
+        if ("返回原连接".equals(label) || "返回已有连接".equals(label) || "已读此确定结果，返回任务".equals(label)) {
+            labelControl(view, true); view.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+        }
         view.setTag(enabled);
         view.setOnClickListener(v -> { if (authorized()) try { callback.run(); } catch (Exception ex) { error(ex); } });
         parent.addView(view, new LinearLayout.LayoutParams(-1, -2));
@@ -852,20 +889,39 @@ public final class MainActivity extends Activity {
     private void showDialog(AlertDialog dialog, boolean inputForm) {
         if (!authorized()) return;
         dialogs.add(dialog); popup = true;
+        View decor = dialog.getWindow().getDecorView();
+        View.OnLayoutChangeListener sizing = (v, l, t, r, b, oldL, oldT, oldR, oldB) -> fitDialog(dialog);
         dialog.setOnDismissListener(d -> {
+            decor.removeOnLayoutChangeListener(sizing);
             forgetActions(dialog.getWindow().getDecorView());
             dialogs.remove(dialog); popup = !dialogs.isEmpty();
         });
         dialog.getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
-        if (inputForm) dialog.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
-                | WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
+        dialog.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+                | (inputForm ? WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN : WindowManager.LayoutParams.SOFT_INPUT_STATE_UNCHANGED));
+        dialog.getWindow().setGravity(Gravity.CENTER);
         dialog.show();
-        if (inputForm) {
-            // Let Android reserve space for the IME; the dialog's ScrollView shrinks above its action bar.
-            dialog.getWindow().setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT);
-            dialog.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
-                    | WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
+        for (int which : new int[] {AlertDialog.BUTTON_POSITIVE, AlertDialog.BUTTON_NEGATIVE, AlertDialog.BUTTON_NEUTRAL}) {
+            Button action = dialog.getButton(which);
+            if (action == null) continue;
+            action.setMinHeight(dp(48)); action.setMinimumHeight(dp(48)); action.setAllCaps(false);
+            font(action, 14); action.setSingleLine(false);
+            String label = action.getText().toString();
+            if ("关闭".equals(label) || "取消".equals(label) || "退出".equals(label)) labelControl(action, false);
         }
+        decor.addOnLayoutChangeListener(sizing);
+        fitDialog(dialog);
+    }
+    private void fitDialog(AlertDialog dialog) {
+        if (!dialog.isShowing()) return;
+        Rect visible = new Rect(); dialog.getWindow().getDecorView().getWindowVisibleDisplayFrame(visible);
+        if (visible.width() <= 0) getWindow().getDecorView().getWindowVisibleDisplayFrame(visible);
+        if (visible.width() <= 0) return;
+        int width = Math.max(1, Math.min(dp(560), visible.width() - dp(32)));
+        WindowManager.LayoutParams layout = dialog.getWindow().getAttributes();
+        // Native AlertDialog reserves title/actions; its ScrollView takes only the remaining safe height.
+        if (layout.width != width || layout.height != WindowManager.LayoutParams.WRAP_CONTENT)
+            dialog.getWindow().setLayout(width, WindowManager.LayoutParams.WRAP_CONTENT);
     }
 
     private void dismissDialogs() {
@@ -874,7 +930,7 @@ public final class MainActivity extends Activity {
 
     private void showPanel(String title, LinearLayout box) {
         ScrollView viewport = new ScrollView(this); viewport.addView(box);
-        showDialog(new AlertDialog.Builder(this).setTitle(title).setView(viewport).setPositiveButton("关闭", null).create(), true);
+        showDialog(new AlertDialog.Builder(this).setTitle(title).setView(viewport).setPositiveButton("关闭", null).create(), false);
     }
 
     private void showPairing() {
@@ -1066,9 +1122,10 @@ public final class MainActivity extends Activity {
         header.removeAllViews();
         LinearLayout navigation = new LinearLayout(this); navigation.setGravity(Gravity.CENTER_VERTICAL);
         header.addView(navigation);
-        Button back = button(navigation, "‹", true, () -> { cancelScreenshot(); cancelPrivacy(); selectedId = null; task = null; showTasks(); refresh(); });
-        back.setContentDescription("返回任务列表"); font(back, 28);
-        spacing(back, 0, 8, 0, 8);
+        Button back = button(navigation, "", true, () -> { cancelScreenshot(); cancelPrivacy(); selectedId = null; task = null; showTasks(); refresh(); });
+        back.setContentDescription("返回任务列表");
+        back.setCompoundDrawablesRelative(controlIcon(back, true), null, null, null);
+        back.setPadding(dp(14), dp(14), dp(14), dp(14)); back.setTag(PADDING_STYLE, null);
         back.setLayoutParams(new LinearLayout.LayoutParams(dp(48), -2));
         TextView title = text(navigation, task.optString("title", "对话"), 18);
         title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
