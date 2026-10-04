@@ -10,6 +10,7 @@ import tkinter as tk
 import unittest
 from unittest import mock
 
+from relay.preferences import DEFAULTS
 from relay.ui import CommandWorker, NewTaskDialog, RelayApp
 
 
@@ -161,6 +162,9 @@ class TkSmokeTests(unittest.TestCase):
             self.skipTest(f"Tk display unavailable: {error}")
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        preferences = mock.patch("relay.ui.load_preferences", return_value=dict(DEFAULTS))
+        preferences.start()
+        self.addCleanup(preferences.stop)
         self.main_thread = threading.get_ident()
 
         def factory(state_dir=None):
@@ -230,6 +234,60 @@ class TkSmokeTests(unittest.TestCase):
             self.assertLessEqual(widget.winfo_rooty() + widget.winfo_height(),
                                  self.app.chat_panel.winfo_rooty() + self.app.chat_panel.winfo_height())
         self.assertEqual(self.app.pending_frame.winfo_manager(), "")
+
+    def test_preferences_preview_preserves_live_ui_and_failed_save_is_not_success(self):
+        self.add_task()
+        self.select_task("task-other")
+        self.app.message_text.insert("1.0", "保留中的草稿")
+        request = {"id": "approval-theme", "method": "item/commandExecution/requestApproval",
+                   "params": {"command": "synthetic", "commandActions": [{"type": "read"}]}}
+        self.fake.tasks[1]["pending"] = [request]
+        self.wait_for(lambda: self.app.pending_requests == [request])
+        self.app._open_preferences()
+        dialog = self.app.preferences_dialog
+        dialog.theme.set("淡绿青")
+        dialog.font_size.set("大字")
+        dialog.density.set("紧凑")
+        dialog.preview()
+        self.root.update()
+        self.assertEqual(self.app.preferences,
+                         {"theme": "mint", "font_size": "large", "density": "compact"})
+        self.assertEqual(self.app.selected_id, "task-other")
+        self.assertEqual(self.app.message_text.get("1.0", "end-1c"), "保留中的草稿")
+        self.assertEqual(self.app.pending_requests, [request])
+        self.assertEqual(self.app.message_text.cget("background"), "#ffffff")
+        self.assertEqual(self.app.message_text.cget("foreground"), "#173a34")
+        with mock.patch("relay.ui.save_preferences", side_effect=OSError("synthetic write failure")):
+            dialog.save()
+        self.assertTrue(dialog.winfo_exists())
+        self.assertIn("保存失败", dialog.info.get())
+        self.assertNotIn("已保存", self.app.status.get())
+        dialog.cancel()
+        self.root.update()
+        self.assertEqual(self.app.preferences, DEFAULTS)
+        self.assertEqual(self.app.selected_id, "task-other")
+        self.assertEqual(self.app.message_text.get("1.0", "end-1c"), "保留中的草稿")
+        self.assertEqual(self.app.pending_requests, [request])
+
+    def test_preferences_restore_default_and_save_only_fixed_display_choices(self):
+        self.app._open_preferences()
+        dialog = self.app.preferences_dialog
+        dialog.theme.set("淡绿青")
+        dialog.font_size.set("大字")
+        dialog.density.set("紧凑")
+        dialog.preview()
+        dialog.restore_defaults()
+        self.assertEqual(dialog.values(), DEFAULTS)
+        self.assertIn("点击保存", dialog.info.get())
+        dialog.theme.set("淡绿青")
+        dialog.preview()
+        chosen = {"theme": "mint", "font_size": "standard", "density": "comfortable"}
+        with mock.patch("relay.ui.save_preferences", return_value=chosen) as save:
+            dialog.save()
+        save.assert_called_once_with(chosen)
+        self.assertFalse(dialog.winfo_exists())
+        self.assertEqual(self.app.preferences, chosen)
+        self.assertEqual(self.app.status.get(), "外观与偏好已保存。")
 
     def test_global_backup_does_not_need_selected_task_and_reports_counts(self):
         self.app.search.set("no match")
@@ -1042,7 +1100,8 @@ class WorkerTests(unittest.TestCase):
 
 
 class TkLayoutTests(unittest.TestCase):
-    def test_snapshot_and_existing_actions_visible_at_supported_scaling(self):
+    @mock.patch("relay.ui.load_preferences", return_value=dict(DEFAULTS))
+    def test_snapshot_and_existing_actions_visible_at_supported_scaling(self, _preferences):
         for dpi, inspection in ((95, False), (96, False), (144, False), (96, True), (144, True)):
             with self.subTest(dpi=dpi, inspection=inspection):
                 try:

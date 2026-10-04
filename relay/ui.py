@@ -1,92 +1,233 @@
 """Tk interface; task mutations belong to the single command worker."""
+import base64
 from copy import deepcopy
 from datetime import datetime
 import json
 from pathlib import Path
 import queue
+import struct
 import threading
 import tkinter as tk
 from tkinter import filedialog, font as tkfont, messagebox, ttk
+import zlib
 
 from .budget import budget_status, validate_limits
+from .preferences import DEFAULTS, load_preferences, save_preferences
 
 
-BG = "#f7f8fa"
-SURFACE = "#ffffff"
-INK = "#17212b"
-MUTED = "#606d7d"
-ACCENT = "#2457d6"
-BORDER = "#dce2e9"
+THEMES = {
+    "blue": {"bg": "#f7f8fa", "surface": "#ffffff", "ink": "#17212b",
+             "muted": "#606d7d", "accent": "#2457d6", "border": "#dce2e9",
+             "select": "#e4ebfb", "control": "#edf0f4", "control_active": "#e3e7ed"},
+    "mint": {"bg": "#f1f8f5", "surface": "#ffffff", "ink": "#173a34",
+             "muted": "#526f67", "accent": "#147d6b", "border": "#cfe1d9",
+             "select": "#deefe7", "control": "#e6f1ed", "control_active": "#d8ebe4"},
+}
 WARNING_BG = "#fff6e8"
 WARNING = "#8a4b08"
 
 
-def apply_theme(root):
-    root.configure(background=BG)
+def _paint_rounded(image, fill, border):
+    def rgb(value):
+        return tuple(int(value[index:index + 2], 16) for index in (1, 3, 5))
+
+    rows = []
+    size = image.width()
+    for y in range(size):
+        row = bytearray((0,))
+        for x in range(size):
+            color = None
+            for inset, value, radius in ((0, border, 4), (1, fill, 3)):
+                low, high = inset, size - 1 - inset
+                if low <= x <= high and low <= y <= high:
+                    dx = max(low + radius - x, 0, x - (high - radius))
+                    dy = max(low + radius - y, 0, y - (high - radius))
+                    if dx * dx + dy * dy <= radius * radius:
+                        color = value
+            row.extend((*rgb(color), 255) if color else (0, 0, 0, 0))
+        rows.append(bytes(row))
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(b"".join(rows))) + chunk(b"IEND", b""))
+    image.configure(data=base64.b64encode(png), format="png")
+
+
+def _rounded_elements(root, style, colors):
+    images = getattr(root, "_context_relay_theme_images", None)
+    if images is None:
+        images = {name: tk.PhotoImage(master=root, width=12, height=12) for name in (
+            "primary", "primary_active", "primary_pressed", "primary_disabled", "primary_focus",
+            "secondary", "secondary_active", "secondary_pressed", "secondary_disabled", "secondary_focus",
+            "entry", "entry_focus", "entry_disabled")}
+        root._context_relay_theme_images = images
+        style.element_create("ContextRelay.Primary.background", "image", images["primary"],
+                             ("disabled", images["primary_disabled"]),
+                             ("pressed", images["primary_pressed"]), ("active", images["primary_active"]),
+                             ("focus", images["primary_focus"]),
+                             border=4, sticky="nsew")
+        style.element_create("ContextRelay.Entry.background", "image", images["entry"],
+                             ("disabled", images["entry_disabled"]), ("focus", images["entry_focus"]),
+                             border=4, sticky="nsew")
+        style.element_create("ContextRelay.Secondary.background", "image", images["secondary"],
+                             ("disabled", images["secondary_disabled"]),
+                             ("pressed", images["secondary_pressed"]),
+                             ("active", images["secondary_active"]), ("focus", images["secondary_focus"]),
+                             border=4, sticky="nsew")
+    for name, fill, border in (
+            ("primary", colors["accent"], colors["accent"]),
+            ("primary_active", "#1f4bbb" if colors is THEMES["blue"] else "#106b5c", colors["accent"]),
+            ("primary_pressed", "#193f9e" if colors is THEMES["blue"] else "#0c594d", colors["accent"]),
+            ("primary_disabled", "#b8c5e3" if colors is THEMES["blue"] else "#a9c9c1", colors["border"]),
+            ("primary_focus", colors["accent"], colors["ink"]),
+            ("secondary", colors["control"], colors["border"]),
+            ("secondary_active", colors["control_active"], colors["border"]),
+            ("secondary_pressed", colors["select"], colors["accent"]),
+            ("secondary_disabled", colors["control"], colors["border"]),
+            ("secondary_focus", colors["control"], colors["accent"]),
+            ("entry", colors["surface"], colors["border"]),
+            ("entry_focus", colors["surface"], colors["accent"]),
+            ("entry_disabled", colors["bg"], colors["border"])):
+        _paint_rounded(images[name], fill, border)
+    style.layout("Primary.TButton", [
+        ("ContextRelay.Primary.background", {"sticky": "nswe"}),
+        ("Button.padding", {"sticky": "nswe", "children": [("Button.label", {"sticky": "nswe"})]})])
+    style.layout("Secondary.TButton", [
+        ("ContextRelay.Secondary.background", {"sticky": "nswe"}),
+        ("Button.padding", {"sticky": "nswe", "children": [("Button.label", {"sticky": "nswe"})]})])
+    style.layout("Rounded.TMenubutton", [
+        ("ContextRelay.Secondary.background", {"sticky": "nswe"}),
+        ("Menubutton.focus", {"sticky": "nswe", "children": [
+            ("Menubutton.indicator", {"side": "right"}),
+            ("Menubutton.padding", {"sticky": "we", "children": [
+                ("Menubutton.label", {"side": "left"})]})]})])
+    style.layout("TEntry", [("ContextRelay.Entry.background", {
+        "sticky": "nswe", "children": [("Entry.padding", {
+            "sticky": "nswe", "children": [("Entry.textarea", {"sticky": "nswe"})]})]})])
+    style.layout("RoundedEntry.TFrame", [("ContextRelay.Entry.background", {
+        "sticky": "nswe"})])
+
+
+def _recolor_widgets(widget, colors):
+    try:
+        if isinstance(widget, (tk.Tk, tk.Toplevel)):
+            widget.configure(background=colors["bg"])
+        elif isinstance(widget, tk.Text):
+            widget.configure(background=colors["surface"], foreground=colors["ink"],
+                             insertbackground=colors["ink"], selectbackground=colors["accent"],
+                             highlightbackground=colors["border"], highlightcolor=colors["accent"],
+                             font="TkTextFont")
+        elif isinstance(widget, tk.Listbox):
+            widget.configure(background=colors["surface"], foreground=colors["ink"],
+                             selectbackground=colors["accent"], selectforeground=colors["surface"],
+                             highlightbackground=colors["border"], highlightcolor=colors["accent"],
+                             font="TkTextFont")
+        elif isinstance(widget, tk.Menu):
+            widget.configure(background=colors["surface"], foreground=colors["ink"],
+                             activebackground=colors["select"], font="TkMenuFont")
+        elif isinstance(widget, tk.Canvas):
+            widget.configure(background=colors["bg"])
+    except tk.TclError:
+        pass
+    for child in widget.winfo_children():
+        _recolor_widgets(child, colors)
+
+
+def apply_theme(root, preferences=None):
+    preferences = dict(DEFAULTS if preferences is None else preferences)
+    colors = THEMES[preferences["theme"]]
+    base = 12 if preferences["font_size"] == "large" else 10
+    compact = preferences["density"] == "compact"
+    root._context_relay_palette = colors
+    root.configure(background=colors["bg"])
     for name, size, weight in (("TkDefaultFont", 10, "normal"), ("TkTextFont", 10, "normal"),
                                ("TkMenuFont", 10, "normal"), ("TkHeadingFont", 11, "bold")):
         try:
-            tkfont.nametofont(name, root=root).configure(family="Segoe UI", size=size, weight=weight)
+            tkfont.nametofont(name, root=root).configure(
+                family="Segoe UI", size=base + size - 10, weight=weight)
         except tk.TclError:
             pass
-    root.option_add("*Text.background", SURFACE)
-    root.option_add("*Text.foreground", INK)
-    root.option_add("*Text.insertBackground", INK)
-    root.option_add("*Text.selectBackground", ACCENT)
-    root.option_add("*Listbox.background", SURFACE)
-    root.option_add("*Listbox.foreground", INK)
-    root.option_add("*Listbox.selectBackground", ACCENT)
-    root.option_add("*Listbox.selectForeground", SURFACE)
-    root.option_add("*Menu.background", SURFACE)
-    root.option_add("*Menu.foreground", INK)
-    root.option_add("*Menu.activeBackground", "#e8eefc")
+    root.option_add("*Text.background", colors["surface"])
+    root.option_add("*Text.foreground", colors["ink"])
+    root.option_add("*Text.insertBackground", colors["ink"])
+    root.option_add("*Text.selectBackground", colors["accent"])
+    root.option_add("*Listbox.background", colors["surface"])
+    root.option_add("*Listbox.foreground", colors["ink"])
+    root.option_add("*Listbox.selectBackground", colors["accent"])
+    root.option_add("*Listbox.selectForeground", colors["surface"])
+    root.option_add("*Menu.background", colors["surface"])
+    root.option_add("*Menu.foreground", colors["ink"])
+    root.option_add("*Menu.activeBackground", colors["select"])
     style = ttk.Style(root)
     if "clam" in style.theme_names():
         style.theme_use("clam")
-    style.configure(".", font=("Segoe UI", 10), foreground=INK)
-    style.configure("TFrame", background=BG)
-    style.configure("Sidebar.TFrame", background=BG)
-    style.configure("Surface.TFrame", background=SURFACE)
-    style.configure("TLabel", background=BG, foreground=INK)
-    style.configure("Surface.TLabel", background=SURFACE, foreground=INK)
-    style.configure("Muted.TLabel", background=BG, foreground=MUTED)
-    style.configure("Surface.Muted.TLabel", background=SURFACE, foreground=MUTED)
-    style.configure("Title.TLabel", background=BG, foreground=INK, font=("Segoe UI", 18, "bold"))
-    style.configure("Surface.Title.TLabel", background=SURFACE, foreground=INK, font=("Segoe UI", 15, "bold"))
-    style.configure("Section.TLabel", background=SURFACE, foreground=INK, font=("Segoe UI", 11, "bold"))
+    _rounded_elements(root, style, colors)
+    button_pad = (10, 5) if compact else (12, 7)
+    primary_pad = (12, 6) if compact else (14, 8)
+    style.configure(".", font=("Segoe UI", base), foreground=colors["ink"])
+    style.configure("TFrame", background=colors["bg"])
+    style.configure("Sidebar.TFrame", background=colors["bg"])
+    style.configure("Surface.TFrame", background=colors["surface"])
+    style.configure("RoundedEntry.TFrame", background=colors["surface"])
+    style.configure("TLabel", background=colors["bg"], foreground=colors["ink"])
+    style.configure("Surface.TLabel", background=colors["surface"], foreground=colors["ink"])
+    style.configure("Muted.TLabel", background=colors["bg"], foreground=colors["muted"])
+    style.configure("Surface.Muted.TLabel", background=colors["surface"], foreground=colors["muted"])
+    style.configure("Title.TLabel", background=colors["bg"], foreground=colors["ink"],
+                    font=("Segoe UI", base + 8, "bold"))
+    style.configure("Surface.Title.TLabel", background=colors["surface"], foreground=colors["ink"],
+                    font=("Segoe UI", base + 5, "bold"))
+    style.configure("Section.TLabel", background=colors["surface"], foreground=colors["ink"],
+                    font=("Segoe UI", base + 1, "bold"))
     style.configure("Alert.TLabel", background=WARNING_BG, foreground=WARNING, padding=(10, 8))
-    style.configure("TButton", background="#edf0f4", foreground=INK, bordercolor=BORDER,
-                    lightcolor="#edf0f4", darkcolor="#edf0f4", padding=(12, 7), relief="flat")
-    style.map("TButton", background=[("active", "#e3e7ed"), ("pressed", "#d8dee6")],
+    style.configure("TButton", background=colors["control"], foreground=colors["ink"],
+                    bordercolor=colors["border"], padding=button_pad, relief="flat")
+    style.map("TButton", background=[("active", colors["control_active"]), ("pressed", colors["select"])],
               foreground=[("disabled", "#98a3af")])
-    style.configure("Primary.TButton", background=ACCENT, foreground=SURFACE, bordercolor=ACCENT,
-                    lightcolor=ACCENT, darkcolor=ACCENT, padding=(14, 8), relief="flat")
-    style.map("Primary.TButton", background=[("active", "#1f4bbb"), ("pressed", "#193f9e"),
-                                             ("disabled", "#b8c5e3")],
-              foreground=[("disabled", "#f5f7fb")])
-    style.configure("TMenubutton", background="#edf0f4", foreground=INK, bordercolor=BORDER, padding=(12, 7))
-    style.configure("TEntry", fieldbackground=SURFACE, foreground=INK, bordercolor=BORDER, padding=6)
-    style.configure("TCombobox", fieldbackground=SURFACE, foreground=INK, bordercolor=BORDER, padding=5)
-    style.map("TCombobox", fieldbackground=[("readonly", SURFACE)], selectbackground=[("readonly", SURFACE)],
-              selectforeground=[("readonly", INK)])
-    style.configure("Task.Treeview", background=BG, fieldbackground=BG, foreground=INK,
-                    borderwidth=0, relief="flat", rowheight=34, bordercolor=BG,
-                    lightcolor=BG, darkcolor=BG)
-    style.configure("Task.Treeview.Heading", background=BG, foreground=MUTED, relief="flat", padding=(6, 7))
-    style.map("Task.Treeview", background=[("selected", "#e4ebfb")], foreground=[("selected", INK)])
+    style.configure("Secondary.TButton", background=colors["surface"], foreground=colors["ink"],
+                    bordercolor=colors["border"], padding=button_pad, relief="flat")
+    style.map("Secondary.TButton", foreground=[("disabled", "#98a3af")])
+    style.configure("Primary.TButton", background=colors["surface"], foreground=colors["surface"],
+                    bordercolor=colors["accent"], padding=primary_pad, relief="flat")
+    style.map("Primary.TButton", foreground=[("disabled", "#f5f7fb")])
+    style.configure("TMenubutton", background=colors["control"], foreground=colors["ink"],
+                    bordercolor=colors["border"], padding=button_pad)
+    style.configure("Rounded.TMenubutton", background=colors["control"], foreground=colors["ink"],
+                    bordercolor=colors["border"], padding=button_pad)
+    style.configure("TEntry", fieldbackground=colors["surface"], foreground=colors["ink"],
+                    bordercolor=colors["border"], padding=4 if compact else 6)
+    style.configure("TCombobox", fieldbackground=colors["surface"], foreground=colors["ink"],
+                    bordercolor=colors["border"], padding=4 if compact else 5)
+    style.map("TCombobox", fieldbackground=[("readonly", colors["surface"])],
+              selectbackground=[("readonly", colors["surface"])],
+              selectforeground=[("readonly", colors["ink"])])
+    rowheight = (34 if base == 12 else 30) if compact else (38 if base == 12 else 34)
+    style.configure("Task.Treeview", background=colors["bg"], fieldbackground=colors["bg"],
+                    foreground=colors["ink"], borderwidth=0, relief="flat", rowheight=rowheight,
+                    bordercolor=colors["bg"], lightcolor=colors["bg"], darkcolor=colors["bg"])
+    style.configure("Task.Treeview.Heading", background=colors["bg"], foreground=colors["muted"],
+                    relief="flat", padding=(6, 5 if compact else 7))
+    style.map("Task.Treeview", background=[("selected", colors["select"])],
+              foreground=[("selected", colors["ink"])])
     style.configure("Vertical.TScrollbar", background="#cfd7e1", troughcolor="#f1f3f6",
                     bordercolor="#f1f3f6", lightcolor="#cfd7e1", darkcolor="#cfd7e1",
-                    arrowcolor=MUTED, relief="flat", borderwidth=0)
+                    arrowcolor=colors["muted"], relief="flat", borderwidth=0)
     style.map("Vertical.TScrollbar", background=[("active", "#bbc6d2")])
-    style.configure("TNotebook", background=BG, borderwidth=0)
-    style.configure("TNotebook.Tab", background="#e9edf2", foreground=MUTED, padding=(14, 8))
-    style.map("TNotebook.Tab", background=[("selected", SURFACE)], foreground=[("selected", INK)])
-    style.configure("Surface.TLabelframe", background=SURFACE, bordercolor=BORDER, relief="solid")
-    style.configure("Surface.TLabelframe.Label", background=SURFACE, foreground=INK,
-                    font=("Segoe UI", 10, "bold"))
+    style.configure("TNotebook", background=colors["bg"], borderwidth=0)
+    style.configure("TNotebook.Tab", background=colors["control"], foreground=colors["muted"],
+                    padding=(12, 6) if compact else (14, 8))
+    style.map("TNotebook.Tab", background=[("selected", colors["surface"])],
+              foreground=[("selected", colors["ink"])])
+    style.configure("Surface.TLabelframe", background=colors["surface"],
+                    bordercolor=colors["border"], relief="solid")
+    style.configure("Surface.TLabelframe.Label", background=colors["surface"], foreground=colors["ink"],
+                    font=("Segoe UI", base, "bold"))
     style.configure("Attention.TLabelframe", background=WARNING_BG, bordercolor="#efd7ae", relief="solid")
     style.configure("Attention.TLabelframe.Label", background=WARNING_BG, foreground=WARNING,
-                    font=("Segoe UI", 10, "bold"))
+                    font=("Segoe UI", base, "bold"))
+    _recolor_widgets(root, colors)
     return style
 
 
@@ -244,11 +385,12 @@ def set_text(widget, value, follow=False):
 
 
 def text_area(parent, height):
+    colors = getattr(parent._root(), "_context_relay_palette", THEMES["blue"])
     frame = ttk.Frame(parent, style="Surface.TFrame")
     widget = tk.Text(frame, height=height, wrap="word", state="disabled", relief="flat",
-                     background=SURFACE, foreground=INK, insertbackground=INK,
-                     selectbackground=ACCENT, borderwidth=0, highlightthickness=0,
-                     padx=10, pady=8, font=("Segoe UI", 10))
+                     background=colors["surface"], foreground=colors["ink"],
+                     insertbackground=colors["ink"], selectbackground=colors["accent"],
+                     borderwidth=0, highlightthickness=0, padx=10, pady=8, font="TkTextFont")
     scrollbar = ttk.Scrollbar(frame, orient="vertical", command=widget.yview)
     widget.configure(yscrollcommand=scrollbar.set)
     widget.pack(side="left", fill="both", expand=True)
@@ -920,6 +1062,81 @@ class AssessmentDialog(tk.Toplevel):
                           "操作已记录；以任务状态和核验后的报告为准，尚未自动执行。")
 
 
+class PreferencesDialog(tk.Toplevel):
+    THEMES = {"经典蓝": "blue", "淡绿青": "mint"}
+    FONT_SIZES = {"标准": "standard", "大字": "large"}
+    DENSITIES = {"舒适": "comfortable", "紧凑": "compact"}
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.original = dict(app.preferences)
+        self.title("外观与偏好")
+        self.transient(app.root)
+        self.resizable(False, False)
+        body = ttk.Frame(self, padding=18, style="Surface.TFrame")
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="外观与偏好", style="Surface.Title.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        ttk.Label(body, text="更改会立即预览；保存后下次启动继续使用。",
+                  style="Surface.Muted.TLabel").grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 14))
+        self.theme = tk.StringVar(value=self._label(self.THEMES, self.original["theme"]))
+        self.font_size = tk.StringVar(value=self._label(self.FONT_SIZES, self.original["font_size"]))
+        self.density = tk.StringVar(value=self._label(self.DENSITIES, self.original["density"]))
+        for row, (label, variable, values) in enumerate((
+                ("配色", self.theme, self.THEMES), ("字号", self.font_size, self.FONT_SIZES),
+                ("间距", self.density, self.DENSITIES)), start=2):
+            ttk.Label(body, text=label, style="Surface.TLabel").grid(row=row, column=0, sticky="w", pady=5)
+            choice = ttk.Combobox(body, textvariable=variable, values=tuple(values), state="readonly", width=18)
+            choice.grid(row=row, column=1, sticky="ew", padx=(18, 0), pady=5)
+            choice.bind("<<ComboboxSelected>>", lambda _event: self.preview())
+        self.info = tk.StringVar()
+        ttk.Label(body, textvariable=self.info, style="Surface.Muted.TLabel", wraplength=390,
+                  justify="left").grid(row=5, column=0, columnspan=2, sticky="ew", pady=(10, 4))
+        actions = ttk.Frame(body, style="Surface.TFrame")
+        actions.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ttk.Button(actions, text="保存", command=self.save, style="Primary.TButton").pack(side="right")
+        ttk.Button(actions, text="取消", command=self.cancel, style="Secondary.TButton").pack(side="right", padx=8)
+        ttk.Button(actions, text="恢复默认", command=self.restore_defaults,
+                   style="Secondary.TButton").pack(side="left")
+        self.protocol("WM_DELETE_WINDOW", self.cancel)
+
+    @staticmethod
+    def _label(options, value):
+        return next(label for label, item in options.items() if item == value)
+
+    def values(self):
+        return {"theme": self.THEMES[self.theme.get()],
+                "font_size": self.FONT_SIZES[self.font_size.get()],
+                "density": self.DENSITIES[self.density.get()]}
+
+    def preview(self):
+        self.app.apply_preferences(self.values())
+        self.info.set("当前为即时预览，尚未保存。")
+
+    def restore_defaults(self):
+        self.theme.set(self._label(self.THEMES, DEFAULTS["theme"]))
+        self.font_size.set(self._label(self.FONT_SIZES, DEFAULTS["font_size"]))
+        self.density.set(self._label(self.DENSITIES, DEFAULTS["density"]))
+        self.preview()
+        self.info.set("已恢复默认预览；点击保存后才会保留。")
+
+    def save(self):
+        try:
+            saved = save_preferences(self.values())
+        except (OSError, ValueError) as error:
+            self.info.set(f"保存失败：{error}。当前预览未保存。")
+            return
+        self.app.apply_preferences(saved)
+        self.original = dict(saved)
+        self.app.status.set("外观与偏好已保存。")
+        self.destroy()
+
+    def cancel(self):
+        self.app.apply_preferences(self.original)
+        self.destroy()
+
+
 class RelayApp:
     def __init__(self, root, state_dir=None, factory=manager_factory):
         self.root = root
@@ -942,7 +1159,9 @@ class RelayApp:
         self.phone_dialog = None
         self.phone_request = None
         self.diagnostics_window = None
-        self.style = apply_theme(self.root)
+        self.preferences_dialog = None
+        self.preferences = load_preferences()
+        self.style = apply_theme(self.root, self.preferences)
         self.root.title("Context Relay · 本机任务管理器")
         width = min(1180, max(1, self.root.winfo_screenwidth() - 80))
         height = min(850, max(1, self.root.winfo_screenheight() - 120))
@@ -1066,12 +1285,16 @@ class RelayApp:
         ttk.Separator(self.controls_frame).pack(fill="x", pady=(2, 10))
         ttk.Label(self.controls_frame, text="发给 Codex（可留空继续）",
                   style="Surface.Muted.TLabel").pack(anchor="w")
-        self.message_text = tk.Text(self.controls_frame, height=1 if compact else 2, wrap="word", relief="flat",
-                                    background=SURFACE, foreground=INK, insertbackground=INK,
-                                    selectbackground=ACCENT, borderwidth=0, highlightthickness=1,
-                                    highlightbackground=BORDER, highlightcolor=ACCENT,
-                                    padx=10, pady=8, font=("Segoe UI", 10))
-        self.message_text.pack(fill="x", pady=(4, 8))
+        colors = self.root._context_relay_palette
+        self.composer_frame = ttk.Frame(self.controls_frame, style="RoundedEntry.TFrame", padding=(8, 2))
+        self.composer_frame.pack(fill="x", pady=(4, 8))
+        self.message_text = tk.Text(self.composer_frame, height=1 if compact else 2, wrap="word", relief="flat",
+                                    background=colors["surface"], foreground=colors["ink"],
+                                    insertbackground=colors["ink"], selectbackground=colors["accent"],
+                                    borderwidth=0, highlightthickness=0, padx=3, pady=6, font="TkTextFont")
+        self.message_text.pack(fill="x")
+        self.message_text.bind("<FocusIn>", lambda _event: self.composer_frame.state(["focus"]))
+        self.message_text.bind("<FocusOut>", lambda _event: self.composer_frame.state(["!focus"]))
         self.primary_actions = ttk.Frame(self.controls_frame, style="Surface.TFrame")
         self.primary_actions.pack(fill="x")
         for label, method in (("发送 / 继续", "start"), ("暂停", "pause"), ("核对恢复", "reconcile")):
@@ -1086,6 +1309,7 @@ class RelayApp:
                                                command=lambda action=method: self._action(action))
         for label, key, command in (
                 ("手机连接", "phone", self.phone_button.invoke),
+                ("外观与偏好", "preferences", self._open_preferences),
                 ("备份管理器", "backup", self.backup_button.invoke),
                 ("诊断信息", "diagnostics", self.diagnostics_button.invoke),
                 ("任务设置", "update_settings", self.buttons["update_settings"].invoke),
@@ -1141,6 +1365,17 @@ class RelayApp:
             return
         from .phone import PhoneDialog
         self.phone_dialog = PhoneDialog(self)
+
+    def _open_preferences(self):
+        if self.preferences_dialog is not None and self.preferences_dialog.winfo_exists():
+            self.preferences_dialog.lift()
+            return
+        self.preferences_dialog = PreferencesDialog(self)
+
+    def apply_preferences(self, values):
+        self.preferences = dict(values)
+        self.style = apply_theme(self.root, self.preferences)
+        self.root.update_idletasks()
 
     def submit_remote(self, dialog, method, *args):
         gate = (lambda: self.worker.phone.gate_control(method, *args)

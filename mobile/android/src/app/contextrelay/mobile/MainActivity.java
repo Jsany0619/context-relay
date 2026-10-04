@@ -29,6 +29,7 @@ import android.text.style.RelativeSizeSpan;
 import android.text.style.ForegroundColorSpan;
 import android.util.Base64;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.Gravity;
 import android.view.WindowManager;
 import android.view.accessibility.AccessibilityNodeInfo;
@@ -38,6 +39,8 @@ import android.widget.LinearLayout;
 import android.widget.HorizontalScrollView;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.RadioButton;
+import android.widget.RadioGroup;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
@@ -66,6 +69,14 @@ public final class MainActivity extends Activity {
     private static final int ACCENT = Color.rgb(36, 87, 214);
     // Custom action IDs must not collide with standard actions such as ACTION_FOCUS (1).
     private static final int COPY_MESSAGE = 0x02000000 | View.generateViewId();
+    private static final int FONT_STYLE = 0x02000000 | View.generateViewId();
+    private static final int PADDING_STYLE = 0x02000000 | View.generateViewId();
+    private static final int TEXT_STYLE = 0x02000000 | View.generateViewId();
+    private static final int BACKGROUND_STYLE = 0x02000000 | View.generateViewId();
+    private static final int BUTTON_STYLE = 0x02000000 | View.generateViewId();
+    private static final int PREVIEW_STYLE = 0x02000000 | View.generateViewId();
+    private String theme = "blue", fontSize = "standard", density = "comfortable";
+    private boolean appearanceReadFailed;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final List<Button> actions = new ArrayList<>();
@@ -116,10 +127,16 @@ public final class MainActivity extends Activity {
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        try {
+            java.util.Map<String, ?> values = getSharedPreferences("appearance", MODE_PRIVATE).getAll();
+            theme = Protocol.appearancePreference("theme", values.get("theme"));
+            fontSize = Protocol.appearancePreference("font_size", values.get("font_size"));
+            density = Protocol.appearancePreference("density", values.get("density"));
+        } catch (RuntimeException ex) { appearanceReadFailed = true; }
         getWindow().setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE);
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
-        getWindow().setStatusBarColor(Color.WHITE);
-        getWindow().setNavigationBarColor(Color.WHITE);
+        getWindow().setStatusBarColor(color("background"));
+        getWindow().setNavigationBarColor(color("background"));
         getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
         readIntent(getIntent());
         showLocked("请验证手机锁屏身份后继续。");
@@ -134,10 +151,10 @@ public final class MainActivity extends Activity {
 
     private void showLocked(String reason) {
         LinearLayout box = column(); box.setPadding(dp(24), dp(32), dp(24), dp(24));
-        box.setBackgroundColor(Color.WHITE);
+        background(box, "background", 0);
         text(box, "Context Relay", 26).setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         text(box, "验证身份后继续对话", 18);
-        text(box, reason + "\n离开 App 后需要重新验证；未确认的操作保留，不会自动重发。", 15).setTextColor(MUTED);
+        ink(text(box, reason + "\n离开 App 后需要重新验证；未确认的操作保留，不会自动重发。", 15), "muted");
         Button unlock = new Button(this); unlock.setText("验证手机身份");
         styleButton(unlock, true);
         unlock.setOnClickListener(v -> requestUnlock()); box.addView(unlock);
@@ -189,7 +206,7 @@ public final class MainActivity extends Activity {
             return;
         }
         root = column();
-        root.setBackgroundColor(Color.WHITE);
+        background(root, "background", 0);
         root.setPadding(dp(16), dp(8), dp(16), dp(8));
         root.setOnApplyWindowInsetsListener((view, insets) -> {
             view.setPadding(dp(16) + insets.getSystemWindowInsetLeft(), dp(4) + insets.getSystemWindowInsetTop(),
@@ -203,12 +220,12 @@ public final class MainActivity extends Activity {
         operation = text(root, "", 14);
         compactStatus(operation);
         operation.setOnClickListener(v -> showOperationDetails());
-        operation.setTextColor(Color.rgb(138, 59, 0));
+        ink(operation, "warning");
         scroll = new ScrollView(this);
         scroll.setFillViewport(true);
         scroll.setOnScrollChangeListener((view, x, y, oldX, oldY) -> updateLatestButton());
         content = column();
-        content.setPadding(0, dp(8), 0, dp(12));
+        spacing(content, 0, 8, 0, 12);
         scroll.addView(content);
         root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
         composer = column(); root.addView(composer);
@@ -291,32 +308,168 @@ public final class MainActivity extends Activity {
 
     private int dp(int value) { return Math.round(value * getResources().getDisplayMetrics().density); }
     private LinearLayout column() { LinearLayout box = new LinearLayout(this); box.setOrientation(LinearLayout.VERTICAL); return box; }
+    private int color(String role) {
+        boolean mint = "mint".equals(theme);
+        switch (role) {
+            case "ink": return mint ? 0xff173a34 : INK;
+            case "muted": return mint ? 0xff526f67 : MUTED;
+            case "surface": return mint ? Color.WHITE : SURFACE;
+            case "outline": return mint ? 0xffcfe1d9 : OUTLINE;
+            case "accent": return mint ? 0xff147d6b : ACCENT;
+            case "selection": return mint ? 0xffdeefe7 : SURFACE;
+            case "warning": return Color.rgb(138, 59, 0);
+            default: return mint ? 0xfff1f8f5 : Color.WHITE;
+        }
+    }
+    private void font(TextView view, float sp) {
+        view.setTag(FONT_STYLE, sp);
+        view.setTextSize(sp * ("large".equals(fontSize) ? 1.15f : 1)); // SP keeps the system's own font scaling.
+    }
+    private TextView ink(TextView view, String role) {
+        view.setTag(TEXT_STYLE, role); view.setTextColor(color(role)); return view;
+    }
+    private void spacing(View view, int left, int top, int right, int bottom) {
+        view.setTag(PADDING_STYLE, new int[] {left, top, right, bottom});
+        float factor = "compact".equals(density) ? .75f : 1;
+        view.setPadding(dp(Math.round(left * factor)), dp(Math.round(top * factor)),
+                dp(Math.round(right * factor)), dp(Math.round(bottom * factor)));
+    }
+    private void background(View view, String role, int radius) {
+        view.setTag(BACKGROUND_STYLE, new Object[] {role, radius});
+        view.setBackground(surface(color(role), radius));
+    }
     private GradientDrawable surface(int color, int radius) {
         GradientDrawable shape = new GradientDrawable(); shape.setColor(color); shape.setCornerRadius(dp(radius)); return shape;
     }
     private void styleButton(Button view, boolean primary) {
-        view.setAllCaps(false); view.setTextSize(14); view.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        view.setTag(BUTTON_STYLE, primary);
+        view.setAllCaps(false); font(view, 14); view.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         view.setMinHeight(dp(48)); view.setMinimumHeight(dp(48)); view.setMinWidth(0); view.setMinimumWidth(dp(48));
-        view.setPadding(dp(12), dp(8), dp(12), dp(8)); view.setStateListAnimator(null);
+        spacing(view, 12, 8, 12, 8); view.setStateListAnimator(null);
+        buttonColors(view, primary);
+    }
+    private void buttonColors(Button view, boolean primary) {
         int[][] states = new int[][] {new int[] {-android.R.attr.state_enabled}, new int[] {}};
-        view.setTextColor(new ColorStateList(states, new int[] {MUTED, primary ? Color.WHITE : INK}));
+        view.setTextColor(new ColorStateList(states, new int[] {color("muted"), primary ? Color.WHITE : color("ink")}));
         GradientDrawable fill = surface(Color.TRANSPARENT, 12);
-        fill.setColor(new ColorStateList(states, new int[] {primary ? OUTLINE : Color.TRANSPARENT, primary ? ACCENT : Color.TRANSPARENT}));
-        view.setBackground(new RippleDrawable(ColorStateList.valueOf(Color.argb(28, 36, 87, 214)), fill, null));
+        fill.setColor(new ColorStateList(states, new int[] {primary ? color("outline") : Color.TRANSPARENT, primary ? color("accent") : Color.TRANSPARENT}));
+        view.setBackground(new RippleDrawable(ColorStateList.valueOf((color("accent") & 0x00ffffff) | 0x1c000000), fill, null));
+    }
+    private void applyAppearance(View view) {
+        if (view.getTag(FONT_STYLE) != null) font((TextView) view, (Float) view.getTag(FONT_STYLE));
+        if (view.getTag(TEXT_STYLE) != null) ink((TextView) view, (String) view.getTag(TEXT_STYLE));
+        if (view instanceof EditText) ((EditText) view).setHintTextColor(color("muted"));
+        if (view.getTag(PADDING_STYLE) != null) {
+            int[] padding = (int[]) view.getTag(PADDING_STYLE);
+            spacing(view, padding[0], padding[1], padding[2], padding[3]);
+        }
+        if (view.getTag(BACKGROUND_STYLE) != null) {
+            Object[] style = (Object[]) view.getTag(BACKGROUND_STYLE);
+            background(view, (String) style[0], (Integer) style[1]);
+        }
+        if (view.getTag(BUTTON_STYLE) != null) buttonColors((Button) view, (Boolean) view.getTag(BUTTON_STYLE));
+        if (view.getTag(PREVIEW_STYLE) != null) {
+            TextView row = (TextView) view;
+            SpannableStringBuilder label = new SpannableStringBuilder(row.getText());
+            for (ForegroundColorSpan span : label.getSpans(0, label.length(), ForegroundColorSpan.class)) label.removeSpan(span);
+            label.setSpan(new ForegroundColorSpan(color("muted")), (Integer) view.getTag(PREVIEW_STYLE), label.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            row.setText(label);
+        }
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++) applyAppearance(group.getChildAt(i));
+        }
+    }
+    private void restyleCurrentPage() {
+        if (root == null || scroll == null) return;
+        final int bound = generation, oldY = scroll.getScrollY();
+        ViewGroup reading = timeline == null ? content : timeline;
+        View anchor = null; int offset = 0;
+        for (int i = 0; i < reading.getChildCount(); i++) {
+            View item = reading.getChildAt(i); Rect bounds = new Rect();
+            item.getDrawingRect(bounds); content.offsetDescendantRectToMyCoords(item, bounds);
+            if (bounds.bottom > oldY) { anchor = item; offset = oldY - bounds.top; break; }
+        }
+        final View readingAnchor = anchor;
+        final int readingOffset = offset;
+        applyAppearance(root);
+        getWindow().setStatusBarColor(color("background"));
+        getWindow().setNavigationBarColor(color("background"));
+        scroll.post(() -> {
+            if (!authorized() || generation != bound) return;
+            int y = oldY;
+            if (readingAnchor != null) {
+                Rect bounds = new Rect(); readingAnchor.getDrawingRect(bounds);
+                content.offsetDescendantRectToMyCoords(readingAnchor, bounds); y = bounds.top + readingOffset;
+            }
+            scroll.scrollTo(0, Math.max(0, y)); updateLatestButton();
+        });
+    }
+    private RadioGroup appearanceChoices(LinearLayout parent, String title, String[] labels, String[] values, String selected) {
+        text(parent, title, 16).setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        RadioGroup group = new RadioGroup(this); group.setOrientation(RadioGroup.HORIZONTAL); parent.addView(group);
+        for (int i = 0; i < values.length; i++) {
+            RadioButton option = new RadioButton(this); option.setId(View.generateViewId()); option.setTag(values[i]);
+            option.setText(labels[i]); font(option, 16); ink(option, "ink"); option.setMinHeight(dp(48));
+            option.setButtonTintList(new ColorStateList(new int[][] {new int[] {android.R.attr.state_checked}, new int[] {}},
+                    new int[] {color("accent"), color("muted")}));
+            group.addView(option, new RadioGroup.LayoutParams(0, -2, 1));
+            if (values[i].equals(selected)) group.check(option.getId());
+        }
+        return group;
+    }
+    private void showAppearance() {
+        if (!authorized() || !dialogs.isEmpty() || busy || refreshing) return;
+        LinearLayout box = column(); spacing(box, 16, 8, 16, 8); background(box, "background", 0);
+        RadioGroup themes = appearanceChoices(box, "主题", new String[] {"经典蓝", "淡绿青"}, new String[] {"blue", "mint"}, theme);
+        RadioGroup fonts = appearanceChoices(box, "字号", new String[] {"标准", "大字"}, new String[] {"standard", "large"}, fontSize);
+        RadioGroup spaces = appearanceChoices(box, "间距", new String[] {"舒适", "紧凑"}, new String[] {"comfortable", "compact"}, density);
+        ink(text(box, "仅保存在这台手机；系统字体大小仍然有效。", 13), "muted");
+        TextView notice = ink(text(box, appearanceReadFailed ? "未能读取外观设置，当前使用默认外观。" : "", 13), "warning");
+        ScrollView viewport = new ScrollView(this); viewport.addView(box);
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("外观与偏好").setView(viewport)
+                .setPositiveButton("保存", null).setNeutralButton("恢复默认", null).setNegativeButton("取消", null).create();
+        showDialog(dialog, false);
+        dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(view -> {
+            if (!authorized()) return;
+            for (RadioGroup group : new RadioGroup[] {themes, fonts, spaces}) group.check(group.getChildAt(0).getId());
+            notice.setText("已选择默认外观，保存后生效。");
+        });
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
+            if (!authorized()) return;
+            String newTheme = Protocol.appearancePreference("theme", themes.findViewById(themes.getCheckedRadioButtonId()).getTag());
+            String newFont = Protocol.appearancePreference("font_size", fonts.findViewById(fonts.getCheckedRadioButtonId()).getTag());
+            String newDensity = Protocol.appearancePreference("density", spaces.findViewById(spaces.getCheckedRadioButtonId()).getTag());
+            android.content.SharedPreferences preferences = null;
+            boolean committed = false;
+            try {
+                preferences = getSharedPreferences("appearance", MODE_PRIVATE);
+                committed = preferences.edit().putString("theme", newTheme).putString("font_size", newFont).putString("density", newDensity).commit();
+            }
+            catch (RuntimeException ignored) { }
+            if (!committed) {
+                // commit(false) can still change the framework's in-memory map. Restore the last applied values too.
+                try { if (preferences != null) preferences.edit().putString("theme", theme).putString("font_size", fontSize).putString("density", density).commit(); }
+                catch (RuntimeException ignored) { }
+                notice.setText("未能确认保存，当前外观未切换。请重试。"); return;
+            }
+            theme = newTheme; fontSize = newFont; density = newDensity; appearanceReadFailed = false;
+            dialog.dismiss(); restyleCurrentPage();
+        });
     }
     private TextView text(LinearLayout parent, String value, int size) {
         TextView view = new TextView(this);
-        view.setText(value); view.setTextSize(size); view.setTextIsSelectable(true);
-        view.setTextColor(INK); view.setIncludeFontPadding(false);
-        view.setPadding(0, dp(4), 0, dp(4));
+        view.setText(value); font(view, size); view.setTextIsSelectable(true);
+        ink(view, "ink"); view.setIncludeFontPadding(false);
+        spacing(view, 0, 4, 0, 4);
         parent.addView(view, new LinearLayout.LayoutParams(-1, -2));
         return view;
     }
     private EditText input(LinearLayout parent, String hint, String value, boolean multiline) {
         EditText view = new ScrollingEditText(this);
-        view.setHint(hint); view.setText(value); view.setTextSize(16);
-        view.setTextColor(INK); view.setHintTextColor(MUTED);
-        view.setBackground(surface(SURFACE, 12)); view.setPadding(dp(14), dp(12), dp(14), dp(12));
+        view.setHint(hint); view.setText(value); font(view, 16);
+        ink(view, "ink"); view.setHintTextColor(color("muted"));
+        background(view, "surface", 12); spacing(view, 14, 12, 14, 12);
         view.setMinHeight(dp(48));
         view.setInputType(InputType.TYPE_CLASS_TEXT | (multiline ? InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES : 0));
         view.setMinLines(1); view.setMaxLines(multiline ? 3 : 2);
@@ -326,7 +479,7 @@ public final class MainActivity extends Activity {
     private void compactStatus(TextView view) {
         view.setMaxLines(2);
         view.setEllipsize(TextUtils.TruncateAt.END);
-        view.setTextSize(13); view.setTextColor(MUTED);
+        font(view, 13); ink(view, "muted");
         view.setOnClickListener(v -> {
             if (view.getText().length() == 0) return;
             popup = true;
@@ -599,7 +752,8 @@ public final class MainActivity extends Activity {
         TextView title = text(navigation, "我的任务", 22); title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         title.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
         Button more = button(navigation, "⋯", true, this::showDetails); more.setContentDescription("更多操作");
-        more.setTextSize(24); more.setLayoutParams(new LinearLayout.LayoutParams(dp(48), -2));
+        spacing(more, 0, 8, 0, 8);
+        font(more, 24); more.setLayoutParams(new LinearLayout.LayoutParams(dp(48), -2));
         renderOperation();
         int visible = 0;
         for (int i = 0; i < tasks.length(); i++) {
@@ -611,20 +765,21 @@ public final class MainActivity extends Activity {
             Button row = button(content, item.optString("title", "未命名任务") + "\n" + stateLabel(item.optString("state")) + "\n" + Protocol.preview(preview), true, () -> {
                 selectedId = id; task = item; showTask(); refresh();
             });
-            row.setGravity(Gravity.START | Gravity.CENTER_VERTICAL); row.setPadding(dp(12), dp(10), dp(12), dp(10));
+            row.setGravity(Gravity.START | Gravity.CENTER_VERTICAL); spacing(row, 12, 10, 12, 10);
             SpannableStringBuilder label = new SpannableStringBuilder(row.getText());
             int end = label.toString().indexOf('\n');
             label.setSpan(new StyleSpan(Typeface.BOLD), 0, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
             label.setSpan(new RelativeSizeSpan(0.86f), end + 1, label.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-            label.setSpan(new ForegroundColorSpan(MUTED), end + 1, label.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-            row.setText(label); row.setTextSize(17); row.setLineSpacing(dp(5), 1);
+            label.setSpan(new ForegroundColorSpan(color("muted")), end + 1, label.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            row.setTag(PREVIEW_STYLE, end + 1);
+            row.setText(label); font(row, 17); row.setLineSpacing(dp(5), 1);
             row.setMaxLines(5); row.setEllipsize(TextUtils.TruncateAt.END);
-            View divider = new View(this); divider.setBackgroundColor(OUTLINE);
+            View divider = new View(this); background(divider, "outline", 0);
             content.addView(divider, new LinearLayout.LayoutParams(-1, dp(1)));
         }
         if (visible == 0) {
             text(content, offline ? "还没有读取到任务" : "暂无获授权的任务", 20).setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-            text(content, offline ? "连接电脑后刷新，已有授权不会因此改变。" : "在电脑选择允许手机访问的任务，再生成配对信息。", 15).setTextColor(MUTED);
+            ink(text(content, offline ? "连接电脑后刷新，已有授权不会因此改变。" : "在电脑选择允许手机访问的任务，再生成配对信息。", 15), "muted");
             button(content, "刷新列表", connection() != null, this::refresh);
         }
         listSignature = tasks.toString();
@@ -694,14 +849,16 @@ public final class MainActivity extends Activity {
         LinearLayout navigation = new LinearLayout(this); navigation.setGravity(Gravity.CENTER_VERTICAL);
         header.addView(navigation);
         Button back = button(navigation, "‹", true, () -> { selectedId = null; task = null; showTasks(); refresh(); });
-        back.setContentDescription("返回任务列表"); back.setTextSize(28);
+        back.setContentDescription("返回任务列表"); font(back, 28);
+        spacing(back, 0, 8, 0, 8);
         back.setLayoutParams(new LinearLayout.LayoutParams(dp(48), -2));
         TextView title = text(navigation, task.optString("title", "对话"), 18);
         title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         title.setMaxLines(1); title.setEllipsize(TextUtils.TruncateAt.END);
         title.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
         Button more = button(navigation, "⋯", fullTask(task), this::showDetails);
-        more.setContentDescription("更多操作与完整任务名称"); more.setTextSize(24);
+        more.setContentDescription("更多操作与完整任务名称"); font(more, 24);
+        spacing(more, 0, 8, 0, 8);
         more.setLayoutParams(new LinearLayout.LayoutParams(dp(48), -2));
         taskStatus = text(header, "", 14); compactStatus(taskStatus);
         requestsAction = button(header, "处理请求", true, this::showRequests);
@@ -713,22 +870,23 @@ public final class MainActivity extends Activity {
             taskStatus.setText("正在读取对话…");
             taskStatus.setVisibility(View.VISIBLE);
             text(timeline, "可先写草稿，读到最新状态后再发送。", 17);
-            composer.setPadding(0, dp(8), 0, 0);
+            spacing(composer, 0, 8, 0, 0);
             draftInput(composer, id, "写下消息，连接后再发送");
             controls();
             return;
         }
-        composer.setPadding(0, dp(8), 0, 0);
+        spacing(composer, 0, 8, 0, 0);
         latest = button(composer, "最新消息 ↓", true, () -> {
             if (originalView && originalCursor != null) readOriginal(null, false, true);
             else { scroll.scrollTo(0, Math.max(0, content.getHeight() - scroll.getHeight())); updateLatestButton(); }
         });
         latest.setVisibility(View.GONE);
         LinearLayout entry = new LinearLayout(this); entry.setGravity(Gravity.BOTTOM);
-        entry.setBackground(surface(SURFACE, 16)); entry.setPadding(dp(4), dp(4), dp(4), dp(4)); composer.addView(entry);
+        background(entry, "surface", 16); spacing(entry, 4, 4, 4, 4); composer.addView(entry);
         draftInput(entry, id, "发送消息…");
         message.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
         message.setBackgroundColor(Color.TRANSPARENT);
+        message.setTag(BACKGROUND_STYLE, null); // The shared composer surface owns this background.
         LinearLayout commands = column(); entry.addView(commands, new LinearLayout.LayoutParams(dp(80), -2));
         pause = button(commands, "暂停", false, () -> command(task, "pause", new JSONObject(), "暂停任务", "请求电脑暂停；收到原生终态之前不能假定已停止。", null));
         send = button(commands, "发送", false, () -> {
@@ -884,13 +1042,13 @@ public final class MainActivity extends Activity {
             String language = block[1].length() > 24 ? block[1].substring(0, 24) + "…" : block[1];
             TextView label = text(bar, language.isEmpty() ? "代码" : "代码 · " + language, 13);
             label.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
-            label.setTextIsSelectable(false); label.setTextColor(MUTED);
+            label.setTextIsSelectable(false); ink(label, "muted");
             Button copy = button(bar, "复制", true, () -> copyText(block[2], "代码"));
             copy.setLayoutParams(new LinearLayout.LayoutParams(dp(64), -2));
             HorizontalScrollView viewport = new HorizontalScrollView(this); viewport.setFillViewport(true);
-            TextView code = new TextView(this); code.setText(block[2]); code.setTextSize(15); code.setTypeface(Typeface.MONOSPACE);
-            code.setTextColor(INK); code.setBackgroundColor(SURFACE);
-            code.setPadding(dp(10), dp(10), dp(10), dp(10)); code.setTextIsSelectable(true); code.setHorizontallyScrolling(true);
+            TextView code = new TextView(this); code.setText(block[2]); font(code, 15); code.setTypeface(Typeface.MONOSPACE);
+            ink(code, "ink"); background(code, "surface", 0);
+            spacing(code, 10, 10, 10, 10); code.setTextIsSelectable(true); code.setHorizontallyScrolling(true);
             viewport.addView(code, new android.widget.FrameLayout.LayoutParams(-2, -2));
             parent.addView(viewport, new LinearLayout.LayoutParams(-1, -2));
         }
@@ -905,13 +1063,13 @@ public final class MainActivity extends Activity {
         LinearLayout bubble = column();
         LinearLayout.LayoutParams layout = new LinearLayout.LayoutParams(-1, -2);
         layout.setMargins(mine ? dp(32) : 0, dp(8), 0, dp(12));
-        bubble.setPadding(mine ? dp(14) : 0, dp(8), mine ? dp(14) : 0, dp(8));
-        if (mine) bubble.setBackground(surface(SURFACE, 16));
+        spacing(bubble, mine ? 14 : 0, 8, mine ? 14 : 0, 8);
+        if (mine) background(bubble, "selection", 16);
         timeline.addView(bubble, layout);
         LinearLayout caption = new LinearLayout(this); caption.setGravity(Gravity.CENTER_VERTICAL); bubble.addView(caption);
         TextView label = text(caption, (mine ? "你" : "Codex") + (at.isEmpty() ? "" : " · " + timeLabel(at)), 12);
         label.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
-        label.setTextColor(MUTED); label.setTextIsSelectable(false);
+        ink(label, "muted"); label.setTextIsSelectable(false);
         copyMenu(bubble, value, "完整消息");
         if (!notice.isEmpty()) text(bubble, notice, 13);
         if (verbatim) { TextView body = text(bubble, value, 17); body.setLineSpacing(dp(3), 1); }
@@ -1047,8 +1205,13 @@ public final class MainActivity extends Activity {
     }
 
     private void showDetails() {
+        if (!authorized() || !dialogs.isEmpty()) return;
         if (task != null && !fullTask(task)) { showStatus("完整任务尚未读取，暂不能打开任务操作。"); return; }
         LinearLayout box = column(); box.setPadding(dp(16), dp(8), dp(16), dp(8));
+        button(box, "外观与偏好", !refreshing, () -> {
+            if (dialogs.size() != 1 || busy || refreshing) return;
+            dismissDialogs(); showAppearance();
+        });
         if (task == null) {
             text(box, "这里只列出本次配对获授权的任务。请在电脑创建或导入、选择任务后连接手机。", 16);
             if (connection() != null && connection().has("expires_at"))

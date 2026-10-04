@@ -11,13 +11,6 @@ import time
 import webbrowser
 
 
-BG = "#f7f8fa"
-SURFACE = "#ffffff"
-INK = "#17212b"
-ACCENT = "#2457d6"
-BORDER = "#dce2e9"
-
-
 def private_address(value):
     address = ipaddress.IPv4Address(value)
     if (address.is_unspecified or address.is_multicast or address.is_link_local
@@ -147,13 +140,15 @@ class PhoneDialog(tk.Toplevel):
     def __init__(self, app):
         super().__init__(app.root)
         self.app, self.enabled, self.devices = app, False, []
+        colors = app.root._context_relay_palette
         self._pairing_request = self._pairing_snapshot = None
         self._pairing_deadline = self._pairing_timer = None
         self._pairing_serial = 0
-        self.configure(background=BG)
+        self.configure(background=colors["bg"])
         self.title("手机连接 · Context Relay")
         self.transient(app.root)
-        desired_height = 680 if float(self.tk.call("tk", "scaling")) >= 1.75 else 600
+        desired_height = 680 if (float(self.tk.call("tk", "scaling")) >= 1.75
+                                 or app.preferences["font_size"] == "large") else 600
         self.geometry(f"{min(720, self.winfo_screenwidth() - 80)}x"
                       f"{min(desired_height, self.winfo_screenheight() - 80)}")
         body = ttk.Frame(self, padding=18, style="Sidebar.TFrame")
@@ -196,33 +191,35 @@ class PhoneDialog(tk.Toplevel):
         ttk.Label(self.pair_page, text="允许访问的任务（可多选）",
                   style="Surface.TLabel").pack(anchor="w", pady=(6, 0))
         self.task_list = tk.Listbox(self.pair_page, height=4, selectmode="extended", exportselection=False,
-                                    background=SURFACE, foreground=INK, selectbackground=ACCENT,
-                                    selectforeground=SURFACE, relief="flat", borderwidth=0,
-                                    highlightthickness=1, highlightbackground=BORDER,
-                                    highlightcolor=ACCENT, font=("Segoe UI", 10))
+                                    background=colors["surface"], foreground=colors["ink"],
+                                    selectbackground=colors["accent"], selectforeground=colors["surface"],
+                                    relief="flat", borderwidth=0, highlightthickness=1,
+                                    highlightbackground=colors["border"], highlightcolor=colors["accent"],
+                                    font="TkTextFont")
         self.task_list.pack(fill="x", pady=(3, 8))
         self.task_list.bind("<<ListboxSelect>>", self._pairing_choices_changed)
         self.task_ids = []
         self._sync_tasks()
         buttons = ttk.Frame(self.pair_page, style="Surface.TFrame")
         buttons.pack(fill="x")
-        self.enable_button = ttk.Button(buttons, text="开启手机连接", command=self.enable, style="Primary.TButton")
-        self.pair_button = ttk.Button(buttons, text="按所选权限生成配对信息", command=self.pair, style="Primary.TButton")
+        self.enable_button = ttk.Button(buttons, text="开启手机连接", command=self.enable)
+        self.pair_button = ttk.Button(buttons, text="按所选权限生成配对信息", command=self.pair)
         self.pairing_panel = ttk.Frame(self.pair_page, style="Surface.TFrame")
         self.pairing = tk.Text(self.pairing_panel, height=3, wrap="char", state="disabled", relief="flat",
-                               background=SURFACE, foreground=INK, borderwidth=0, highlightthickness=1,
-                               highlightbackground=BORDER, selectbackground=ACCENT, padx=8, pady=8,
-                               font=("Segoe UI", 9))
+                               background=colors["surface"], foreground=colors["ink"], borderwidth=0,
+                               highlightthickness=1, highlightbackground=colors["border"],
+                               selectbackground=colors["accent"], padx=8, pady=8, font="TkTextFont")
         self.pairing.pack(fill="x", pady=(10, 4))
         self.copy_button = ttk.Button(self.pairing_panel, text="复制配对信息（5 分钟内有效，仅一次）",
-                                      command=self.copy, style="Primary.TButton")
+                                      command=self.copy)
         self.copy_button.pack(anchor="w")
         ttk.Label(self.device_page, text="已配对设备", style="Surface.TLabel").pack(anchor="w", pady=(0, 4))
         self.device_list = tk.Listbox(self.device_page, height=4, exportselection=False,
-                                      background=SURFACE, foreground=INK, selectbackground=ACCENT,
-                                      selectforeground=SURFACE, relief="flat", borderwidth=0,
-                                      highlightthickness=1, highlightbackground=BORDER,
-                                      highlightcolor=ACCENT, font=("Segoe UI", 10))
+                                      background=colors["surface"], foreground=colors["ink"],
+                                      selectbackground=colors["accent"], selectforeground=colors["surface"],
+                                      relief="flat", borderwidth=0, highlightthickness=1,
+                                      highlightbackground=colors["border"], highlightcolor=colors["accent"],
+                                      font="TkTextFont")
         self.device_list.pack(fill="both", expand=True)
         actions = ttk.Frame(self.device_page, style="Surface.TFrame")
         actions.pack(fill="x", pady=(8, 0))

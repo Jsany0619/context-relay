@@ -10,6 +10,14 @@ import java.util.List;
 public final class Protocol {
     private Protocol() {}
 
+    /** Only local appearance values belong in the separate preferences store. */
+    public static String appearancePreference(String key, Object value) {
+        if ("theme".equals(key)) return "mint".equals(value) ? "mint" : "blue";
+        if ("font_size".equals(key)) return "large".equals(value) ? "large" : "standard";
+        if ("density".equals(key)) return "compact".equals(value) ? "compact" : "comfortable";
+        throw new IllegalArgumentException("不支持的外观设置。");
+    }
+
     public static String endpoint(String value) {
         try {
             URI uri = new URI(value);

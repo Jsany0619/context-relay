@@ -16,6 +16,19 @@ public final class ProtocolCheck {
         throw new AssertionError("Expected rejection " + count);
     }
     public static void main(String[] args) throws Exception {
+        for (Object invalid : new Object[] {null, "", "system", "MINT", Boolean.TRUE, 3}) {
+            check("blue".equals(Protocol.appearancePreference("theme", invalid)));
+            check("standard".equals(Protocol.appearancePreference("font_size", invalid)));
+            check("comfortable".equals(Protocol.appearancePreference("density", invalid)));
+        }
+        check("mint".equals(Protocol.appearancePreference("theme", "mint")));
+        check("large".equals(Protocol.appearancePreference("font_size", "large")));
+        check("compact".equals(Protocol.appearancePreference("density", "compact")));
+        check("blue".equals(Protocol.appearancePreference("theme", "blue")));
+        check("standard".equals(Protocol.appearancePreference("font_size", "standard")));
+        check("comfortable".equals(Protocol.appearancePreference("density", "comfortable")));
+        for (String forbidden : new String[] {"token", "endpoint", "certificate_sha256", "pending", "scope", "unlock", "model"})
+            rejects(() -> Protocol.appearancePreference(forbidden, "mint"));
         check("https://192.168.1.2:9443".equals(Protocol.endpoint("https://192.168.1.2:9443/")));
         check("https://relay.example".equals(Protocol.endpoint("https://relay.example")));
         for (String bad : new String[] {"http://192.168.1.2", "https://u:p@host", "https://host/path", "https://host/?x=1",
