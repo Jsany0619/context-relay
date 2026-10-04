@@ -1,6 +1,7 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="app.contextrelay.mobile" android:versionCode="11" android:versionName="0.2.9">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="app.contextrelay.mobile" android:versionCode="12" android:versionName="0.2.10">
     <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="35" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
     <application android:label="Context Relay" android:icon="@drawable/app_icon" android:theme="@android:style/Theme.Material.Light.NoActionBar"
         android:allowBackup="false" android:fullBackupContent="false" android:dataExtractionRules="@xml/data_extraction_rules"
         android:usesCleartextTraffic="false" android:supportsRtl="true">

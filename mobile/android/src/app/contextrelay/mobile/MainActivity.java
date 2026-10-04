@@ -34,6 +34,7 @@ import android.view.Gravity;
 import android.view.WindowManager;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.HorizontalScrollView;
@@ -75,12 +76,22 @@ public final class MainActivity extends Activity {
     private static final int BACKGROUND_STYLE = 0x02000000 | View.generateViewId();
     private static final int BUTTON_STYLE = 0x02000000 | View.generateViewId();
     private static final int PREVIEW_STYLE = 0x02000000 | View.generateViewId();
+    private static final int PRIVATE_DETAIL = 0x02000000 | View.generateViewId();
+    private static final int VIEW_PRIVATE = 0x02000000 | View.generateViewId();
+    private static int nextPrivacyRequest = 8192;
     private String theme = "blue", fontSize = "standard", density = "comfortable";
     private boolean appearanceReadFailed;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final List<Button> actions = new ArrayList<>();
     private final List<AlertDialog> dialogs = new ArrayList<>();
+    private final java.util.Set<String> expandedDetails = new java.util.HashSet<>();
+    private String expandedTaskId, lastReadAt = "";
+    private TextView connectionInfo;
+    private VerifiedScreenshot screenshots;
+    private SensitiveText.Reveal privacyRequest;
+    private boolean privacyPairing;
+    private String reviewedPrivateDetail, reviewedPrivatePage;
     private Vault vault;
     private JSONObject saved;
     private JSONObject drafts;
@@ -138,6 +149,19 @@ public final class MainActivity extends Activity {
         getWindow().setStatusBarColor(color("background"));
         getWindow().setNavigationBarColor(color("background"));
         getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
+        screenshots = new VerifiedScreenshot(this, new VerifiedScreenshot.Host() {
+            public boolean eligible() { return screenshotEligible(); }
+            public String pageKey() { return screenshotPageKey(); }
+            public View captureView() { return root; }
+            public void onCredentialVerified() {
+                unlockApproved = true;
+                if (foreground) finishUnlock();
+            }
+            public void report(String value) {
+                if (authorized() && status != null) showStatus(value);
+                else android.widget.Toast.makeText(MainActivity.this, value, android.widget.Toast.LENGTH_LONG).show();
+            }
+        });
         readIntent(getIntent());
         showLocked("请验证手机锁屏身份后继续。");
     }
@@ -163,6 +187,8 @@ public final class MainActivity extends Activity {
 
     private void requestUnlock() {
         if (!foreground || authPending || storageFailed) return;
+        cancelScreenshot();
+        cancelPrivacy();
         requestOnResume = false;
         KeyguardManager manager = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
         if (manager == null || !manager.isDeviceSecure()) {
@@ -178,6 +204,16 @@ public final class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
+        if (request >= 8192 && request < 16384) {
+            if (privacyRequest == null || request != privacyRequest.code) return;
+            if (!privacyRequest.verify(request, result == RESULT_OK && deviceSecure())) {
+                cancelPrivacy(); requestOnResume = false; showLocked("验证未完成，敏感信息保持隐藏。"); return;
+            }
+            unlockApproved = true;
+            if (foreground) { finishUnlock(); showVerifiedPrivacy(); }
+            return;
+        }
+        if (screenshots != null && screenshots.onActivityResult(request, result, data)) return;
         if (request == UNLOCK_REQUEST) {
             authPending = false;
             unlockApproved = result == RESULT_OK && deviceSecure();
@@ -236,7 +272,7 @@ public final class MainActivity extends Activity {
             boolean open = root.getRootView().getHeight() - visible.bottom > dp(150);
             if (open != keyboardOpen) { keyboardOpen = open; compactChat(); }
         });
-        if (connection() == null || incomingPair != null) showPairing();
+        if (connection() == null || incomingPair != null || privacyRequest != null && privacyPairing) showPairing();
         else {
             if (task != null) { selectedId = resumeTaskId; showTask(); }
             else { showTasks(); selectedId = resumeTaskId; }
@@ -246,6 +282,9 @@ public final class MainActivity extends Activity {
 
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
+        cancelScreenshot();
+        cancelPrivacy();
+        dismissDialogs();
         setIntent(intent);
         readIntent(intent);
         if (authorized() && !storageFailed && incomingPair != null) showPairing();
@@ -261,12 +300,24 @@ public final class MainActivity extends Activity {
     @Override protected void onResume() {
         super.onResume();
         foreground = true;
-        if (unlockApproved && deviceSecure()) {
-            unlockApproved = false; unlocked = true; openUnlocked();
-            handler.removeCallbacks(poller); handler.postDelayed(poller, 500);
-        } else if (requestOnResume && !authPending && !storageFailed) requestUnlock();
+        if (unlockApproved && deviceSecure()) finishUnlock();
+        else if (requestOnResume && !authPending && !storageFailed && privacyRequest == null && (screenshots == null || !screenshots.isPending())) requestUnlock();
+        if (screenshots != null) screenshots.onResume();
+        showVerifiedPrivacy();
+    }
+    private void finishUnlock() {
+        if (!unlockApproved || !foreground || !deviceSecure()) return;
+        unlockApproved = false; unlocked = true; openUnlocked();
+        handler.removeCallbacks(poller); handler.postDelayed(poller, 500);
+    }
+    @Override public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (screenshots != null) screenshots.onWindowFocusChanged(hasFocus);
     }
     @Override protected void onPause() {
+        if (screenshots != null) screenshots.onPause();
+        reviewedPrivateDetail = null; reviewedPrivatePage = null;
+        if (privacyRequest != null && !privacyRequest.pause()) cancelPrivacy();
         authEpoch++; generation++; // Invalidate in-flight permits before disk writes can delay the foreground transition.
         handler.removeCallbacks(poller);
         handler.removeCallbacks(saveDrafts);
@@ -297,11 +348,15 @@ public final class MainActivity extends Activity {
         super.onPause();
     }
     @Override protected void onDestroy() {
+        cancelScreenshot();
+        cancelPrivacy();
         handler.removeCallbacksAndMessages(null);
         worker.shutdownNow();
         super.onDestroy();
     }
     @Override public void onBackPressed() {
+        cancelScreenshot();
+        cancelPrivacy();
         if (authorized() && selectedId != null && !busy) { selectedId = null; task = null; showTasks(); refresh(); }
         else super.onBackPressed();
     }
@@ -425,6 +480,29 @@ public final class MainActivity extends Activity {
         TextView label = ink(text(parent, title, 13), "muted");
         label.setTextIsSelectable(false); spacing(label, 0, 14, 0, 6);
     }
+    private void disclosure(LinearLayout row, View details, String key, String title) {
+        boolean expanded = expandedDetails.contains(key);
+        details.setVisibility(expanded ? View.VISIBLE : View.GONE);
+        Button arrow = button(row, expanded ? "▴" : "▾", true, () -> { });
+        font(arrow, 18); spacing(arrow, 0, 8, 0, 8);
+        arrow.setLayoutParams(new LinearLayout.LayoutParams(dp(48), -2));
+        arrow.setContentDescription((expanded ? "收起" : "展开") + title + "详细信息");
+        arrow.setOnClickListener(view -> {
+            if (!authorized()) return;
+            boolean open = !expandedDetails.contains(key);
+            if (open) expandedDetails.add(key); else expandedDetails.remove(key);
+            details.setVisibility(open ? View.VISIBLE : View.GONE);
+            arrow.setText(open ? "▴" : "▾");
+            arrow.setContentDescription((open ? "收起" : "展开") + title + "详细信息");
+        });
+    }
+    private void updateConnectionInfo() {
+        if (connectionInfo == null) return;
+        JSONObject connected = connection();
+        metadataText(connectionInfo, (connected == null ? "尚未配对电脑。" : "电脑地址：" + connected.optString("endpoint")
+                + (connected.has("expires_at") ? "\n授权到期：" + timeLabel(connected.optString("expires_at")) : ""))
+                + "\n最近成功读取：" + (lastReadAt.isEmpty() ? "本次尚未读取" : timeLabel(lastReadAt)));
+    }
     private void showAppearance() {
         if (!authorized() || !dialogs.isEmpty() || busy || refreshing) return;
         LinearLayout box = column(); spacing(box, 16, 8, 16, 8); background(box, "background", 0);
@@ -472,12 +550,111 @@ public final class MainActivity extends Activity {
         });
     }
     private TextView text(LinearLayout parent, String value, int size) {
+        TextView view = plainText(parent, "", size);
+        metadataText(view, value);
+        return view;
+    }
+    private TextView plainText(LinearLayout parent, String value, int size) {
         TextView view = new TextView(this);
         view.setText(value); font(view, size); view.setTextIsSelectable(true);
         ink(view, "ink"); view.setIncludeFontPadding(false);
         spacing(view, 0, 4, 0, 4);
         parent.addView(view, new LinearLayout.LayoutParams(-1, -2));
         return view;
+    }
+    private String privateDetail(String value) {
+        String safe = SensitiveText.withoutSecrets(value);
+        if (connection() != null) {
+            String token = connection().optString("token");
+            if (!token.isEmpty()) safe = safe.replace(token, "[凭据已隐藏]");
+        }
+        return safe;
+    }
+    private void metadataText(TextView view, String value) {
+        String safe = privateDetail(value), masked = SensitiveText.masked(safe);
+        view.setText(masked);
+        boolean hidden = !safe.equals(masked);
+        view.setTag(PRIVATE_DETAIL, hidden ? safe : null);
+        view.setCompoundDrawablesRelative(null, null, hidden ? closedEye() : null, null);
+        if (!hidden) { view.setOnTouchListener(null); return; }
+        view.setMinHeight(dp(48));
+        view.setOnTouchListener((v, event) -> {
+            boolean inside = view.getLayoutDirection() == View.LAYOUT_DIRECTION_RTL
+                    ? event.getX() <= view.getPaddingLeft() + dp(48)
+                    : event.getX() >= view.getWidth() - dp(48) - view.getPaddingRight();
+            if (!inside) return false;
+            if (event.getAction() == android.view.MotionEvent.ACTION_UP) requestPrivacy((String) view.getTag(PRIVATE_DETAIL));
+            return true;
+        });
+        view.setAccessibilityDelegate(new View.AccessibilityDelegate() {
+            @Override public void onInitializeAccessibilityNodeInfo(View v, AccessibilityNodeInfo info) {
+                super.onInitializeAccessibilityNodeInfo(v, info);
+                if (view.getTag(PRIVATE_DETAIL) != null)
+                    info.addAction(new AccessibilityNodeInfo.AccessibilityAction(VIEW_PRIVATE, "验证查看敏感信息"));
+            }
+            @Override public boolean performAccessibilityAction(View v, int action, Bundle args) {
+                if (action == VIEW_PRIVATE) { requestPrivacy((String) view.getTag(PRIVATE_DETAIL)); return true; }
+                return super.performAccessibilityAction(v, action, args);
+            }
+        });
+    }
+    private android.graphics.drawable.Drawable closedEye() {
+        android.graphics.drawable.Drawable icon = new android.graphics.drawable.Drawable() {
+            private final android.graphics.Paint paint = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+            @Override public void draw(android.graphics.Canvas canvas) {
+                paint.setColor(color("muted")); paint.setStyle(android.graphics.Paint.Style.STROKE); paint.setStrokeWidth(dp(2));
+                canvas.drawOval(dp(12), dp(17), dp(36), dp(31), paint);
+                canvas.drawCircle(dp(24), dp(24), dp(4), paint);
+                canvas.drawLine(dp(12), dp(12), dp(36), dp(36), paint);
+            }
+            @Override public void setAlpha(int alpha) { paint.setAlpha(alpha); }
+            @Override public void setColorFilter(android.graphics.ColorFilter filter) { paint.setColorFilter(filter); }
+            @Override public int getOpacity() { return android.graphics.PixelFormat.TRANSLUCENT; }
+        };
+        icon.setBounds(0, 0, dp(48), dp(48)); return icon;
+    }
+    private String privacyPageKey() {
+        if (!authorized() || storageFailed) return null;
+        String connected = connection() == null ? "unpaired" : connection().optString("certificate_sha256") + ":" + connection().optString("device_id");
+        return connected + (pairingView ? ":pairing" : selectedId == null ? ":tasks"
+                : ":task:" + selectedId + ":" + originalView + ":" + (originalCursor == null ? "latest" : originalCursor));
+    }
+    private void cancelPrivacy() {
+        privacyRequest = null; privacyPairing = false;
+        reviewedPrivateDetail = null; reviewedPrivatePage = null;
+    }
+    private void requestPrivacy(String detail) {
+        if (!authorized() || detail == null || authPending || busy || privacyRequest != null
+                || screenshots != null && screenshots.isPending()) return;
+        KeyguardManager manager = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
+        if (manager == null || !manager.isDeviceSecure() || nextPrivacyRequest >= 16384) {
+            showStatus("暂不能验证敏感信息，请重新打开 App 或检查锁屏设置。"); return;
+        }
+        Intent intent = manager.createConfirmDeviceCredentialIntent("查看本次敏感信息", "重新验证手机身份；只显示本次信息，离开后重新隐藏");
+        if (intent == null) { showStatus("系统暂不能验证，敏感信息保持隐藏。"); return; }
+        privacyPairing = pairingView;
+        privacyRequest = new SensitiveText.Reveal(nextPrivacyRequest++, privacyPageKey(), privateDetail(detail));
+        requestOnResume = false;
+        try { startActivityForResult(intent, privacyRequest.code); }
+        catch (Exception ex) { cancelPrivacy(); showStatus("无法打开系统验证，敏感信息保持隐藏。"); }
+    }
+    private void showVerifiedPrivacy() {
+        if (!foreground || privacyRequest == null || !privacyRequest.verified) return;
+        SensitiveText.Reveal request = privacyRequest;
+        privacyRequest = null; privacyPairing = false;
+        if (!request.consume(privacyPageKey(), authorized() && !storageFailed && !authPending)) {
+            if (authorized()) showStatus("页面已变化，本次不显示敏感信息，请重新点击验证。");
+            return;
+        }
+        final String safe = privateDetail(request.detail);
+        handler.post(() -> {
+            if (!authorized() || !request.page.equals(privacyPageKey()) || !dialogs.isEmpty()) return;
+            LinearLayout box = column(); spacing(box, 16, 8, 16, 8);
+            plainText(box, safe, 16);
+            text(box, "已核对，请关闭后重新打开该操作确认。离开页面后需重新验证；凭据始终隐藏。", 14);
+            showPanel("本次验证查看", box);
+            reviewedPrivateDetail = safe; reviewedPrivatePage = privacyPageKey();
+        });
     }
     private EditText input(LinearLayout parent, String hint, String value, boolean multiline) {
         EditText view = new ScrollingEditText(this);
@@ -497,15 +674,14 @@ public final class MainActivity extends Activity {
         view.setOnClickListener(v -> {
             if (view.getText().length() == 0) return;
             popup = true;
-            AlertDialog dialog = new AlertDialog.Builder(this).setTitle("完整状态说明")
-                    .setMessage(view.getText()).setPositiveButton("关闭", null).create();
-            dialog.setOnDismissListener(d -> popup = false);
-            showDialog(dialog, false);
+            LinearLayout box = column(); spacing(box, 16, 8, 16, 8);
+            text(box, view.getTag(PRIVATE_DETAIL) == null ? view.getText().toString() : (String) view.getTag(PRIVATE_DETAIL), 16);
+            showPanel("完整状态说明", box);
         });
     }
     private Button button(LinearLayout parent, String label, boolean enabled, Runnable callback) {
         Button view = new Button(this);
-        view.setText(label); styleButton(view, false);
+        metadataText(view, label); styleButton(view, false);
         view.setEnabled(enabled && !busy && !storageFailed && authorized());
         view.setMinHeight(dp(48));
         view.setTag(enabled);
@@ -520,10 +696,10 @@ public final class MainActivity extends Activity {
     private void clearPage() {
         generation++; content.removeAllViews(); header.removeAllViews(); composer.removeAllViews();
         actions.clear(); message = null; timeline = null; timelineSignature = ""; listSignature = "";
-        taskStatus = null; taskSubtitle = null; send = null; pause = null; latest = null; requestsAction = null;
+        taskStatus = null; taskSubtitle = null; connectionInfo = null; send = null; pause = null; latest = null; requestsAction = null;
         originalInfo = ""; originalError = ""; statusPinned = false; status.setVisibility(View.GONE);
         originalPage = null; originalCursor = null; originalView = false; originalChoice = false;
-        status.setMaxLines(2); operation.setMaxLines(2);
+        status.setMaxLines(1); operation.setMaxLines(2);
         text(header, "Context Relay", 22);
     }
     private JSONObject connection() { return saved == null ? null : saved.optJSONObject("connection"); }
@@ -532,10 +708,8 @@ public final class MainActivity extends Activity {
         JSONObject current = pending();
         if (current == null) return "";
         JSONObject receipt = current.optJSONObject("receipt");
-        JSONObject failure = receipt == null ? null : receipt.optJSONObject("error");
         boolean rejected = current.optBoolean("rejected");
-        return Protocol.failureNotice(receipt == null ? "" : receipt.optString("state"), rejected,
-                rejected ? current.optString("rejection") : failure == null ? "" : failure.optString("message"));
+        return Protocol.failureNotice(receipt == null ? "" : receipt.optString("state"), rejected, "详细原因请在电脑核对。");
     }
     private void statusWithFailure(String value) {
         showStatus(value);
@@ -543,7 +717,7 @@ public final class MainActivity extends Activity {
     }
     private void showStatus(String value) {
         statusPinned = true;
-        status.setText(value);
+        metadataText(status, value);
         status.setVisibility(View.VISIBLE);
     }
     private void showProgress(String value) {
@@ -564,7 +738,9 @@ public final class MainActivity extends Activity {
     }
     private void expireConnection() {
         if (connection() == null) return;
-        connection().remove("token"); put(connection(), "needs_pairing", true); offline = true;
+        cancelScreenshot();
+        cancelPrivacy();
+        connection().remove("token"); put(connection(), "needs_pairing", true); offline = true; lastReadAt = ""; expandedTaskId = null;
         saved.remove("last_task"); saved.remove("last_task_pin"); saved.remove("selected_task");
         task = null; tasks = new JSONArray(); resumeTaskId = null; selectedId = null;
         persist(); showTasks();
@@ -593,9 +769,11 @@ public final class MainActivity extends Activity {
         updateTaskControls();
     }
     private static String safeError(Exception ex) {
-        String value = ex.getMessage();
-        if (value == null || value.isEmpty()) value = ex.getClass().getSimpleName();
-        return value.length() > 700 ? value.substring(0, 700) : value;
+        if (ex instanceof HttpApi.ApiError) return "电脑返回错误（HTTP " + ((HttpApi.ApiError) ex).status + "），请在电脑核对详细原因。";
+        if (ex instanceof javax.net.ssl.SSLException) return "安全连接未完成，请核对电脑地址、证书和网络。";
+        if (ex instanceof java.io.IOException) return "连接或本机读取失败，请检查网络与本机存储。";
+        if (ex instanceof IllegalArgumentException) return "输入资料不完整或格式不正确，请核对后重试。";
+        return "读取或处理失败，请在电脑核对详细原因；未自动重试操作。";
     }
     private static String pretty(Object value) {
         if (value == null || value == JSONObject.NULL) return "无";
@@ -606,15 +784,9 @@ public final class MainActivity extends Activity {
         return value.toString();
     }
     private static String pathId(String value) throws Exception { return URLEncoder.encode(value, "UTF-8"); }
-    private static String shortTaskId(String value) {
-        if (value == null || value.isEmpty()) return "未知任务";
-        return value.substring(0, Math.min(8, value.length()));
-    }
     private String pendingTaskLabel(JSONObject current) {
-        JSONObject body = current == null ? null : current.optJSONObject("body");
-        String id = body == null ? "" : body.optString("task_id");
         String title = current == null ? "" : current.optString("task_title").trim();
-        return (title.isEmpty() ? "任务" : Protocol.preview(title)) + " · " + shortTaskId(id);
+        return title.isEmpty() ? "待核对任务" : Protocol.preview(title);
     }
 
     private HttpApi api(JSONObject target, int epoch) throws Exception {
@@ -653,9 +825,20 @@ public final class MainActivity extends Activity {
     }
 
     private void confirm(String title, String detail, Runnable action) {
+        confirm(title, detail, false, action);
+    }
+    private void confirm(String title, String detail, boolean conversation, Runnable action) {
         if (!authorized()) return;
         popup = true;
-        AlertDialog dialog = new AlertDialog.Builder(this).setTitle(title).setMessage(detail)
+        String safe = privateDetail(detail);
+        boolean hidden = !conversation && !safe.equals(SensitiveText.masked(safe));
+        boolean reviewed = safe.equals(reviewedPrivateDetail) && privacyPageKey() != null && privacyPageKey().equals(reviewedPrivatePage);
+        LinearLayout box = column(); spacing(box, 16, 8, 16, 8);
+        if (conversation) { text(box, "当前任务：" + (task == null ? "对话" : task.optString("title")), 14); plainText(box, detail, 16); }
+        else text(box, safe, 16);
+        if (hidden && !reviewed) text(box, "请先点闭眼图标验证查看，再重新打开该操作确认。", 14);
+        ScrollView viewport = new ScrollView(this); viewport.addView(box);
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle(title).setView(viewport)
                 .setNegativeButton("取消", null).setPositiveButton("确认本次操作", (d, which) -> {
                     if (!authorized()) return;
                     for (AlertDialog open : new ArrayList<>(dialogs)) open.dismiss();
@@ -663,6 +846,7 @@ public final class MainActivity extends Activity {
                 }).create();
         dialog.setOnDismissListener(d -> popup = false);
         showDialog(dialog, false);
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(!hidden || reviewed);
     }
 
     private void showDialog(AlertDialog dialog, boolean inputForm) {
@@ -694,10 +878,16 @@ public final class MainActivity extends Activity {
     }
 
     private void showPairing() {
+        cancelScreenshot();
+        if (privacyRequest == null) cancelPrivacy();
         clearPage(); selectedId = null; task = null; pairingView = true;
-        text(content, "连接自己的电脑", 22);
-        text(content, "1  电脑：打开手机连接，选择允许查看的任务和控制权限。\n2  电脑：复制配对信息，通过可信方式传到手机。\n3  手机：粘贴并核对电脑地址与证书指纹。", 16);
-        text(content, "手机与电脑须在同一网络或已配置的私有网络。配对信息含一次性密钥，请勿公开。", 14);
+        header.removeAllViews();
+        LinearLayout navigation = new LinearLayout(this); navigation.setGravity(Gravity.CENTER_VERTICAL); header.addView(navigation);
+        TextView title = text(navigation, "连接自己的电脑", 22); title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        title.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
+        LinearLayout help = column(); content.addView(help); disclosure(navigation, help, "pairing", "配对说明");
+        text(help, "1  电脑：打开手机连接，选择允许查看的任务和控制权限。\n2  电脑：复制配对信息，通过可信方式传到手机。\n3  手机：粘贴并核对电脑地址与证书指纹。", 16);
+        text(help, "手机与电脑须在同一网络或已配置的私有网络。配对信息含一次性密钥，请勿公开。", 14);
         if (pending() != null) {
             text(content, "仍有结果待核对的操作，不能替换连接或丢弃原请求。请返回查询。", 17);
             button(content, "返回原连接", true, () -> { incomingPair = null; showTasks(); });
@@ -737,7 +927,7 @@ public final class MainActivity extends Activity {
                         target.put("scope", result.optString("scope", "read_only"));
                         if (result.has("task_ids")) target.put("task_ids", result.get("task_ids"));
                         saved.remove("last_task"); saved.remove("last_task_pin"); saved.remove("selected_task"); resumeTaskId = null;
-                        tasks = new JSONArray(); task = null; selectedId = null; offline = true;
+                        tasks = new JSONArray(); task = null; selectedId = null; offline = true; lastReadAt = ""; expandedTaskId = null;
                         saved.put("connection", target);
                         if (persist()) { code.setText(""); showTasks(); refresh(); }
                     }));
@@ -765,10 +955,14 @@ public final class MainActivity extends Activity {
         LinearLayout navigation = new LinearLayout(this); navigation.setGravity(Gravity.CENTER_VERTICAL); header.addView(navigation);
         TextView title = text(navigation, "我的任务", 22); title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         title.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
+        LinearLayout details = column(); content.addView(details); disclosure(navigation, details, "tasks", "任务列表");
+        ink(text(details, "这里只显示本次配对获授权的任务。", 14), "muted");
+        connectionInfo = ink(text(details, "", 14), "muted"); updateConnectionInfo();
         Button more = button(navigation, "⋯", true, this::showDetails); more.setContentDescription("更多操作");
         spacing(more, 0, 8, 0, 8);
         font(more, 24); more.setLayoutParams(new LinearLayout.LayoutParams(dp(48), -2));
         renderOperation();
+        if (offline) showProgress("连接未更新 · 刷新后再操作");
         int visible = 0;
         for (int i = 0; i < tasks.length(); i++) {
             JSONObject item = tasks.optJSONObject(i);
@@ -777,6 +971,7 @@ public final class MainActivity extends Activity {
             String id = item.optString("id");
             String preview = item.has("message_preview") ? item.optString("message_preview") : item.optString("last_message");
             Button row = button(content, item.optString("title", "未命名任务") + "\n" + stateLabel(item.optString("state")) + "\n" + Protocol.preview(preview), true, () -> {
+                cancelScreenshot(); cancelPrivacy();
                 selectedId = id; task = item; showTask(); refresh();
             });
             row.setGravity(Gravity.START | Gravity.CENTER_VERTICAL); spacing(row, 12, 10, 12, 10);
@@ -793,7 +988,7 @@ public final class MainActivity extends Activity {
         }
         if (visible == 0) {
             text(content, offline ? "还没有读取到任务" : "暂无获授权的任务", 20).setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-            ink(text(content, offline ? "连接电脑后刷新，已有授权不会因此改变。" : "在电脑选择允许手机访问的任务，再生成配对信息。", 15), "muted");
+            ink(text(details, offline ? "连接电脑后刷新，已有授权不会因此改变。" : "在电脑选择允许手机访问的任务，再生成配对信息。", 15), "muted");
             button(content, "刷新列表", connection() != null, this::refresh);
         }
         spacing(composer, 0, 8, 0, 0);
@@ -842,6 +1037,7 @@ public final class MainActivity extends Activity {
                 if (timeline == null || loading) showTask(); else updateTask();
             }
             offline = false;
+            lastReadAt = OffsetDateTime.now().toString(); updateConnectionInfo();
             if (!statusPinned) status.setVisibility(View.GONE);
             updateTaskControls();
             if (id != null && originalView && originalCursor == null) readOriginal(null, true, false);
@@ -856,29 +1052,32 @@ public final class MainActivity extends Activity {
             case "briefing": return "正在整理简报"; case "reviewing": return "正在阶段审核";
             case "summarizing": return "正在整理交接"; case "verifying": return "正在核验交接";
             case "needs_reconcile": return "结果未知，需要核对"; case "blocked": return "需要处理";
-            case "completed": return "已标记完成"; default: return "状态：" + state;
+            case "completed": return "已标记完成"; default: return "未知状态";
         }
     }
 
     private void showTask() {
         if (!authorized() || task == null) return;
+        if (!task.optString("id").equals(expandedTaskId)) {
+            expandedDetails.remove("chat"); expandedDetails.remove("task-info"); expandedTaskId = task.optString("id");
+        }
         pairingView = false;
         clearPage();
         header.removeAllViews();
         LinearLayout navigation = new LinearLayout(this); navigation.setGravity(Gravity.CENTER_VERTICAL);
         header.addView(navigation);
-        Button back = button(navigation, "‹", true, () -> { selectedId = null; task = null; showTasks(); refresh(); });
+        Button back = button(navigation, "‹", true, () -> { cancelScreenshot(); cancelPrivacy(); selectedId = null; task = null; showTasks(); refresh(); });
         back.setContentDescription("返回任务列表"); font(back, 28);
         spacing(back, 0, 8, 0, 8);
         back.setLayoutParams(new LinearLayout.LayoutParams(dp(48), -2));
-        LinearLayout heading = column(); navigation.addView(heading, new LinearLayout.LayoutParams(0, -2, 1));
-        TextView title = text(heading, task.optString("title", "对话"), 16);
+        TextView title = text(navigation, task.optString("title", "对话"), 18);
         title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         title.setMaxLines(1); title.setEllipsize(TextUtils.TruncateAt.END);
+        title.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
         spacing(title, 0, 2, 0, 2);
-        taskSubtitle = ink(text(heading, "正在读取任务…", 12), "muted");
-        taskSubtitle.setMaxLines(1); taskSubtitle.setEllipsize(TextUtils.TruncateAt.END);
-        taskSubtitle.setTextIsSelectable(false); spacing(taskSubtitle, 0, 2, 0, 4);
+        LinearLayout details = column(); content.addView(details); disclosure(navigation, details, "chat", "当前任务");
+        taskSubtitle = ink(text(details, "正在读取任务…", 14), "muted");
+        connectionInfo = ink(text(details, "", 14), "muted"); updateConnectionInfo();
         Button more = button(navigation, "⋯", fullTask(task), this::showDetails);
         more.setContentDescription("更多操作与完整任务名称"); font(more, 24);
         spacing(more, 0, 8, 0, 8);
@@ -917,7 +1116,7 @@ public final class MainActivity extends Activity {
             try {
                 String value = Protocol.messageInput(draft(id));
                 JSONObject payload = new JSONObject().put("message", value);
-                command(task, "start", payload, "发送给电脑", "提交到任务：" + task.optString("title") + "\n" + value, draft(id));
+                command(task, "start", payload, "发送给电脑", value, draft(id));
             } catch (Exception ex) { error(ex); }
         });
         styleButton(send, true);
@@ -985,12 +1184,13 @@ public final class MainActivity extends Activity {
         requestsAction.setText("处理请求（" + requestCount + "）");
         String notice = requestCount > 0 ? " · 等待你处理请求" : "";
         if (waitingBrief) notice = " · 简报待核对，请点更多";
-        taskStatus.setText((task.optBoolean("archived") ? "任务已归档；请先在电脑取消归档，手机不能继续执行。\n" : "")
+        metadataText(taskStatus, (!control ? "手机仅查看 · " : !"workspace-write".equals(task.optString("mode")) ? "项目只读 · " : "")
+                + (task.optBoolean("archived") ? "任务已归档；请先在电脑取消归档，手机不能继续执行。\n" : "")
                 + (originalView && !originalError.isEmpty() ? "原文未更新：" + originalError + "\n" : "")
-                + (offline ? "连接未更新 · 草稿保留，不会自动重发" : stateLabel(task.optString("state"))) + notice
-                + (task.optString("error").isEmpty() ? "" : "\n" + task.optString("error")));
+                + (offline ? "连接未更新 · 暂不可操作" : Protocol.quiet(task.optString("state")) ? "等待继续" : stateLabel(task.optString("state"))) + notice
+                + (task.optString("error").isEmpty() ? "" : "\n任务报告错误，请在电脑核对详细原因。"));
         taskStatus.setVisibility(Protocol.taskNoticeNeeded(task.optString("state"), offline,
-                task.optBoolean("archived") || waitingBrief || requestCount > 0 || !task.optString("error").isEmpty()
+                !control || !"workspace-write".equals(task.optString("mode")) || task.optBoolean("archived") || waitingBrief || requestCount > 0 || !task.optString("error").isEmpty()
                         || originalView && !originalError.isEmpty()) ? View.VISIBLE : View.GONE);
         compactChat();
         controls();
@@ -998,7 +1198,7 @@ public final class MainActivity extends Activity {
 
     private static String timeLabel(String value) {
         try { return DateTimeFormatter.ofPattern("MM-dd HH:mm").withZone(ZoneId.systemDefault()).format(OffsetDateTime.parse(value).toInstant()); }
-        catch (Exception ignored) { return value == null ? "" : value; }
+        catch (Exception ignored) { return value == null || value.isEmpty() ? "" : "时间不可用"; }
     }
 
     private void updateLatestButton() {
@@ -1010,7 +1210,7 @@ public final class MainActivity extends Activity {
         // Keep the composer and its actions reachable with a keyboard and large system text.
         // Status remains tappable for its full text; reading shortcuts return when typing ends.
         taskStatus.setMaxLines(keyboardOpen ? 1 : 2);
-        status.setMaxLines(keyboardOpen ? 1 : 2);
+        status.setMaxLines(1);
         operation.setMaxLines(keyboardOpen ? 1 : 2);
         message.setMinLines(keyboardOpen ? 1 : 2);
         message.setMaxLines(keyboardOpen ? 2 : 4);
@@ -1100,11 +1300,11 @@ public final class MainActivity extends Activity {
     private void chatMessage(String role, String value, String at, String notice, boolean verbatim) {
         boolean mine = "user".equals(role);
         LinearLayout bubble = column();
-        LinearLayout.LayoutParams layout = new LinearLayout.LayoutParams(mine ? -2 : -1, -2);
+        LinearLayout.LayoutParams layout = new LinearLayout.LayoutParams(-2, -2);
         layout.gravity = mine ? Gravity.END : Gravity.START;
-        layout.setMargins(mine ? dp(24) : 0, 0, 0, dp(22));
-        spacing(bubble, mine ? 14 : 0, mine ? 8 : 0, mine ? 14 : 0, mine ? 8 : 0);
-        if (mine) background(bubble, "selection", 16);
+        layout.setMargins(mine ? dp(24) : 0, 0, mine ? 0 : dp(24), dp(16));
+        spacing(bubble, 14, 8, 14, 8);
+        background(bubble, mine ? "selection" : "surface", 14);
         timeline.addView(bubble, layout);
         if (!mine) {
             LinearLayout caption = new LinearLayout(this); caption.setGravity(Gravity.CENTER_VERTICAL);
@@ -1123,7 +1323,7 @@ public final class MainActivity extends Activity {
         }
         copyMenu(bubble, value, "完整消息");
         if (!notice.isEmpty()) ink(text(bubble, notice, 13), "muted");
-        if (verbatim) { TextView body = text(bubble, value, 17); body.setLineSpacing(dp(5), 1); }
+        if (verbatim) { TextView body = plainText(bubble, value, 17); body.setLineSpacing(dp(5), 1); }
         else messageBody(bubble, value);
     }
 
@@ -1181,6 +1381,7 @@ public final class MainActivity extends Activity {
     }
 
     private void readOriginal(String cursor, boolean silent, boolean changePage) {
+        if (changePage) cancelPrivacy();
         if (!fullTask(task)) {
             if (!silent) showStatus("完整任务尚未读取，暂不能查看原始对话。");
             return;
@@ -1193,7 +1394,7 @@ public final class MainActivity extends Activity {
             try { return api(target, epoch).request("GET", Protocol.conversationPath(id, cursor), null); }
             catch (HttpApi.ApiError ex) {
                 if (!Protocol.conversationPageFailure(ex.status, ex.code)) throw ex;
-                return new JSONObject().put("conversation_error", ex.getMessage());
+                return new JSONObject().put("conversation_error", safeError(ex));
             }
         }, page -> {
             if (!originalView || !id.equals(selectedId)) return;
@@ -1220,7 +1421,7 @@ public final class MainActivity extends Activity {
             boolean follow = originalPage == null || !scroll.canScrollVertically(1);
             int position = scroll.getScrollY();
             originalPage = page; originalCursor = cursor; originalError = "";
-            originalInfo = "原始对话 · 来源 " + page.getString("thread_id")
+            originalInfo = "原始对话 · 来源标识：" + page.getString("thread_id")
                     + "\n读取时间：" + timeLabel(page.optString("checked_at")) + " · 宿主状态：" + page.optString("status", "unknown")
                     + "\n第 " + page.optInt("page", 1) + " / " + page.optInt("pages", 1) + " 页 · 非文字记录（含附件、工具）" + page.optInt("non_text_items") + " 项未展开"
                     + "\n" + page.optString("notice")
@@ -1255,6 +1456,50 @@ public final class MainActivity extends Activity {
         showPanel("处理本次请求", box);
     }
 
+    private void cancelScreenshot() { if (screenshots != null) screenshots.cancel(); }
+
+    private String screenshotPageKey() {
+        if (!authorized() || storageFailed || pairingView || incomingPair != null || connection() == null
+                || connection().optBoolean("needs_pairing") || root == null) return null;
+        String connected = connection().optString("certificate_sha256") + ":" + connection().optString("device_id");
+        if (selectedId == null) return connected + ":tasks";
+        if (task == null || !selectedId.equals(task.optString("id")) || !conversationAvailable(task)
+                || originalView && originalPage == null) return null;
+        return connected + ":task:" + selectedId + ":" + originalView + ":" + (originalCursor == null ? "latest" : originalCursor);
+    }
+
+    private boolean screenshotEligible() {
+        return screenshotPageKey() != null && dialogs.isEmpty() && !authPending && privacyRequest == null;
+    }
+
+    private void requestScreenshot() {
+        if (!authorized()) return;
+        if (screenshots == null || !screenshotEligible() || busy || refreshing) { showStatus("当前页面暂不能导出，请完成验证或读取后再试。"); return; }
+        final String page = screenshotPageKey();
+        LinearLayout box = column(); spacing(box, 20, 8, 20, 8);
+        text(box, "截图可能包含任务、对话、路径、IP 等信息。保存后可能被转发、云备份或被其他 App 读取，本 App 无法撤回。", 16);
+        text(box, "本人对自行保存、传播和保管行为依法承担相应责任；这不免除开发者的法定责任。", 15);
+        ink(text(box, "仅导出当前任务列表或聊天页一次；本次同意不会被记住，之后仍须通过系统身份验证。", 14), "muted");
+        CheckBox consent = new CheckBox(this); consent.setText("我已明确风险并继续"); consent.setChecked(false);
+        font(consent, 16); ink(consent, "ink"); consent.setMinHeight(dp(48)); box.addView(consent);
+        ScrollView viewport = new ScrollView(this); viewport.addView(box);
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("截图风险说明").setView(viewport)
+                .setNegativeButton("取消", null).setPositiveButton("继续验证", null).create();
+        showDialog(dialog, false);
+        Button proceed = dialog.getButton(AlertDialog.BUTTON_POSITIVE); proceed.setEnabled(false);
+        consent.setOnCheckedChangeListener((view, checked) -> proceed.setEnabled(checked && authorized()));
+        proceed.setOnClickListener(view -> {
+            if (!consent.isChecked() || !authorized()) return;
+            if (!page.equals(screenshotPageKey())) { dialog.dismiss(); showStatus("页面已变化，本次未保存截图，请重新发起。"); return; }
+            dialog.dismiss();
+            handler.post(() -> {
+                if (!authorized()) return;
+                if (!page.equals(screenshotPageKey())) { showStatus("页面已变化，本次未保存截图，请重新发起。"); return; }
+                if (privacyRequest == null && !authPending) screenshots.request();
+            });
+        });
+    }
+
     private void showDetails() {
         if (!authorized() || !dialogs.isEmpty()) return;
         if (task != null && !fullTask(task)) { showStatus("完整任务尚未读取，暂不能打开任务操作。"); return; }
@@ -1271,6 +1516,7 @@ public final class MainActivity extends Activity {
             menuSection(box, "对话");
             button(box, "刷新当前对话", true, () -> { dismissDialogs(); refresh(); });
             button(box, originalView ? "查看管理记录" : "查看原始对话", true, () -> {
+                cancelScreenshot(); cancelPrivacy();
                 dismissDialogs(); generation++; originalChoice = true; originalView = !originalView;
                 timelineSignature = ""; originalPage = null; originalCursor = null; originalError = "";
                 updateTask();
@@ -1293,13 +1539,22 @@ public final class MainActivity extends Activity {
                 button(box, "处理请求（" + requests.length() + "）", true, () -> { dismissDialogs(); showRequests(); });
             boolean waitingBrief = !"direct".equals(task.optString("connection_mode"))
                     && task.optBoolean("brief_required") && candidate(task.optJSONObject("brief"));
-            button(box, waitingBrief ? "核对简报与任务详情" : "任务详情与操作", true, () -> { dismissDialogs(); showTaskDetails(); });
+            button(box, waitingBrief ? "核对简报与任务详情" : "任务详情与操作", true, () -> { dismissDialogs(); handler.post(this::showTaskDetails); });
         }
         if (pending() != null) button(box, "查看待核对操作", true, () -> { dismissDialogs(); showOperationDetails(); });
         menuSection(box, "设置");
         button(box, "外观与偏好", !refreshing, () -> {
             if (dialogs.size() != 1 || busy || refreshing) return;
-            dismissDialogs(); showAppearance();
+            dismissDialogs(); handler.post(this::showAppearance);
+        });
+        button(box, "验证并保存截图", screenshotPageKey() != null && !refreshing, () -> {
+            final String page = screenshotPageKey();
+            dismissDialogs();
+            handler.post(() -> {
+                if (!authorized()) return;
+                if (page == null || !page.equals(screenshotPageKey())) { showStatus("页面已变化，本次未保存截图，请重新发起。"); return; }
+                requestScreenshot();
+            });
         });
         showPanel("更多", box);
     }
@@ -1309,22 +1564,25 @@ public final class MainActivity extends Activity {
         if (!fullTask(task)) { showStatus("完整任务尚未读取，暂不能打开任务操作。"); return; }
         final JSONObject displayed = task;
         LinearLayout box = column(); box.setPadding(dp(16), dp(8), dp(16), dp(8));
-        text(box, displayed.optString("title", "对话"), 20).setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        LinearLayout heading = new LinearLayout(this); heading.setGravity(Gravity.CENTER_VERTICAL); box.addView(heading);
+        TextView title = text(heading, displayed.optString("title", "对话"), 20); title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        title.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
+        LinearLayout details = column(); box.addView(details); disclosure(heading, details, "task-info", "任务资料");
         if (originalView) {
-            text(box, originalInfo.isEmpty() ? "原始对话尚未读取。" : originalInfo, 14);
+            text(details, originalInfo.isEmpty() ? "原始对话尚未读取。" : originalInfo, 14);
             JSONArray entries = originalPage == null ? null : originalPage.optJSONArray("entries");
             if (entries != null) for (int i = 0; i < entries.length(); i++) {
                 JSONObject entry = entries.optJSONObject(i);
                 if (entry == null) continue;
-                text(box, "消息 " + (i + 1) + " · " + entry.optString("role") + " · 第 " + entry.optInt("part") + " / " + entry.optInt("parts")
+                text(details, "消息 " + (i + 1) + " · " + entry.optString("role") + " · 第 " + entry.optInt("part") + " / " + entry.optInt("parts")
                         + " 段 · " + entry.optString("turn_status", "unknown") + (entry.isNull("phase") ? "" : " · " + entry.optString("phase")), 13);
             }
         }
         text(box, stateLabel(displayed.optString("state")) + " · " + ("workspace-write".equals(displayed.optString("mode")) ? "项目可写" : "项目只读")
                 + " · " + (controlAllowed(displayed) ? "手机可控制" : "手机仅查看"), 14);
-        text(box, "长按消息边缘可复制完整原文；正文可选中文字复制。代码长行可左右滑动，标题旁可复制代码。无障碍操作中也提供完整复制。", 14);
-        text(box, "目标\n" + displayed.optString("goal", "待整理简报"), 17);
-        text(box, "累计记录 Token：" + pretty(displayed.opt("usage")) + "\n软预算：" + displayed.optLong("max_tokens")
+        text(details, "长按消息边缘可复制完整原文；正文可选中文字复制。代码长行可左右滑动，标题旁可复制代码。无障碍操作中也提供完整复制。", 14);
+        text(details, "目标\n" + displayed.optString("goal", "待整理简报"), 17);
+        text(details, "累计记录 Token：" + pretty(displayed.opt("usage")) + "\n软预算：" + displayed.optLong("max_tokens")
                 + " Token / " + displayed.optDouble("max_minutes", 0) + " 分钟（0 为不限；不是当前上下文占用）", 14);
         text(box, "执行时可先写草稿。要追加指令，请先暂停并核对结果。手机不会扩大电脑任务权限。", 15);
         boolean mutable = pending() == null && !displayed.optBoolean("archived") && !offline && controlAllowed(displayed);
@@ -1349,10 +1607,12 @@ public final class MainActivity extends Activity {
             JSONObject params = request.optJSONObject("params");
             if (params == null) params = new JSONObject();
             String method = request.optString("method");
-            text(parent, "请求 " + pretty(request.opt("id")) + "\n" + pretty(params), 16);
+            text(parent, "请求编号：" + pretty(request.opt("id")) + "\n" + pretty(params), 16);
             if ("item/commandExecution/requestApproval".equals(method) || "item/fileChange/requestApproval".equals(method)) {
+                boolean secret = !pretty(params).equals(privateDetail(pretty(params)));
+                if (secret) text(parent, "请求包含凭据，手机无法完整展示审批依据。请在电脑核对；这里仍可拒绝。", 16);
                 if (!request.optBoolean("can_approve")) text(parent, "动作证据不完整或不支持，只能拒绝。请在电脑核对。", 17);
-                button(parent, "仅允许本次动作", mutable && request.optBoolean("can_approve"), () -> answerApproval(displayed, request, true));
+                button(parent, "仅允许本次动作", mutable && request.optBoolean("can_approve") && !secret, () -> answerApproval(displayed, request, true));
                 button(parent, "拒绝本次动作", mutable, () -> answerApproval(displayed, request, false));
             } else if ("item/tool/requestUserInput".equals(method)) {
                 final JSONObject questions = params;
@@ -1364,9 +1624,11 @@ public final class MainActivity extends Activity {
 
     private void answerApproval(JSONObject displayed, JSONObject request, boolean allow) {
         try {
+            String params = pretty(request.opt("params"));
+            if (allow && !params.equals(privateDetail(params))) { showStatus("审批依据包含凭据，请在电脑核对。手机不会批准此请求。"); return; }
             JSONObject payload = new JSONObject().put("pending_request_id", request.get("id"))
                     .put("answer", new JSONObject().put("decision", allow ? "accept" : "decline"));
-            command(displayed, "answer", payload, allow ? "允许本次动作" : "拒绝本次动作", pretty(request.opt("params")) + "\n仅对当前请求作出一次决定。", null);
+            command(displayed, "answer", payload, allow ? "允许本次动作" : "拒绝本次动作", allow ? params + "\n仅对当前请求作出一次决定。" : "拒绝当前请求，不执行该动作。", null);
         } catch (Exception ex) { error(ex); }
     }
 
@@ -1440,6 +1702,10 @@ public final class MainActivity extends Activity {
     private void adoptBrief(JSONObject displayed, JSONObject brief) {
         JSONObject report = brief.optJSONObject("report");
         if (report == null) return;
+        String editable = report.optString("goal") + "\n" + pretty(report.opt("acceptance"));
+        if (!editable.equals(privateDetail(editable)) || !editable.equals(SensitiveText.masked(editable))) {
+            showStatus("简报编辑资料含敏感信息，请在电脑核对并编辑。手机不会将遮罩文字作为目标提交。"); return;
+        }
         LinearLayout box = column(); box.setPadding(dp(16), dp(8), dp(16), dp(8));
         text(box, "核对并编辑目标和验收标准。原始授权范围保持不变。", 17);
         EditText goal = input(box, "本轮目标", report.optString("goal"), true);
@@ -1471,7 +1737,7 @@ public final class MainActivity extends Activity {
         if (!fullTask(displayed)) { showStatus("完整任务尚未读取，暂不能发送或操作。请等待详情加载完成。"); return; }
         if (!controlAllowed(displayed)) { showStatus("此手机没有当前任务的控制权限，请在电脑重新授权配对。"); return; }
         if (pending() != null || busy || storageFailed) { showStatus("先查询原操作结果，不能另发一次。"); return; }
-        confirm(title, description, () -> {
+        confirm(title, description, "start".equals(name), () -> {
             try {
                 JSONObject body = new JSONObject().put("request_id", UUID.randomUUID().toString()).put("task_id", displayed.getString("id"))
                         .put("command", name).put("expected_etag", displayed.getString("etag")).put("payload", payload);
@@ -1574,7 +1840,7 @@ public final class MainActivity extends Activity {
         String state = receipt == null ? "结果尚未确认" : receipt.optString("state");
         String failure = pendingFailure();
         String target = pendingTaskLabel(current) + "\n";
-        operation.setText(target + (failure.isEmpty() ? (receipt == null || "unknown".equals(state) || current.optBoolean("lookup_unknown")
+        metadataText(operation, target + (failure.isEmpty() ? (receipt == null || "unknown".equals(state) || current.optBoolean("lookup_unknown")
                 ? "结果尚未确定，点此核对；不会自动重发。" : "请求已提交，正在核对结果；点此查看。") : failure + "\n点此处理。"));
     }
 
@@ -1586,8 +1852,8 @@ public final class MainActivity extends Activity {
         LinearLayout box = column(); box.setPadding(dp(16), dp(8), dp(16), dp(8));
         text(box, "任务：" + pendingTaskLabel(current) + "\n本次操作：" + (body == null ? "记录不完整" : body.optString("command")) + " · " + state
                 + "\n请求编号：" + (body == null ? "未知" : body.optString("request_id")), 16);
-        text(box, "操作回执\n" + (current.optBoolean("rejected") ? current.optString("rejection") : receipt == null
-                ? "请求已在本机密封保存。失去连接或退出后只查询原请求，不自动重发。" : pretty(receipt.opt("error"))), 15);
+        text(box, "操作回执\n" + (receipt == null && !current.optBoolean("rejected")
+                ? "请求已在本机密封保存。失去连接或退出后只查询原请求，不自动重发。" : "回执已保留；详细原因请在电脑核对，手机不展示原始错误内容。"), 15);
         button(box, "只查询这个请求的结果", !current.optBoolean("rejected") && connection() != null && !connection().optBoolean("needs_pairing"),
                 () -> { dismissDialogs(); queryOperation(); });
         boolean terminal = current.optBoolean("rejected") || receipt != null && Protocol.terminalReceipt(receipt.optString("state"));

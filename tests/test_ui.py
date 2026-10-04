@@ -38,6 +38,11 @@ def install_quiet_toplevels(testcase):
     testcase.addCleanup(patcher.stop)
 
 
+def displayed_conversation(app):
+    return "\n".join([widget.get("1.0", "end-1c") for widget in app.latest_frame.message_widgets]
+                     + [label.cget("text") for label in app.latest_frame.notice_widgets])
+
+
 class FakeManager:
     def __init__(self, state_dir=None):
         self.calls = []
@@ -326,6 +331,30 @@ class TkSmokeTests(unittest.TestCase):
         self.assertFalse(dialog.winfo_exists())
         self.assertEqual(self.app.preferences, chosen)
         self.assertEqual(self.app.status.get(), "外观与偏好已保存。")
+
+    def test_primary_controls_share_scaled_rounded_native_styles(self):
+        def elements(layout):
+            found = []
+            for name, options in layout:
+                found.append(name)
+                found.extend(elements(options.get("children", [])))
+            return found
+
+        self.assertLessEqual(10, self.root._context_relay_corner_radius)
+        self.assertLessEqual(self.root._context_relay_corner_radius, 12)
+        for name, background in (("TButton", "ContextRelay.Secondary.background"),
+                                 ("Primary.TButton", "ContextRelay.Primary.background"),
+                                 ("Rounded.TMenubutton", "ContextRelay.Secondary.background"),
+                                 ("TEntry", "ContextRelay.Entry.background"),
+                                 ("TCombobox", "ContextRelay.Entry.background")):
+            self.assertIn(background, elements(self.app.style.layout(name)), name)
+        self.assertEqual(self.app.new_button.cget("style"), "Sidebar.Primary.TButton")
+        self.assertEqual(self.app.import_button.cget("style"), "Sidebar.TButton")
+        self.assertEqual(self.app.search_entry.cget("style"), "Sidebar.TEntry")
+        self.assertEqual(self.app.filter_choice.cget("style"), "Sidebar.TCombobox")
+        self.assertEqual(self.app.details_button.cget("style"), "Secondary.TButton")
+        self.assertEqual(self.app.more_button.cget("style"), "Rounded.TMenubutton")
+        self.assertEqual(self.app.composer_frame.cget("style"), "RoundedEntry.TFrame")
 
     def test_global_backup_does_not_need_selected_task_and_reports_counts(self):
         self.app.search.set("no match")
@@ -848,19 +877,19 @@ class TkSmokeTests(unittest.TestCase):
             {"role": "assistant", "text": "可见回复", "status": "completed", "purpose": "work",
              "truncated": True},
         ], messages_truncated=False)
-        self.wait_for(lambda: "可见回复" in self.app.latest_text.get("1.0", "end-1c"))
-        text = self.app.latest_text.get("1.0", "end-1c")
+        self.wait_for(lambda: "可见回复" in displayed_conversation(self.app))
+        text = displayed_conversation(self.app)
         self.assertIn("可见用户原话", text)
         self.assertIn("可见回复", text)
         self.assertIn("较早的本机对话已截短", text)
         self.assertNotIn("内部分析", text)
         self.assertNotIn("尚未确认的输入", text)
-        self.app.latest_text.configure(state="normal")
-        self.app.latest_text.tag_add("sel", "1.0", "1.2")
-        self.app.latest_text.configure(state="disabled")
-        selected = tuple(str(value) for value in self.app.latest_text.tag_ranges("sel"))
+        selected_widget = self.app.latest_frame.message_widgets[0]
+        selected_widget.tag_add("sel", "1.0", "1.2")
+        selected = tuple(str(value) for value in selected_widget.tag_ranges("sel"))
         self.app._render_task()
-        self.assertEqual(tuple(str(value) for value in self.app.latest_text.tag_ranges("sel")), selected)
+        self.assertIs(self.app.latest_frame.message_widgets[0], selected_widget)
+        self.assertEqual(tuple(str(value) for value in selected_widget.tag_ranges("sel")), selected)
 
     def test_direct_chat_late_result_is_cached_for_its_task_and_never_crossed(self):
         self.fake.delay = 0.2
@@ -870,7 +899,7 @@ class TkSmokeTests(unittest.TestCase):
         self.wait_for(lambda: ("task-other", None) in self.fake.chat_reads)
         self.select_task("task-1")
         self.wait_for(lambda: ("task-1", None) in self.fake.chat_reads and not self.app.busy)
-        text = self.app.latest_text.get("1.0", "end-1c")
+        text = displayed_conversation(self.app)
         self.assertIn("原文-task-1", text)
         self.assertIn("回复-task-1", text)
         self.assertNotIn("原文-task-other", text)
@@ -895,12 +924,12 @@ class TkSmokeTests(unittest.TestCase):
     def test_manual_native_read_replaces_no_summary_and_first_failure_is_visible(self):
         self.app.open_chat()
         self.wait_for(lambda: not self.app.busy and self.fake.chat_reads)
-        self.assertIn("原文-task-1", self.app.latest_text.get("1.0", "end-1c"))
+        self.assertIn("原文-task-1", displayed_conversation(self.app))
         self.fake.chat_error = "宿主暂不可读"
         self.app.chat_cache.pop("task-1", None)
         self.app.open_chat()
         self.wait_for(lambda: not self.app.busy and self.app.chat_cache.get("task-1", {}).get("error"))
-        text = self.app.latest_text.get("1.0", "end-1c")
+        text = displayed_conversation(self.app)
         self.assertIn("原始对话读取失败：宿主暂不可读", text)
         self.assertIn("未用任务摘要代替", text)
         self.assertNotIn("准备就绪", text)
@@ -1286,7 +1315,7 @@ class TkLayoutTests(unittest.TestCase):
                     self.assertIn("已达预算", app.budget_details.get())
                     widgets = {"new": app.new_button, "import": app.import_button, "more": app.more_button,
                                "tree": app.task_tree, "details": app.details_button,
-                               "latest": app.latest_text, "message": app.message_text,
+                               "latest": app.latest_frame.canvas, "message": app.message_text,
                                "primary": app.buttons["start"]}
                     if inspection:
                         widgets["recovery_banner"] = app.recovery_banner

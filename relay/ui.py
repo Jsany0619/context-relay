@@ -21,16 +21,18 @@ from .preferences import DEFAULTS, load_preferences, save_preferences
 THEMES = {
     "blue": {"bg": "#f7f8fa", "surface": "#ffffff", "ink": "#17212b",
              "muted": "#606d7d", "accent": "#2457d6", "border": "#dce2e9",
-             "select": "#e4ebfb", "control": "#edf0f4", "control_active": "#e3e7ed"},
+             "select": "#e4ebfb", "control": "#edf0f4", "control_active": "#e3e7ed",
+             "bubble_user": "#e7efff", "bubble_assistant": "#f1f4f8"},
     "mint": {"bg": "#f7f9f8", "surface": "#ffffff", "ink": "#202927",
              "muted": "#626e6a", "accent": "#226356", "border": "#dbe3df",
-             "select": "#e8eeea", "control": "#eef2f0", "control_active": "#e2e9e5"},
+             "select": "#e8eeea", "control": "#eef2f0", "control_active": "#e2e9e5",
+             "bubble_user": "#d8eee5", "bubble_assistant": "#f1f4f2"},
 }
 WARNING_BG = "#fff6e8"
 WARNING = "#8a4b08"
 
 
-def _paint_rounded(image, fill, border):
+def _paint_rounded(image, fill, border, radius):
     def rgb(value):
         return tuple(int(value[index:index + 2], 16) for index in (1, 3, 5))
 
@@ -40,12 +42,12 @@ def _paint_rounded(image, fill, border):
         row = bytearray((0,))
         for x in range(size):
             color = None
-            for inset, value, radius in ((0, border, 4), (1, fill, 3)):
+            for inset, value, corner in ((0, border, radius), (1, fill, radius - 1)):
                 low, high = inset, size - 1 - inset
                 if low <= x <= high and low <= y <= high:
-                    dx = max(low + radius - x, 0, x - (high - radius))
-                    dy = max(low + radius - y, 0, y - (high - radius))
-                    if dx * dx + dy * dy <= radius * radius:
+                    dx = max(low + corner - x, 0, x - (high - corner))
+                    dy = max(low + corner - y, 0, y - (high - corner))
+                    if dx * dx + dy * dy <= corner * corner:
                         color = value
             row.extend((*rgb(color), 255) if color else (0, 0, 0, 0))
         rows.append(bytes(row))
@@ -59,9 +61,13 @@ def _paint_rounded(image, fill, border):
 
 
 def _rounded_elements(root, style, colors):
+    scale = float(root.tk.call("tk", "scaling")) / (96 / 72)
+    radius = max(10, min(12, round(10 * scale)))
+    root._context_relay_corner_radius = radius
     images = getattr(root, "_context_relay_theme_images", None)
     if images is None:
-        images = {name: tk.PhotoImage(master=root, width=12, height=12) for name in (
+        size = radius * 2 + 4
+        images = {name: tk.PhotoImage(master=root, width=size, height=size) for name in (
             "primary", "primary_active", "primary_pressed", "primary_disabled", "primary_focus",
             "secondary", "secondary_active", "secondary_pressed", "secondary_disabled", "secondary_focus",
             "entry", "entry_focus", "entry_disabled")}
@@ -70,15 +76,15 @@ def _rounded_elements(root, style, colors):
                              ("disabled", images["primary_disabled"]),
                              ("pressed", images["primary_pressed"]), ("active", images["primary_active"]),
                              ("focus", images["primary_focus"]),
-                             border=4, sticky="nsew")
+                             border=radius + 1, padding=(4, 2), sticky="nsew")
         style.element_create("ContextRelay.Entry.background", "image", images["entry"],
                              ("disabled", images["entry_disabled"]), ("focus", images["entry_focus"]),
-                             border=4, sticky="nsew")
+                             border=radius + 1, padding=(4, 2), sticky="nsew")
         style.element_create("ContextRelay.Secondary.background", "image", images["secondary"],
                              ("disabled", images["secondary_disabled"]),
                              ("pressed", images["secondary_pressed"]),
                              ("active", images["secondary_active"]), ("focus", images["secondary_focus"]),
-                             border=4, sticky="nsew")
+                             border=radius + 1, padding=(4, 2), sticky="nsew")
     for name, fill, border in (
             ("primary", colors["accent"], colors["accent"]),
             ("primary_active", "#1f4bbb" if colors is THEMES["blue"] else "#106b5c", colors["accent"]),
@@ -93,22 +99,28 @@ def _rounded_elements(root, style, colors):
             ("entry", colors["surface"], colors["border"]),
             ("entry_focus", colors["surface"], colors["accent"]),
             ("entry_disabled", colors["bg"], colors["border"])):
-        _paint_rounded(images[name], fill, border)
-    style.layout("Primary.TButton", [
-        ("ContextRelay.Primary.background", {"sticky": "nswe"}),
-        ("Button.padding", {"sticky": "nswe", "children": [("Button.label", {"sticky": "nswe"})]})])
-    style.layout("Secondary.TButton", [
-        ("ContextRelay.Secondary.background", {"sticky": "nswe"}),
-        ("Button.padding", {"sticky": "nswe", "children": [("Button.label", {"sticky": "nswe"})]})])
-    style.layout("Rounded.TMenubutton", [
-        ("ContextRelay.Secondary.background", {"sticky": "nswe"}),
+        _paint_rounded(images[name], fill, border, radius)
+    button_content = [("Button.padding", {"sticky": "nswe", "children": [
+        ("Button.label", {"sticky": "nswe"})]})]
+    for name, element in (("TButton", "ContextRelay.Secondary.background"),
+                          ("Secondary.TButton", "ContextRelay.Secondary.background"),
+                          ("Primary.TButton", "ContextRelay.Primary.background")):
+        style.layout(name, [(element, {"sticky": "nswe", "children": button_content})])
+    menu_layout = [("ContextRelay.Secondary.background", {"sticky": "nswe", "children": [
         ("Menubutton.focus", {"sticky": "nswe", "children": [
             ("Menubutton.indicator", {"side": "right"}),
             ("Menubutton.padding", {"sticky": "we", "children": [
-                ("Menubutton.label", {"side": "left"})]})]})])
+                ("Menubutton.label", {"side": "left"})]})]})]})]
+    style.layout("TMenubutton", menu_layout)
+    style.layout("Rounded.TMenubutton", menu_layout)
     style.layout("TEntry", [("ContextRelay.Entry.background", {
         "sticky": "nswe", "children": [("Entry.padding", {
             "sticky": "nswe", "children": [("Entry.textarea", {"sticky": "nswe"})]})]})])
+    style.layout("TCombobox", [("ContextRelay.Entry.background", {
+        "sticky": "nswe", "children": [
+            ("Combobox.downarrow", {"side": "right", "sticky": "ns"}),
+            ("Combobox.padding", {"sticky": "nswe", "children": [
+                ("Combobox.textarea", {"sticky": "nswe"})]})]})])
     style.layout("RoundedEntry.TFrame", [("ContextRelay.Entry.background", {
         "sticky": "nswe"})])
 
@@ -195,14 +207,19 @@ def apply_theme(root, preferences=None):
     style.configure("Primary.TButton", background=colors["surface"], foreground=colors["surface"],
                     bordercolor=colors["accent"], padding=primary_pad, relief="flat")
     style.map("Primary.TButton", foreground=[("disabled", "#f5f7fb")])
+    style.configure("Sidebar.TButton", background=colors["bg"])
+    style.configure("Sidebar.Primary.TButton", background=colors["bg"])
     style.configure("TMenubutton", background=colors["control"], foreground=colors["ink"],
                     bordercolor=colors["border"], padding=button_pad)
     style.configure("Rounded.TMenubutton", background=colors["control"], foreground=colors["ink"],
                     bordercolor=colors["border"], padding=button_pad)
+    style.configure("Sidebar.Rounded.TMenubutton", background=colors["bg"])
     style.configure("TEntry", fieldbackground=colors["surface"], foreground=colors["ink"],
-                    bordercolor=colors["border"], padding=4 if compact else 6)
+                    background=colors["surface"], bordercolor=colors["border"], padding=4 if compact else 6)
+    style.configure("Sidebar.TEntry", background=colors["bg"])
     style.configure("TCombobox", fieldbackground=colors["surface"], foreground=colors["ink"],
-                    bordercolor=colors["border"], padding=4 if compact else 5)
+                    background=colors["surface"], bordercolor=colors["border"], padding=4 if compact else 5)
+    style.configure("Sidebar.TCombobox", background=colors["bg"])
     style.map("TCombobox", fieldbackground=[("readonly", colors["surface"])],
               selectbackground=[("readonly", colors["surface"])],
               selectforeground=[("readonly", colors["ink"])])
@@ -1267,14 +1284,15 @@ class RelayApp:
         ttk.Label(left, text="我的任务", style="Title.TLabel").pack(anchor="w", pady=(0, 12))
         create_row = ttk.Frame(left, style="Sidebar.TFrame")
         create_row.pack(fill="x", pady=(0, 12))
-        self.new_button = ttk.Button(create_row, text="新建", style="Primary.TButton",
+        self.new_button = ttk.Button(create_row, text="新建", style="Sidebar.Primary.TButton",
                                      command=lambda: NewTaskDialog(self.root, self.submit))
         self.new_button.pack(side="left", fill="x", expand=True)
-        self.import_button = ttk.Button(create_row, text="导入", command=self._open_import)
+        self.import_button = ttk.Button(create_row, text="导入", style="Sidebar.TButton",
+                                        command=self._open_import)
         self.import_button.pack(side="left", padx=(8, 0))
         find_row = ttk.Frame(left, style="Sidebar.TFrame")
         find_row.pack(fill="x", pady=(0, 8))
-        self.search_entry = ttk.Entry(find_row, textvariable=self.search)
+        self.search_entry = ttk.Entry(find_row, textvariable=self.search, style="Sidebar.TEntry")
         self.search_entry.pack(side="left", fill="x", expand=True)
         self.search_placeholder = ttk.Label(find_row, text="搜索任务", style="Muted.TLabel", cursor="xterm")
         self.search_placeholder.place(in_=self.search_entry, x=9, rely=.5, anchor="w")
@@ -1282,7 +1300,7 @@ class RelayApp:
         self.search_entry.bind("<FocusIn>", lambda _event: self._sync_search_placeholder())
         self.search_entry.bind("<FocusOut>", lambda _event: self._sync_search_placeholder())
         self.filter_choice = ttk.Combobox(find_row, width=9, textvariable=self.state_filter,
-                                          values=FILTERS, state="readonly")
+                                          values=FILTERS, state="readonly", style="Sidebar.TCombobox")
         self.filter_choice.pack(side="left", padx=(7, 0))
         self.attention_button = ttk.Button(left, command=self._show_attention)
 
@@ -1294,7 +1312,7 @@ class RelayApp:
             self._action_proxies, text="任务设置", command=lambda: self._action("update_settings"))
         self.buttons["reopen_task"] = ttk.Button(
             self._action_proxies, text="重新打开", command=lambda: self._action("reopen_task"))
-        self.settings_button = ttk.Menubutton(left, text="设置", style="Rounded.TMenubutton")
+        self.settings_button = ttk.Menubutton(left, text="设置", style="Sidebar.Rounded.TMenubutton")
         self.settings_menu = tk.Menu(self.settings_button, tearoff=False)
         self.settings_button.configure(menu=self.settings_menu)
         self.settings_entries = {}
@@ -1329,7 +1347,8 @@ class RelayApp:
         ttk.Label(title_area, textvariable=self.task_subtitle, style="Surface.Muted.TLabel").pack(anchor="w", pady=(2, 0))
         self.more_button = ttk.Menubutton(task_header, width=3, text="⋯", style="Rounded.TMenubutton")
         self.more_button.pack(side="right", padx=(8, 0))
-        self.details_button = ttk.Button(task_header, width=4, text="详情", command=self._toggle_details)
+        self.details_button = ttk.Button(task_header, width=4, text="详情", style="Secondary.TButton",
+                                         command=self._toggle_details)
         self.details_button.pack(side="right")
         self.more_menu = tk.Menu(self.more_button, tearoff=False)
         self.more_button.configure(menu=self.more_menu)
@@ -1398,7 +1417,6 @@ class RelayApp:
         self.latest_frame = ConversationView(right)
         self.latest_frame.configure_tags(colors)
         self.latest_frame.pack(fill="both", expand=True)
-        self.latest_text = self.latest_frame.text
 
         for label, method in (("预备快照", "prepare_snapshot"), ("交接", "handoff"),
                               ("标记完成", "finish"), ("导出", "export_task")):

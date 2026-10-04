@@ -236,7 +236,7 @@ class AssessmentUiTests(unittest.TestCase):
                                  work_turns=0, brief_required=True,
                                  error="chat evidence is not present in the bound source snapshot")
         self.wait_for(lambda: self.app.tasks["task-1"].get("last_message_kind") == "brief")
-        displayed = self.app.latest_text.get("1.0", "end-1c")
+        displayed = base_ui.displayed_conversation(self.app)
         self.assertNotIn(raw, displayed)
         self.assertIn("未通过", displayed)
         self.assertIn("聊天引用", displayed)
@@ -278,7 +278,7 @@ class AssessmentUiTests(unittest.TestCase):
         self.fake.tasks[0].update(brief=brief_record(), last_message=json.dumps(brief_record()["report"]),
                                  last_message_kind="brief", brief_required=True, work_turns=0)
         self.wait_for(lambda: bool(self.app.tasks["task-1"].get("brief")))
-        displayed = self.app.latest_text.get("1.0", "end-1c")
+        displayed = base_ui.displayed_conversation(self.app)
         self.assertIn("建议目标", displayed)
         self.assertIn("采用", displayed)
         self.assertNotIn('"decisions"', displayed)

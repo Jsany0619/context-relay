@@ -205,8 +205,13 @@ def main():
         (staging / "test-cert.der").write_bytes(_signing_certificate(jdk, key, password))
         source = ROOT / "src/app/contextrelay/mobile"
         run(javac, "--release", "8", "-encoding", "UTF-8", "-d", checks,
-            source / "Protocol.java", source / "PinnedTrust.java", ROOT / "checks/ProtocolCheck.java")
+            source / "Protocol.java", source / "PinnedTrust.java", ROOT / "checks/ProtocolCheck.java",
+            source / "SensitiveText.java", ROOT / "checks/SensitiveTextCheck.java")
         run(java, "-ea", "-cp", checks, "app.contextrelay.mobile.ProtocolCheck", staging / "test-cert.der")
+        run(java, "-ea", "-cp", checks, "app.contextrelay.mobile.SensitiveTextCheck")
+        run(javac, "--release", "8", "-encoding", "UTF-8", "-cp", staging / "android.jar", "-d", checks,
+            source / "VerifiedScreenshot.java", ROOT / "checks/VerifiedScreenshotCheck.java")
+        run(java, "-ea", "-cp", "checks" + os.pathsep + "android.jar", "app.contextrelay.mobile.VerifiedScreenshotCheck")
         run(javac, "--release", "8", "-encoding", "UTF-8", "-cp", staging / "android.jar", "-d", classes, *source.glob("*.java"))
         run(java, "-cp", tools / "lib/d8.jar", "com.android.tools.r8.D8", "--min-api", "26", "--lib", staging / "android.jar",
             "--output", staging, *classes.rglob("*.class"))
@@ -231,7 +236,7 @@ def main():
         report = {"apk": "context-relay.apk", "sha256": digest, "min_sdk": 26, "target_sdk": 35,
                   "signing": "current-user DPAPI protected identity; not store approval",
                   "signing_certificate_sha256": certificate_sha256,
-                  "host_checks": "ProtocolCheck passed", "apk_signature": "verified", "device_test": "not performed by builder"}
+                  "host_checks": "ProtocolCheck, SensitiveTextCheck and VerifiedScreenshotCheck passed", "apk_signature": "verified", "device_test": "not performed by builder"}
         (out / "build-report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(report, ensure_ascii=True))
 
