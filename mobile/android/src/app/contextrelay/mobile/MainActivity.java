@@ -157,8 +157,7 @@ public final class MainActivity extends Activity {
             saved = vault.read();
             drafts = saved.optJSONObject("drafts");
             if (drafts == null) { drafts = new JSONObject(); saved.put("drafts", drafts); }
-            resumeTaskId = saved.optString("selected_task", "");
-            if (resumeTaskId.isEmpty()) resumeTaskId = null;
+            resumeTaskId = Protocol.restoredTaskId(saved.opt("selected_task"));
             task = saved.optJSONObject("last_task");
             if (task != null && (!task.optString("id").equals(resumeTaskId) || connection() == null
                     || connection().optBoolean("needs_pairing")

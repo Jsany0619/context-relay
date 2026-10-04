@@ -70,6 +70,11 @@ public final class ProtocolCheck {
         check(Protocol.conversationSnapshot(false, false, false, true));
         check(!Protocol.conversationSnapshot(true, true, true, true));
         check(!Protocol.conversationSnapshot(false, false, false, false));
+        check(Protocol.restoredTaskId(null) == null);
+        check(Protocol.restoredTaskId(new Object()) == null); // JSONObject.NULL is also a non-String sentinel.
+        check("task_1-A".equals(Protocol.restoredTaskId("task_1-A")));
+        for (Object malformed : new Object[] {"", "null", "with space", "../task", Integer.valueOf(7), Boolean.TRUE})
+            check(Protocol.restoredTaskId(malformed) == null);
         check("/v1/tasks/task_1/conversation".equals(Protocol.conversationPath("task_1", null)));
         check("/v1/tasks/task_1/conversation?cursor=a%2Bb%2F%3D%26%3F%23+%E4%B8%AD".equals(Protocol.conversationPath("task_1", "a+b/=&?# 中")));
         rejects(() -> Protocol.conversationPath("../other", null));

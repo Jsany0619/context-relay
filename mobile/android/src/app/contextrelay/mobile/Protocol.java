@@ -79,6 +79,13 @@ public final class Protocol {
 
     public static String taskListPath() { return "/v1/tasks?summary=1"; }
 
+    /** Persisted JSON null and malformed values mean no selected task. */
+    public static String restoredTaskId(Object value) {
+        if (!(value instanceof String)) return null;
+        String taskId = (String) value;
+        return !"null".equals(taskId) && taskId.matches("[A-Za-z0-9_-]{1,128}") ? taskId : null;
+    }
+
     /** Summary rows are navigation only; commands require a versioned detail response. */
     public static boolean fullTask(boolean summaryOnly, String etag) {
         return !summaryOnly && etag != null && etag.matches("[a-fA-F0-9]{64}");
