@@ -73,9 +73,20 @@ class BackupManagerTests(unittest.TestCase):
                 exported = self.root / "export.json"
                 recovered.export_task(task["id"], exported)
                 self.assertEqual(json.loads(exported.read_text(encoding="utf-8")), before)
+                markdown = self.root / "historical.md"
+                recovered.export_task(task["id"], markdown)
+                self.assertIn("备份历史快照", markdown.read_text(encoding="utf-8"))
+                diagnostic = recovered.diagnostics()
+                self.assertTrue(diagnostic["inspection_only"])
+                self.assertEqual("inspection_only", diagnostic["tasks"][0]["next_action"])
+                self.assertEqual(0, diagnostic["tasks"][0]["budget"]["elapsed_minutes"])
                 for folder in (destination, self.manager.root, self.project):
                     with self.assertRaisesRegex(ValueError, "只读"):
                         recovered.export_task(task["id"], folder / "export.json")
+                    with self.assertRaisesRegex(ValueError, "只读"):
+                        recovered.export_task(task["id"], folder / "historical.md")
+                    with self.assertRaisesRegex(ValueError, "只读"):
+                        recovered.export_diagnostics(folder / "diagnostics.json")
                 self.assertEqual(recovered.get_task(task["id"]), before)
             finally:
                 recovered.close()

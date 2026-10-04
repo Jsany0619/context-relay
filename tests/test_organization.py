@@ -118,6 +118,49 @@ class OrganizationTests(unittest.TestCase):
         self.assertEqual(self.manager.list_tasks(), before)
         self.assertEqual(self.client.calls, [])
 
+    def test_reopen_completed_task_preserves_execution_identity_without_starting_work(self):
+        task = self.manager._task(self.task["id"])
+        task.update(thread_id="source", generation=4, mode="workspace-write", usage=321,
+                    history=[{"thread_id": "old", "generation": 3}],
+                    permission_receipt={"sandbox": {"type": "workspaceWrite"}})
+        self.manager._save(task)
+        completed = self.manager.finish(task["id"])
+        before_calls = copy.deepcopy(self.client.calls)
+
+        reopened = self.manager.reopen_task(task["id"])
+
+        self.assertEqual("paused", reopened["state"])
+        self.assertIn("等待明确", reopened["error"])
+        for key in ("thread_id", "generation", "mode", "usage", "history", "permission_receipt"):
+            self.assertEqual(completed[key], reopened[key], key)
+        self.assertEqual(before_calls, self.client.calls)
+        saved = self.manager.get_task(task["id"])
+        self.assertEqual("task_reopened", saved["events"][0]["kind"])
+
+    def test_reopen_refuses_noncompleted_archived_inspection_or_unsettled_task(self):
+        base = self.manager._task(self.task["id"])
+        for state in ("queued", "idle", "paused", "running", "needs_reconcile"):
+            with self.subTest(state=state):
+                self.manager._save(dict(base, state=state))
+                with self.assertRaises(ValueError):
+                    self.manager.reopen_task(base["id"])
+        for key, value in (("pending", [{"id": 1}]), ("inflight", {"op": {}}),
+                           ("intent", {"kind": "turn"}), ("receiver_id", "receiver"),
+                           ("analysis_thread_id", "analysis"), ("run_started", 0)):
+            with self.subTest(unsettled=key):
+                self.manager._save(dict(base, state="completed", **{key: value}))
+                with self.assertRaises(ValueError):
+                    self.manager.reopen_task(base["id"])
+        self.manager._save(dict(base, state="completed", archived=True))
+        with self.assertRaises(ValueError):
+            self.manager.reopen_task(base["id"])
+        self.manager._save(dict(base, state="completed"))
+        self.manager.recovery_info = {"mode": "inspection"}
+        with self.assertRaises(ValueError):
+            self.manager.reopen_task(base["id"])
+        self.manager.recovery_info = None
+        self.assertEqual([], self.client.calls)
+
 
 if __name__ == "__main__":
     unittest.main()

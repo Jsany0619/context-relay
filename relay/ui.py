@@ -53,7 +53,7 @@ EVENT_LABELS = {
     "permission_expansion_denied": "已拒绝扩大权限", "secret_input_refused": "已拒绝采集秘密信息",
     "late_receipt_recorded": "已记录迟到回执", "tool_state": "已记录工具状态",
     "user_marked_complete": "用户已标记完成", "task_archived": "已归档", "task_unarchived": "已取消归档",
-    "task_settings_updated": "已更新任务设置",
+    "task_settings_updated": "已更新任务设置", "task_reopened": "已重新打开任务（尚未启动）",
     "source_imported": "已导入历史资料（尚未启动）",
     "source_import_updated": "已更新待启动任务的来源资料",
     "assessment_requested": "已请求只读分析", "assessment_ready": "已收到 AI 分析意见（待人工处理）",
@@ -199,6 +199,35 @@ class HistoryWindow(tk.Toplevel):
             lines.append("暂无本地操作记录。")
         set_text(self.history_text, "\n".join(lines))
         ttk.Button(self, text="关闭", command=self.destroy).pack(pady=(0, 10))
+
+
+class DiagnosticsWindow(tk.Toplevel):
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.report_ready = False
+        self.title("诊断信息 · 只读预览")
+        self.transient(app.root)
+        self.geometry(f"{min(760, app.root.winfo_screenwidth() - 80)}x{min(540, app.root.winfo_screenheight() - 120)}")
+        ttk.Label(self, text="本机运行与任务数量摘要；不含任务标题、路径、编号、对话正文或凭据。\n"
+                            "保存时重新采集最新状态，请选择一个新 JSON 文件。", wraplength=700,
+                  justify="left").pack(fill="x", padx=12, pady=(10, 0))
+        self.report_text = text_area(self, 18)
+        set_text(self.report_text, "正在读取本机诊断信息…")
+        actions = ttk.Frame(self)
+        actions.pack(side="bottom", fill="x", padx=12, pady=(0, 10), before=self.report_text.master)
+        self.save_button = ttk.Button(actions, text="保存 JSON…", command=self.save, state="disabled")
+        self.save_button.pack(side="right")
+        ttk.Button(actions, text="关闭", command=self.destroy).pack(side="right", padx=8)
+
+    def save(self):
+        if not self.report_ready or self.app.busy or self.app.closing or self.app.closed:
+            return
+        destination = filedialog.asksaveasfilename(parent=self, title="保存新的诊断信息 JSON",
+                                                  defaultextension=".json", initialfile="context-relay-diagnostics.json",
+                                                  filetypes=(("JSON", "*.json"),), confirmoverwrite=False)
+        if destination and not self.app.closing and not self.app.closed and self.winfo_exists():
+            self.app.submit("export_diagnostics", destination)
 
 
 class NewTaskDialog(tk.Toplevel):
@@ -786,6 +815,7 @@ class RelayApp:
         self.assessment_request = None
         self.phone_dialog = None
         self.phone_request = None
+        self.diagnostics_window = None
         self.root.title("Context Relay · 本机任务管理器")
         width = min(1180, max(1, self.root.winfo_screenwidth() - 80))
         height = min(850, max(1, self.root.winfo_screenheight() - 120))
@@ -832,6 +862,8 @@ class RelayApp:
         self.backup_notice = ttk.Label(left, text="本地明文记录，含导入摘录；不含项目文件、登录信息或完整原生聊天。",
                                        wraplength=240, justify="left", foreground="#555555")
         self.backup_notice.pack(fill="x", pady=(0, 8))
+        self.diagnostics_button = ttk.Button(left, text="诊断信息", command=self._open_diagnostics)
+        self.diagnostics_button.pack(fill="x", pady=(0, 8))
         ttk.Label(left, text="搜索名称、目标或目录").pack(anchor="w")
         self.search_entry = ttk.Entry(left, textvariable=self.search)
         self.search_entry.pack(fill="x", pady=(2, 6))
@@ -848,6 +880,8 @@ class RelayApp:
             self.buttons[method] = button
         self.buttons["update_settings"] = ttk.Button(left, text="任务设置", command=lambda: self._action("update_settings"))
         self.buttons["update_settings"].pack(fill="x", pady=(0, 8))
+        self.buttons["reopen_task"] = ttk.Button(left, text="重新打开", command=lambda: self._action("reopen_task"))
+        self.buttons["reopen_task"].pack(fill="x", pady=(0, 8))
         task_list = ttk.Frame(left)
         task_list.pack(fill="both", expand=True)
         self.task_tree = ttk.Treeview(task_list, columns=("state",), show="tree headings", selectmode="browse")
@@ -900,10 +934,10 @@ class RelayApp:
     def submit(self, method, *args, _before_enqueue=None, **kwargs):
         if not self.ready or self.busy or self.closing:
             return False
-        if self.recovery_info is not None and method not in ("get_task", "export_task"):
+        if self.recovery_info is not None and method not in ("get_task", "export_task", "diagnostics", "export_diagnostics"):
             self.status.set("恢复库为永久只读检视，不能继续任务或修改记录。")
             return False
-        if method not in ("create_task", "backup_state", "list_import_threads", "preview_import", "import_thread",
+        if method not in ("create_task", "backup_state", "diagnostics", "export_diagnostics", "list_import_threads", "preview_import", "import_thread",
                           "remote_enable", "remote_disable", "remote_status", "remote_pair", "remote_revoke", "remote_network") and args and args[0] not in self.visible_ids:
             return False
         if _before_enqueue is not None:
@@ -999,6 +1033,16 @@ class RelayApp:
         if destination:
             self.submit("backup_state", destination)
 
+    def _open_diagnostics(self):
+        if self.diagnostics_button.instate(["disabled"]):
+            return
+        if self.diagnostics_window is not None and self.diagnostics_window.winfo_exists():
+            self.diagnostics_window.lift()
+            return
+        self.diagnostics_window = DiagnosticsWindow(self)
+        if not self.submit("diagnostics"):
+            self.diagnostics_window.destroy()
+
     def open_chat(self):
         if self.busy or self.closing or self.selected_id not in self.visible_ids:
             return
@@ -1022,10 +1066,17 @@ class RelayApp:
         elif method == "set_archived":
             self.submit(method, self.selected_id, not self.tasks[self.selected_id].get("archived", False))
         elif method == "export_task":
-            destination = filedialog.asksaveasfilename(parent=self.root, title="导出任务记录", defaultextension=".json",
-                                                      initialfile="context-relay-task.json", filetypes=(("JSON", "*.json"),))
+            task_id = self.selected_id
+            destination = filedialog.asksaveasfilename(parent=self.root, title="导出任务记录", defaultextension=".md",
+                                                      initialfile="context-relay-task.md",
+                                                      filetypes=(("Markdown", "*.md"), ("JSON", "*.json")))
             if destination:
-                self.submit(method, self.selected_id, destination)
+                self.submit(method, task_id, destination)
+        elif method == "reopen_task":
+            task_id = self.selected_id
+            if messagebox.askyesno("重新打开任务", "仅将这个已完成任务改为待继续，不会自动启动或发送消息。\n"
+                                  "继续时仍使用原任务的权限和预算。确定重新打开？", parent=self.root):
+                self.submit(method, task_id)
         elif method == "finish":
             if messagebox.askyesno("确认完成", "确认这个项目已达到完成标准？单次回复结束不等于项目完成。", parent=self.root):
                 self.submit(method, self.selected_id)
@@ -1247,6 +1298,10 @@ class RelayApp:
             self.import_dialog.controls()
         backup_safe = not any(task.get("state") in ACTIVE or task.get("pending") for task in self.tasks.values())
         self.backup_button.configure(state="normal" if available and not inspection and backup_safe else "disabled")
+        self.diagnostics_button.configure(state="normal" if available else "disabled")
+        if self.diagnostics_window is not None and self.diagnostics_window.winfo_exists():
+            self.diagnostics_window.save_button.configure(
+                state="normal" if available and self.diagnostics_window.report_ready else "disabled")
         self.message_text.configure(state="disabled" if inspection else "normal")
         task = self.tasks.get(self.selected_id) if self.selected_id in self.visible_ids else None
         self.assessment_button.configure(state="normal" if task and not self.closing and task.get("connection_mode") != "direct" else "disabled")
@@ -1277,6 +1332,7 @@ class RelayApp:
                    "handoff": state == "idle", "finish": state in ("idle", "paused"),
                    "reconcile": bool(task), "export_task": bool(task), "get_task": bool(task),
                    "set_archived": archived or can_archive,
+                   "reopen_task": quiet and state == "completed" and not archived and not task.get("analysis_thread_id"),
                    "update_settings": quiet and state in ("queued", "idle", "paused") and not archived}
         if budget and budget["reached"]:
             allowed["start"] = allowed["handoff"] = False
@@ -1348,6 +1404,11 @@ class RelayApp:
                         self.message_text.delete("1.0", "end")
                 if method == "get_task" and isinstance(result, dict) and not self.closing:
                     HistoryWindow(self.root, result)
+                if method == "diagnostics" and isinstance(result, dict) and not self.closing:
+                    window = self.diagnostics_window
+                    if window is not None and window.winfo_exists():
+                        set_text(window.report_text, json.dumps(result, ensure_ascii=False, indent=2))
+                        window.report_ready = True
                 if method == "read_chat" and isinstance(result, dict) and not self.closing:
                     window = getattr(self, "conversation_window", None)
                     if window is None or not window.winfo_exists() or args[0] != self.selected_id:
@@ -1370,6 +1431,9 @@ class RelayApp:
                                     f"文件 {result['file_count']} · 创建时间 {result['created_at']}")
                 else:
                     self.status.set("已导出任务记录。" if method == "export_task" else
+                                    "已保存诊断信息 JSON。" if method == "export_diagnostics" else
+                                    "诊断信息已读取；仅在明确选择文件后保存。" if method == "diagnostics" else
+                                    "任务已重新打开，待继续；未启动任务。" if method == "reopen_task" else
                                     ("已连接原聊天；发送消息时原话接续，勿在原窗口同时执行。" if result.get("connection_mode") == "direct" else
                                      "已导入为待启动任务；原聊天未修改，尚未启动。") if method == "import_thread" else
                                     "设置已保存；未启动任务。" if method == "update_settings" else
@@ -1380,6 +1444,10 @@ class RelayApp:
                     self._import_result(value[0], error=value[1])
                     self._assessment_result(value[0], error=value[1])
                     self._phone_result(value[0], error=value[1])
+                    if value[0] == "diagnostics" and not self.closing:
+                        window = self.diagnostics_window
+                        if window is not None and window.winfo_exists():
+                            set_text(window.report_text, f"无法读取诊断信息：{value[1]}\n关闭预览后可重新尝试。")
                     value = value[1]
                 if kind == "close_error":
                     self.closing = False

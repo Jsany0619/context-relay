@@ -1,6 +1,7 @@
 """Tk integration smoke checks with a fake controller; no Codex sessions are started."""
 from copy import deepcopy
 import gc
+import json
 from pathlib import Path
 import tempfile
 import threading
@@ -19,6 +20,11 @@ class FakeManager:
         self.prepared_task_ids = []
         self.starts = []
         self.archives = []
+        self.reopens = []
+        self.exports = []
+        self.diagnostic_exports = []
+        self.diagnostic_error = None
+        self.diagnostic_read_error = None
         self.settings = []
         self.backups = []
         self.backup_error = None
@@ -93,6 +99,31 @@ class FakeManager:
 
     def export_task(self, task_id, destination):
         self.record("export_task")
+        self.exports.append((task_id, destination))
+        return {"path": destination}
+
+    def reopen_task(self, task_id):
+        self.record("reopen_task")
+        self.reopens.append(task_id)
+        task = next(task for task in self.tasks if task["id"] == task_id)
+        task["state"] = "paused"
+        return deepcopy(task)
+
+    def diagnostics(self):
+        self.record("diagnostics")
+        time.sleep(self.delay)
+        if self.diagnostic_read_error:
+            raise ValueError(self.diagnostic_read_error)
+        return {"format": "context-relay-diagnostics", "version": 1,
+                "captured_at": "2026-10-04T12:00:00Z", "runtime": {"platform": "Windows"},
+                "inspection_only": bool(getattr(self, "recovery_info", None)),
+                "tasks": {"total": len(self.tasks)}, "counts": {}, "boundaries": ["local metadata only"]}
+
+    def export_diagnostics(self, destination):
+        self.record("export_diagnostics")
+        if self.diagnostic_error:
+            raise OSError(self.diagnostic_error)
+        self.diagnostic_exports.append(destination)
         return {"path": destination}
 
     def pause(self, task_id):
@@ -202,6 +233,148 @@ class TkSmokeTests(unittest.TestCase):
         self.assertIn("原生聊天", self.app.backup_notice.cget("text"))
         self.assertEqual({identifier for method, identifier in self.fake.calls if method == "backup_state"},
                          {self.app.worker.ident})
+
+    def test_task_export_offers_markdown_default_and_json_on_worker(self):
+        for suffix in (".md", ".json"):
+            destination = str(Path(self.temp.name) / ("task" + suffix))
+            with mock.patch("relay.ui.filedialog.asksaveasfilename", return_value=destination) as choose:
+                self.app.buttons["export_task"].invoke()
+            self.wait_for(lambda: not self.app.busy)
+            self.assertEqual(choose.call_args.kwargs["defaultextension"], ".md")
+            self.assertIn(("Markdown", "*.md"), choose.call_args.kwargs["filetypes"])
+            self.assertIn(("JSON", "*.json"), choose.call_args.kwargs["filetypes"])
+            self.assertEqual(self.fake.exports[-1], ("task-1", destination))
+        with mock.patch("relay.ui.filedialog.asksaveasfilename", return_value=""):
+            self.app.buttons["export_task"].invoke()
+        self.assertEqual(len(self.fake.exports), 2)
+        self.assertEqual({ident for name, ident in self.fake.calls if name == "export_task"}, {self.app.worker.ident})
+
+    def test_reopen_requires_confirmation_and_does_not_start(self):
+        self.fake.tasks[0]["state"] = "completed"
+        self.wait_for(lambda: not self.app.buttons["reopen_task"].instate(["disabled"]))
+        with mock.patch("relay.ui.messagebox.askyesno", return_value=False):
+            self.app.buttons["reopen_task"].invoke()
+        self.assertFalse(self.fake.reopens)
+        with mock.patch("relay.ui.messagebox.askyesno", return_value=True) as confirm:
+            self.app.buttons["reopen_task"].invoke()
+        self.assertIn("不会自动", confirm.call_args.args[1])
+        self.wait_for(lambda: not self.app.busy and self.app.tasks["task-1"]["state"] == "paused")
+        self.assertEqual(self.fake.reopens, ["task-1"])
+        self.assertFalse(self.fake.starts)
+        self.assertIn("未启动", self.app.status.get())
+        self.fake.tasks[0]["events"] = [{"at": "2026-10-04T12:00:00Z", "kind": "task_reopened", "data": {}}]
+        self.app.buttons["get_task"].invoke()
+        self.wait_for(lambda: not self.app.busy)
+        window = next(child for child in self.root.winfo_children() if hasattr(child, "history_text"))
+        self.assertIn("重新打开", window.history_text.get("1.0", "end-1c"))
+        self.assertEqual({ident for name, ident in self.fake.calls if name == "reopen_task"}, {self.app.worker.ident})
+
+    def test_reopen_disabled_when_not_completed_or_not_quiet_or_inspecting(self):
+        for changes in ({"state": "idle"}, {"state": "completed", "archived": True},
+                        {"inflight": {"item": {}}}, {"intent": {"kind": "turn"}},
+                        {"pending": [{"id": "request"}]}, {"receiver_id": "receiver"}, {"run_started": 1},
+                        {"analysis_thread_id": "analysis"}):
+            with self.subTest(changes=changes):
+                self.fake.tasks[0].update(state="completed", archived=False, inflight={}, intent=None,
+                                          pending=[], receiver_id=None, run_started=None, analysis_thread_id=None)
+                self.fake.tasks[0].update(changes)
+                self.wait_for(lambda: all(self.app.tasks["task-1"].get(key) == value for key, value in changes.items()))
+                self.assertTrue(self.app.buttons["reopen_task"].instate(["disabled"]))
+                self.app.buttons["reopen_task"].invoke()
+        self.assertFalse(self.fake.reopens)
+        self.set_inspection()
+        self.assertFalse(self.app.submit("reopen_task", "task-1"))
+
+    def test_diagnostics_global_preview_and_explicit_save_use_worker(self):
+        self.app.message_text.insert("1.0", "保留草稿")
+        self.app.search.set("no matching task")
+        self.assertIsNone(self.app.selected_id)
+        self.app.diagnostics_button.invoke()
+        self.wait_for(lambda: not self.app.busy)
+        window = self.app.diagnostics_window
+        preview = window.report_text.get("1.0", "end-1c")
+        self.assertEqual(json.loads(preview)["format"], "context-relay-diagnostics")
+        self.assertNotIn("测试任务", preview)
+        self.assertEqual(str(window.report_text.cget("state")), "disabled")
+        self.assertFalse(self.fake.diagnostic_exports)
+        with mock.patch("relay.ui.filedialog.asksaveasfilename", return_value=""):
+            window.save_button.invoke()
+        self.assertFalse(self.fake.diagnostic_exports)
+        destination = str(Path(self.temp.name) / "diagnostics.json")
+        with mock.patch("relay.ui.filedialog.asksaveasfilename", return_value=destination) as choose:
+            window.save_button.invoke()
+        self.wait_for(lambda: not self.app.busy and self.fake.diagnostic_exports)
+        self.assertEqual(self.fake.diagnostic_exports, [destination])
+        self.assertFalse(choose.call_args.kwargs["confirmoverwrite"])
+        self.assertIn("诊断", self.app.status.get())
+        self.assertFalse(self.fake.starts)
+        self.app.search.set("")
+        self.assertEqual(self.app.message_text.get("1.0", "end-1c"), "保留草稿")
+        self.assertEqual({ident for name, ident in self.fake.calls if name in ("diagnostics", "export_diagnostics")},
+                         {self.app.worker.ident})
+
+    def test_diagnostics_inspection_export_error_preserves_readonly_preview(self):
+        self.set_inspection()
+        self.app.diagnostics_button.invoke()
+        self.wait_for(lambda: not self.app.busy)
+        window = self.app.diagnostics_window
+        previous = window.report_text.get("1.0", "end-1c")
+        self.fake.diagnostic_error = "目标文件已存在，不能覆盖"
+        with mock.patch("relay.ui.filedialog.asksaveasfilename", return_value="existing.json"):
+            window.save_button.invoke()
+        self.wait_for(lambda: not self.app.busy and "不能覆盖" in self.app.status.get())
+        self.assertEqual(window.report_text.get("1.0", "end-1c"), previous)
+        self.assertFalse(self.fake.diagnostic_exports)
+        self.assertFalse(self.fake.starts)
+
+    def test_diagnostics_late_result_does_not_reopen_closed_preview(self):
+        self.fake.delay = 0.2
+        self.app.diagnostics_button.invoke()
+        window = self.app.diagnostics_window
+        window.destroy()
+        self.wait_for(lambda: not self.app.busy)
+        self.assertFalse(window.winfo_exists())
+        self.assertIs(self.app.diagnostics_window, window)
+        self.assertFalse(self.fake.starts)
+
+    def test_diagnostics_read_failure_stays_visible_and_cannot_save(self):
+        self.fake.diagnostic_read_error = "诊断读取失败"
+        self.app.diagnostics_button.invoke()
+        self.wait_for(lambda: not self.app.busy)
+        window = self.app.diagnostics_window
+        self.assertIn("诊断读取失败", window.report_text.get("1.0", "end-1c"))
+        self.assertTrue(window.save_button.instate(["disabled"]))
+        self.assertFalse(self.fake.diagnostic_exports)
+
+    def test_export_and_reopen_stay_bound_to_the_task_chosen_before_dialog(self):
+        self.fake.tasks[0]["state"] = "completed"
+        self.add_task(state="completed")
+        self.wait_for(lambda: self.app.tasks["task-1"]["state"] == "completed")
+        def choose():
+            self.select_task("task-other")
+            return "chosen-task.md"
+        with mock.patch("relay.ui.filedialog.asksaveasfilename", side_effect=lambda **kwargs: choose()):
+            self.app.buttons["export_task"].invoke()
+        self.wait_for(lambda: not self.app.busy)
+        self.assertEqual(self.fake.exports, [("task-1", "chosen-task.md")])
+        self.select_task("task-1")
+        with mock.patch("relay.ui.messagebox.askyesno", side_effect=lambda *args, **kwargs: bool(choose())):
+            self.app.buttons["reopen_task"].invoke()
+        self.wait_for(lambda: not self.app.busy)
+        self.assertEqual(self.fake.reopens, ["task-1"])
+        self.assertEqual(self.app.selected_id, "task-other")
+        self.assertFalse(self.fake.starts)
+
+    def test_close_during_diagnostics_does_not_show_late_preview(self):
+        self.fake.delay = 0.2
+        self.app.diagnostics_button.invoke()
+        self.wait_for(lambda: any(name == "diagnostics" for name, _ in self.fake.calls))
+        with mock.patch("relay.ui.messagebox.askokcancel", return_value=True):
+            self.app.request_close()
+        self.wait_for(lambda: self.app.closed)
+        self.assertTrue(self.fake.closed)
+        self.assertFalse(self.fake.diagnostic_exports)
+        self.assertFalse(self.fake.starts)
 
     def test_backup_failure_keeps_message_draft_and_pending_or_active_tasks_disable_it(self):
         self.app.message_text.insert("1.0", "不能丢失的补充说明")
@@ -829,6 +1002,7 @@ class TkLayoutTests(unittest.TestCase):
                     self.assertIn("update_settings", app.buttons)
                     self.assertIn("已达预算", app.budget_details.get())
                     widgets = dict(app.buttons, budget_label=app.budget_label, attention_button=app.attention_button,
+                                   diagnostics_button=app.diagnostics_button,
                                    backup_button=app.backup_button, backup_notice=app.backup_notice)
                     if inspection:
                         widgets["recovery_banner"] = app.recovery_banner
@@ -843,6 +1017,21 @@ class TkLayoutTests(unittest.TestCase):
                             self.assertLessEqual(button.winfo_rooty() + button.winfo_height(),
                                                  parent.winfo_rooty() + parent.winfo_height(), method)
                             parent = parent.master
+                    app.diagnostics_button.invoke()
+                    deadline = time.monotonic() + 4
+                    while app.busy and time.monotonic() < deadline:
+                        root.update()
+                        time.sleep(0.005)
+                    self.assertFalse(app.busy)
+                    window = app.diagnostics_window
+                    root.update()
+                    self.assertEqual(str(window.report_text.cget("state")), "disabled")
+                    self.assertFalse(window.save_button.instate(["disabled"]))
+                    for widget in (window.report_text, window.save_button):
+                        self.assertTrue(widget.winfo_ismapped())
+                        self.assertGreaterEqual(widget.winfo_rooty(), window.winfo_rooty())
+                        self.assertLessEqual(widget.winfo_rooty() + widget.winfo_height(),
+                                             window.winfo_rooty() + window.winfo_height())
                 finally:
                     if app:
                         with mock.patch("relay.ui.messagebox.askokcancel", return_value=True):

@@ -956,9 +956,15 @@ class Manager:
             if task["receiver_id"]:
                 task["history"].append({"thread_id": task["receiver_id"], "role": "abandoned_receiver"})
             self._retire_analysis(task)
+            recovery_error = ""
+            if assessment_kind:
+                recovery_error = "已核对只读分析轮次终态；候选未自动采用，请重新整理。"
+            elif recovered_status == "failed":
+                recovery_error = "已核对到原生轮次执行失败；没有自动继续，请检查结果后再决定。"
+            elif recovered_status == "interrupted":
+                recovery_error = "已核对到原生轮次已中断；没有自动继续。"
             task.update(state="paused", purpose=None, turn_id=None, pending=[],
-                        error=("已核对只读分析轮次终态；候选未自动采用，请重新整理。"
-                               if assessment_kind else ""), intent=None,
+                        error=recovery_error, intent=None,
                         checkpoint=None, checkpoint_hash=None, receiver_id=None, context_estimate=None,
                         fresh_usage=False)
             self._save(task, "reconciled_read_only", {"turn_id": recovered_turn, "status": recovered_status,
@@ -1387,6 +1393,22 @@ class Manager:
             self._save(task, "user_marked_complete")
             return task
 
+    def reopen_task(self, task_id):
+        with self._lock:
+            self._require_writable()
+            task = self._task(task_id)
+            if task.get("archived"):
+                raise ValueError("请先取消本地归档，再重新打开任务。")
+            if task["state"] != "completed":
+                raise ValueError("只能重新打开已完成的任务。")
+            if (any(task.get(key) for key in
+                    ("pending", "inflight", "intent", "receiver_id", "analysis_thread_id"))
+                    or task.get("run_started") is not None):
+                raise ValueError("任务仍有待核对操作，不能重新打开。")
+            task.update(state="paused", error="任务已重新打开；尚未启动，等待明确“启动 / 继续”。")
+            self._save(task, "task_reopened")
+            return task
+
     def backup_state(self, destination):
         with self._lock:
             self._require_writable()
@@ -1404,16 +1426,42 @@ class Manager:
     def export_task(self, task_id, destination):
         with self._lock:
             task = self.get_task(task_id)
-            handoff_rules.reject_sensitive(task)
+            if Path(destination).suffix.lower() == ".md":
+                from .report import render_task_report
+                text = render_task_report(dict(task, inspection_only=bool(self.recovery_info)))
+                handoff_rules.reject_sensitive(text)
+            else:
+                handoff_rules.reject_sensitive(task)
+                text = json.dumps(task, ensure_ascii=False, indent=2) + "\n"
+            return self._export_text(destination, text)
+
+    def diagnostics(self):
+        from .diagnostics import diagnostics_report
+        with self._lock:
+            return diagnostics_report(self.list_tasks(), inspection_only=bool(self.recovery_info))
+
+    def export_diagnostics(self, destination):
+        with self._lock:
+            text = json.dumps(self.diagnostics(), ensure_ascii=False, indent=2) + "\n"
+            return self._export_text(destination, text, protect_projects=True)
+
+    def _export_text(self, destination, text, protect_projects=False):
+        with self._lock:
             path = Path(destination).resolve()
+            protected = [self.root]
             if self.recovery_info:
-                protected = [self.root, Path(self.recovery_info["source_state_dir"]).resolve()]
-                protected.extend(Path(item["cwd"]).resolve() for item in self.list_tasks())
-                if any(path.is_relative_to(root) for root in protected):
-                    raise ValueError("恢复库只读，请把导出文件保存在状态和原项目目录之外。")
-            if path.exists():
-                raise ValueError("导出文件已存在，请选择新文件名。")
-            handoff_rules.atomic_json(path, task)
+                protected.append(Path(self.recovery_info["source_state_dir"]).resolve())
+            if self.recovery_info or protect_projects:
+                protected.extend(Path(item['cwd']).resolve() for item in self.list_tasks())
+            if any(path.is_relative_to(root) for root in protected):
+                raise ValueError("只读导出，请把文件保存在受保护的状态和项目目录之外。")
+            try:
+                with path.open("x", encoding="utf-8", newline="\n") as stream:
+                    stream.write(text)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            except FileExistsError:
+                raise ValueError("导出文件已存在，请选择新文件名。") from None
             return str(path)
 
     def close(self):
