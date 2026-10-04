@@ -14,6 +14,30 @@ from relay.preferences import DEFAULTS
 from relay.ui import CommandWorker, NewTaskDialog, RelayApp
 
 
+def quiet_window(window, *, mapped=False):
+    """Reduce visible test interference; mapped layout checks still need an isolated desktop."""
+    window.withdraw()
+    try:
+        window.attributes("-alpha", 0.0)
+        window.attributes("-disabled", True)
+    except tk.TclError:
+        pass
+    if mapped:
+        window.deiconify()
+
+
+def install_quiet_toplevels(testcase):
+    original_init = tk.Toplevel.__init__
+
+    def quiet_init(window, *args, **kwargs):
+        original_init(window, *args, **kwargs)
+        quiet_window(window)
+
+    patcher = mock.patch.object(tk.Toplevel, "__init__", quiet_init)
+    patcher.start()
+    testcase.addCleanup(patcher.stop)
+
+
 class FakeManager:
     def __init__(self, state_dir=None):
         self.calls = []
@@ -29,6 +53,8 @@ class FakeManager:
         self.settings = []
         self.backups = []
         self.backup_error = None
+        self.chat_reads = []
+        self.chat_error = None
         self.delay = 0
         self.close_delay = 0
         self.close_failures = 0
@@ -75,6 +101,22 @@ class FakeManager:
         self.record("get_task")
         time.sleep(self.delay)
         return deepcopy(next(task for task in self.tasks if task["id"] == task_id))
+
+    def read_chat(self, task_id, cursor=None):
+        self.record("read_chat")
+        self.chat_reads.append((task_id, cursor))
+        time.sleep(self.delay)
+        if self.chat_error:
+            raise ValueError(self.chat_error)
+        page = 1 if cursor is None else 0
+        return {"thread_id": f"thread-{task_id}", "checked_at": "2026-10-04T12:00:00Z",
+                "page": page + 1, "pages": 2, "older_cursor": "older" if page else None,
+                "newer_cursor": None if page else "newer", "non_text_items": 0,
+                "notice": "原始对话文字页。", "entries": [
+                    {"role": "user", "text": f"原文-{task_id}", "part": 1, "parts": 1,
+                     "turn_status": "completed"},
+                    {"role": "assistant", "text": f"回复-{task_id}", "part": 1, "parts": 1,
+                     "turn_status": "completed"}]}
 
     def set_archived(self, task_id, archived):
         self.record("set_archived")
@@ -157,9 +199,10 @@ class TkSmokeTests(unittest.TestCase):
     def setUp(self):
         try:
             self.root = tk.Tk()
-            self.root.withdraw()
+            quiet_window(self.root)
         except tk.TclError as error:
             self.skipTest(f"Tk display unavailable: {error}")
+        install_quiet_toplevels(self)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         preferences = mock.patch("relay.ui.load_preferences", return_value=dict(DEFAULTS))
@@ -221,18 +264,13 @@ class TkSmokeTests(unittest.TestCase):
         self.app.worker.events.put(("ready", info))
         self.wait_for(lambda: getattr(self.app, "recovery_info", None) == info)
 
-    def test_readonly_alert_stays_below_header_and_does_not_crop_primary_action(self):
-        self.root.deiconify()
-        self.root.update()
-        alert, header = self.app.task_alert_label, self.app.task_header
+    def test_ordinary_readonly_uses_subtitle_without_an_alert_and_keeps_actions_reachable(self):
+        alert = self.app.task_alert_label
         self.assertIs(alert.master, self.app.chat_panel)
-        self.assertTrue(alert.winfo_ismapped())
-        self.assertGreaterEqual(alert.winfo_rooty(), header.winfo_rooty() + header.winfo_height())
-        self.assertGreaterEqual(alert.winfo_width(), self.app.chat_panel.winfo_width() - 50)
+        self.assertEqual(alert.winfo_manager(), "")
+        self.assertIn("只读", self.app.task_subtitle.get())
         for widget in (self.app.message_text, self.app.buttons["start"]):
-            self.assertTrue(widget.winfo_ismapped())
-            self.assertLessEqual(widget.winfo_rooty() + widget.winfo_height(),
-                                 self.app.chat_panel.winfo_rooty() + self.app.chat_panel.winfo_height())
+            self.assertEqual(widget.winfo_manager(), "pack")
         self.assertEqual(self.app.pending_frame.winfo_manager(), "")
 
     def test_preferences_preview_preserves_live_ui_and_failed_save_is_not_success(self):
@@ -256,7 +294,7 @@ class TkSmokeTests(unittest.TestCase):
         self.assertEqual(self.app.message_text.get("1.0", "end-1c"), "保留中的草稿")
         self.assertEqual(self.app.pending_requests, [request])
         self.assertEqual(self.app.message_text.cget("background"), "#ffffff")
-        self.assertEqual(self.app.message_text.cget("foreground"), "#173a34")
+        self.assertEqual(self.app.message_text.cget("foreground"), "#202927")
         with mock.patch("relay.ui.save_preferences", side_effect=OSError("synthetic write failure")):
             dialog.save()
         self.assertTrue(dialog.winfo_exists())
@@ -802,6 +840,71 @@ class TkSmokeTests(unittest.TestCase):
         self.assertIs(self.app.conversation_window, window)
         self.assertFalse(window.winfo_exists())
 
+    def test_conversation_shows_only_completed_work_and_marks_message_truncation(self):
+        self.fake.tasks[0].update(messages=[
+            {"role": "user", "text": "可见用户原话", "status": "completed", "purpose": "work"},
+            {"role": "assistant", "text": "内部分析", "status": "completed", "purpose": "brief"},
+            {"role": "user", "text": "尚未确认的输入", "status": "pending", "purpose": "work"},
+            {"role": "assistant", "text": "可见回复", "status": "completed", "purpose": "work",
+             "truncated": True},
+        ], messages_truncated=False)
+        self.wait_for(lambda: "可见回复" in self.app.latest_text.get("1.0", "end-1c"))
+        text = self.app.latest_text.get("1.0", "end-1c")
+        self.assertIn("可见用户原话", text)
+        self.assertIn("可见回复", text)
+        self.assertIn("较早的本机对话已截短", text)
+        self.assertNotIn("内部分析", text)
+        self.assertNotIn("尚未确认的输入", text)
+        self.app.latest_text.configure(state="normal")
+        self.app.latest_text.tag_add("sel", "1.0", "1.2")
+        self.app.latest_text.configure(state="disabled")
+        selected = tuple(str(value) for value in self.app.latest_text.tag_ranges("sel"))
+        self.app._render_task()
+        self.assertEqual(tuple(str(value) for value in self.app.latest_text.tag_ranges("sel")), selected)
+
+    def test_direct_chat_late_result_is_cached_for_its_task_and_never_crossed(self):
+        self.fake.delay = 0.2
+        self.fake.tasks[0]["connection_mode"] = "direct"
+        self.add_task(connection_mode="direct")
+        self.select_task("task-other")
+        self.wait_for(lambda: ("task-other", None) in self.fake.chat_reads)
+        self.select_task("task-1")
+        self.wait_for(lambda: ("task-1", None) in self.fake.chat_reads and not self.app.busy)
+        text = self.app.latest_text.get("1.0", "end-1c")
+        self.assertIn("原文-task-1", text)
+        self.assertIn("回复-task-1", text)
+        self.assertNotIn("原文-task-other", text)
+
+    def test_direct_latest_page_refreshes_read_only_when_task_receives_new_result(self):
+        self.add_task(connection_mode="direct")
+        self.select_task("task-other")
+        self.wait_for(lambda: self.fake.chat_reads.count(("task-other", None)) == 1 and not self.app.busy)
+        next(task for task in self.fake.tasks if task["id"] == "task-other").update(
+            last_message="新的已完成回复", work_turns=3)
+        self.wait_for(lambda: self.fake.chat_reads.count(("task-other", None)) == 2 and not self.app.busy)
+        self.assertFalse(self.fake.starts)
+
+    def test_task_cards_support_keyboard_movement(self):
+        self.add_task()
+        first = self.app.task_tree._buttons["task-1"]
+        self.assertTrue(first.bind("<Down>"))
+        self.app.task_tree._move("task-1", 1)
+        self.assertEqual(self.app.selected_id, "task-other")
+        self.assertEqual(self.app.task_tree.selection(), ("task-other",))
+
+    def test_manual_native_read_replaces_no_summary_and_first_failure_is_visible(self):
+        self.app.open_chat()
+        self.wait_for(lambda: not self.app.busy and self.fake.chat_reads)
+        self.assertIn("原文-task-1", self.app.latest_text.get("1.0", "end-1c"))
+        self.fake.chat_error = "宿主暂不可读"
+        self.app.chat_cache.pop("task-1", None)
+        self.app.open_chat()
+        self.wait_for(lambda: not self.app.busy and self.app.chat_cache.get("task-1", {}).get("error"))
+        text = self.app.latest_text.get("1.0", "end-1c")
+        self.assertIn("原始对话读取失败：宿主暂不可读", text)
+        self.assertIn("未用任务摘要代替", text)
+        self.assertNotIn("准备就绪", text)
+
     def test_history_is_read_only_redacted_and_bound_to_requested_task(self):
         self.add_task()
         self.fake.tasks[0]["events"] = [
@@ -873,7 +976,7 @@ class TkSmokeTests(unittest.TestCase):
         self.select_task(other["id"])
         self.root.update()
         self.assertEqual(self.app.details_panel.winfo_manager(), "")
-        self.assertEqual(self.app.details_button.cget("text"), "显示任务详情")
+        self.assertEqual(self.app.details_button.cget("text"), "详情")
         self.select_task("task-1")
         self.set_pending({"id": 3, "method": "item/commandExecution/requestApproval",
                           "params": {"command": "echo synthetic"}})
@@ -884,27 +987,77 @@ class TkSmokeTests(unittest.TestCase):
         self.assertEqual(self.app.pending_frame.winfo_manager(), "")
 
     def test_more_menu_uses_existing_button_guards_and_keeps_primary_action_clear(self):
-        self.root.deiconify()
-        self.root.update()
         self.assertEqual(self.app.buttons["start"].cget("text"), "发送 / 继续")
-        self.assertTrue(self.app.buttons["start"].winfo_ismapped())
+        self.assertEqual(self.app.buttons["start"].winfo_manager(), "pack")
         for widget in (self.app.phone_button, self.app.backup_button, self.app.diagnostics_button,
                        self.app.assessment_button, self.app.buttons["update_settings"],
                        self.app.buttons["prepare_snapshot"]):
-            self.assertFalse(widget.winfo_ismapped())
-        for key, widget in (("phone", self.app.phone_button), ("backup", self.app.backup_button),
-                            ("diagnostics", self.app.diagnostics_button),
-                            ("assessment", self.app.assessment_button),
+            self.assertEqual(widget.winfo_manager(), "")
+        for key, widget in (("assessment", self.app.assessment_button),
                             ("update_settings", self.app.buttons["update_settings"]),
                             ("prepare_snapshot", self.app.buttons["prepare_snapshot"]),
                             ("reconcile", self.app.buttons["reconcile"])):
             expected = "disabled" if widget.instate(["disabled"]) else "normal"
             self.assertEqual(self.app.more_menu.entrycget(self.app.more_entries[key], "state"), expected)
+        for key, widget in (("phone", self.app.phone_button), ("backup", self.app.backup_button),
+                            ("diagnostics", self.app.diagnostics_button)):
+            expected = "disabled" if widget.instate(["disabled"]) else "normal"
+            self.assertEqual(self.app.settings_entry_menus[key].entrycget(
+                self.app.settings_entries[key], "state"), expected)
         self.assertEqual(self.app.more_menu.entrycget(self.app.more_entries["reconcile"], "state"), "normal")
         self.fake.tasks[0].update(max_minutes=1, elapsed_seconds=60)
         self.wait_for(lambda: "已达到预算" in self.app.task_alert.get())
-        self.assertTrue(self.app.task_alert_label.winfo_ismapped())
+        self.assertEqual(self.app.task_alert_label.winfo_manager(), "pack")
         self.assertEqual(self.app.more_menu.entrycget(self.app.more_entries["handoff"], "state"), "disabled")
+
+    def test_idle_control_refresh_does_not_repack_the_primary_action(self):
+        button = self.app.buttons["start"]
+        self.assertEqual(button.winfo_manager(), "pack")
+        with mock.patch.object(button, "pack_forget", wraps=button.pack_forget) as forget, \
+                mock.patch.object(button, "pack", wraps=button.pack) as pack:
+            for _ in range(25):
+                self.app._controls()
+        forget.assert_not_called()
+        pack.assert_not_called()
+
+    def test_idle_event_pump_does_not_reconfigure_controls(self):
+        self.root.after_cancel(self.app._pump_after)
+        self.app._pump_after = None
+        with mock.patch.object(self.app, "_controls", wraps=self.app._controls) as controls:
+            self.app._pump()
+        controls.assert_not_called()
+
+    def test_active_event_pump_refreshes_elapsed_budget_once_per_second(self):
+        self.root.after_cancel(self.app._pump_after)
+        self.app._pump_after = None
+        self.app.tasks["task-1"].update(state="running", elapsed_seconds=30,
+                                        run_started=100, max_minutes=10)
+        with mock.patch("relay.budget.time.time", return_value=130):
+            self.app._controls()
+        self.assertIn("1.00 / 10", self.app.budget_details.get())
+        self.app._last_clock_controls = 10
+        with mock.patch("relay.ui.time.monotonic", return_value=11.1), \
+                mock.patch("relay.budget.time.time", return_value=160), \
+                mock.patch.object(self.app, "_controls", wraps=self.app._controls) as controls:
+            self.app._pump()
+        controls.assert_called_once_with()
+        self.assertIn("1.50 / 10", self.app.budget_details.get())
+
+    def test_unchanged_task_cards_do_not_reconfigure_or_regrid(self):
+        card = self.app.task_tree._buttons["task-1"]
+        title, preview, meta = self.app.task_tree._parts["task-1"]
+        rows = [self.app._task_card(self.app.tasks["task-1"])]
+        with mock.patch.object(card, "configure", wraps=card.configure) as card_configure, \
+                mock.patch.object(card, "grid", wraps=card.grid) as grid, \
+                mock.patch.object(title, "configure", wraps=title.configure) as title_configure, \
+                mock.patch.object(preview, "configure", wraps=preview.configure) as preview_configure, \
+                mock.patch.object(meta, "configure", wraps=meta.configure) as meta_configure:
+            self.app.task_tree.render(rows, "task-1")
+        card_configure.assert_not_called()
+        grid.assert_not_called()
+        title_configure.assert_not_called()
+        preview_configure.assert_not_called()
+        meta_configure.assert_not_called()
 
     def test_prepare_snapshot_uses_worker_and_displays_only_a_draft(self):
         self.assertNotIn("draft", self.app.tasks["task-1"])
@@ -1106,6 +1259,7 @@ class TkLayoutTests(unittest.TestCase):
             with self.subTest(dpi=dpi, inspection=inspection):
                 try:
                     root = tk.Tk()
+                    quiet_window(root, mapped=True)
                 except tk.TclError as error:
                     self.skipTest(f"Tk display unavailable: {error}")
                 app = None
@@ -1133,7 +1287,7 @@ class TkLayoutTests(unittest.TestCase):
                     widgets = {"new": app.new_button, "import": app.import_button, "more": app.more_button,
                                "tree": app.task_tree, "details": app.details_button,
                                "latest": app.latest_text, "message": app.message_text,
-                               "attention": app.attention_button, "primary": app.buttons["start"]}
+                               "primary": app.buttons["start"]}
                     if inspection:
                         widgets["recovery_banner"] = app.recovery_banner
                     for method, button in widgets.items():
@@ -1149,17 +1303,20 @@ class TkLayoutTests(unittest.TestCase):
                             parent = parent.master
                     self.assertFalse(app.details_panel.winfo_ismapped())
                     self.assertTrue(app.task_alert_label.winfo_ismapped())
+                    self.assertFalse(app.attention_button.winfo_ismapped())
                     for widget in (app.diagnostics_button, app.backup_button, app.backup_notice,
                                    app.buttons["get_task"], app.buttons["prepare_snapshot"]):
                         self.assertFalse(widget.winfo_ismapped())
-                    self.assertEqual(app.more_menu.entrycget(app.more_entries["diagnostics"], "state"), "normal")
+                    self.assertEqual(app.settings_entry_menus["diagnostics"].entrycget(
+                        app.settings_entries["diagnostics"], "state"), "normal")
                     app.diagnostics_button.invoke()
+                    window = app.diagnostics_window
+                    quiet_window(window, mapped=True)
                     deadline = time.monotonic() + 4
                     while app.busy and time.monotonic() < deadline:
                         root.update()
                         time.sleep(0.005)
                     self.assertFalse(app.busy)
-                    window = app.diagnostics_window
                     root.update()
                     self.assertEqual(str(window.report_text.cget("state")), "disabled")
                     self.assertFalse(window.save_button.instate(["disabled"]))

@@ -18,6 +18,10 @@ public final class Protocol {
         throw new IllegalArgumentException("不支持的外观设置。");
     }
 
+    public static float appearanceFontScale(Object value) {
+        return "large".equals(value) ? 1.15f : 1f;
+    }
+
     public static String endpoint(String value) {
         try {
             URI uri = new URI(value);
@@ -55,8 +59,8 @@ public final class Protocol {
                 || "briefing".equals(state) || "reviewing".equals(state);
     }
 
-    public static boolean taskNoticeNeeded(String state, boolean control, boolean offline, boolean attention) {
-        return !control || offline || attention || !quiet(state);
+    public static boolean taskNoticeNeeded(String state, boolean offline, boolean attention) {
+        return offline || attention || !quiet(state);
     }
 
     public static String originalNotice(int part, int parts, String state, String phase) {

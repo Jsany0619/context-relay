@@ -1,6 +1,7 @@
 """Desktop/phone ownership checks without native clients or real task state."""
 
 from pathlib import Path
+from contextlib import ExitStack
 import threading
 import time
 import unittest
@@ -11,26 +12,93 @@ from tests import test_ui as base_ui
 
 
 class PhoneUiTests(unittest.TestCase):
-    setUp = base_ui.TkSmokeTests.setUp
+    def setUp(self):
+        base_ui.TkSmokeTests.setUp(self)
+
     tearDown = base_ui.TkSmokeTests.tearDown
     wait_for = base_ui.TkSmokeTests.wait_for
 
-    def test_pairing_only_shows_current_step_and_settings_remain_reachable(self):
-        self.root.deiconify()
+    def test_unchanged_controls_do_not_repack_or_reconfigure(self):
         with mock.patch("relay.phone.local_addresses", return_value=["127.0.0.1"]):
             self.app.phone_button.invoke()
         dialog = self.app.phone_dialog
         self.wait_for(lambda: not self.app.busy)
-        self.root.update()
-        self.assertTrue(dialog.enable_button.winfo_ismapped())
-        self.assertFalse(dialog.pair_button.winfo_ismapped())
-        self.assertFalse(dialog.pairing.winfo_ismapped())
-        self.assertFalse(dialog.network_button.winfo_ismapped())
-        self.assertFalse(dialog.port_box.winfo_ismapped())
+        self.app.message_text.insert("1.0", "尚未发送的电脑草稿")
+        dialog.task_list.selection_set(0)
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                dialog.deliver({"enabled": enabled, "endpoint": "https://127.0.0.1:8765", "devices": []})
+                if enabled:
+                    dialog._show_pairing("synthetic-pairing", dialog._choice_snapshot(), time.time() + 300)
+                dialog.controls()
+                widgets = (dialog.enable_button, dialog.pair_button, dialog.stop_button,
+                           dialog.refresh_button, dialog.network_button, dialog.revoke_button,
+                           dialog.copy_button, dialog.address_box, dialog.port_box,
+                           dialog.scope_box, dialog.task_list)
+                with ExitStack() as stack:
+                    changes = [stack.enter_context(mock.patch.object(widget, "configure", wraps=widget.configure))
+                               for widget in widgets]
+                    for widget in (dialog.enable_button, dialog.pair_button):
+                        changes.extend(stack.enter_context(mock.patch.object(widget, name, wraps=getattr(widget, name)))
+                                       for name in ("pack", "pack_forget"))
+                    for _ in range(25):
+                        dialog.controls()
+                    self.assertEqual(sum(change.call_count for change in changes), 0,
+                                     "unchanged controls must not redraw or rewrite widget state")
+                self.assertEqual(dialog.task_list.curselection(), (0,))
+                self.assertEqual(dialog.scope.get(), "仅查看")
+                self.assertEqual(dialog.copy_button.instate(["disabled"]), not enabled)
+                self.assertEqual(self.app.message_text.get("1.0", "end-1c"), "尚未发送的电脑草稿")
+
+    def test_unchanged_status_retains_selected_device_without_redraw(self):
+        with mock.patch("relay.phone.local_addresses", return_value=["127.0.0.1"]):
+            self.app.phone_button.invoke()
+        dialog = self.app.phone_dialog
+        self.wait_for(lambda: not self.app.busy)
+        devices = [{"id": name, "name": name, "scope": "read_only", "task_ids": ["task-1"]}
+                   for name in ("one", "two")]
+        connected = {"enabled": True, "endpoint": "https://127.0.0.1:8765", "devices": devices}
+        dialog.deliver(connected)
+        dialog.device_list.selection_set(1)
+        with ExitStack() as stack:
+            changes = [stack.enter_context(mock.patch.object(dialog.device_list, name, wraps=getattr(dialog.device_list, name)))
+                       for name in ("delete", "insert")]
+            changes.append(stack.enter_context(mock.patch.object(dialog.info, "set", wraps=dialog.info.set)))
+            for _ in range(25):
+                dialog.deliver(connected)
+            self.assertEqual(sum(change.call_count for change in changes), 0)
+        self.assertEqual(dialog.device_list.curselection(), (1,))
+        dialog.deliver(dict(connected, devices=[devices[1], dict(devices[0], revoked=True)]))
+        self.assertEqual(dialog.device_list.curselection(), (0,))
+        self.assertIn("已撤销", dialog.device_list.get(1))
+
+    def test_repeated_disabled_status_does_not_reclear_empty_pairing(self):
+        with mock.patch("relay.phone.local_addresses", return_value=["127.0.0.1"]):
+            self.app.phone_button.invoke()
+        dialog = self.app.phone_dialog
+        self.wait_for(lambda: not self.app.busy)
+        with ExitStack() as stack:
+            changes = [stack.enter_context(mock.patch.object(dialog.pairing, name, wraps=getattr(dialog.pairing, name)))
+                       for name in ("configure", "delete")]
+            changes.append(stack.enter_context(mock.patch.object(dialog.pairing_panel, "pack_forget", wraps=dialog.pairing_panel.pack_forget)))
+            for _ in range(25):
+                dialog.deliver({"enabled": False, "devices": []})
+            self.assertEqual(sum(change.call_count for change in changes), 0)
+
+    def test_pairing_only_shows_current_step_and_settings_remain_reachable(self):
+        with mock.patch("relay.phone.local_addresses", return_value=["127.0.0.1"]):
+            self.app.phone_button.invoke()
+        dialog = self.app.phone_dialog
+        dialog.attributes("-alpha", 0.0)
+        self.wait_for(lambda: not self.app.busy)
+        self.assertEqual(dialog.sections.select(), str(dialog.pair_page))
+        self.assertEqual(dialog.enable_button.winfo_manager(), "pack")
+        self.assertEqual(dialog.pair_button.winfo_manager(), "")
+        self.assertEqual(dialog.pairing_panel.winfo_manager(), "")
         dialog.sections.select(dialog.device_page)
-        self.root.update()
-        self.assertTrue(dialog.network_button.winfo_ismapped())
-        self.assertTrue(dialog.port_box.winfo_ismapped())
+        self.assertEqual(dialog.sections.select(), str(dialog.device_page))
+        self.assertEqual(dialog.network_button.winfo_manager(), "pack")
+        self.assertEqual(dialog.port_box.winfo_manager(), "pack")
         dialog.sections.select(dialog.pair_page)
         dialog.deliver({"enabled": True, "endpoint": "https://127.0.0.1:8765", "devices": []})
         dialog.task_list.selection_set(0)
@@ -39,15 +107,13 @@ class PhoneUiTests(unittest.TestCase):
         dialog.deliver({"enabled": True, "endpoint": "https://127.0.0.1:8765", "devices": [],
                         "pairing_uri": "contextrelay://pair#synthetic",
                         "pairing_expires_at": time.time() + 300})
-        self.root.update()
-        self.assertFalse(dialog.enable_button.winfo_ismapped())
-        self.assertTrue(dialog.pair_button.winfo_ismapped())
-        self.assertTrue(dialog.pairing.winfo_ismapped())
-        self.assertTrue(dialog.copy_button.winfo_ismapped())
+        self.assertEqual(dialog.enable_button.winfo_manager(), "")
+        self.assertEqual(dialog.pair_button.winfo_manager(), "pack")
+        self.assertEqual(dialog.pairing_panel.winfo_manager(), "pack")
+        self.assertEqual(dialog.copy_button.winfo_manager(), "pack")
         dialog.scope.set("查看与控制")
         dialog._pairing_choices_changed()
-        self.root.update()
-        self.assertFalse(dialog.pairing.winfo_ismapped())
+        self.assertEqual(dialog.pairing_panel.winfo_manager(), "")
         self.assertIn("选择已变化", dialog.info.get())
         self.assertFalse(self.fake.starts)
 

@@ -11,6 +11,8 @@ def check_environment():
         result["errors"].append("The manager requires Python 3.10 or newer")
     try:
         import tkinter as tk
+        from .display import enable_native_dpi
+        enable_native_dpi()
         root = tk.Tk()
         root.withdraw()
         result["tkinter"] = True

@@ -16,6 +16,10 @@ public final class ProtocolCheck {
         throw new AssertionError("Expected rejection " + count);
     }
     public static void main(String[] args) throws Exception {
+        check(Protocol.appearanceFontScale("standard") == 1f);
+        check(Protocol.appearanceFontScale("large") == 1.15f);
+        check(Protocol.appearanceFontScale(null) == 1f);
+        check(Protocol.appearanceFontScale("system") == 1f);
         for (Object invalid : new Object[] {null, "", "system", "MINT", Boolean.TRUE, 3}) {
             check("blue".equals(Protocol.appearancePreference("theme", invalid)));
             check("standard".equals(Protocol.appearancePreference("font_size", invalid)));
@@ -51,13 +55,12 @@ public final class ProtocolCheck {
         check(Protocol.originalNotice(1, 1, "completed", "commentary").contains("commentary"));
         check(Protocol.active("briefing")); check(Protocol.active("reviewing")); check(Protocol.active("pausing"));
         for (String state : new String[] {"idle", "queued", "paused"}) {
-            check(!Protocol.taskNoticeNeeded(state, true, false, false));
-            check(Protocol.taskNoticeNeeded(state, false, false, false));
-            check(Protocol.taskNoticeNeeded(state, true, true, false));
-            check(Protocol.taskNoticeNeeded(state, true, false, true));
+            check(!Protocol.taskNoticeNeeded(state, false, false));
+            check(Protocol.taskNoticeNeeded(state, true, false));
+            check(Protocol.taskNoticeNeeded(state, false, true));
         }
         for (String state : new String[] {"running", "blocked", "needs_reconcile", "completed", "future_state"})
-            check(Protocol.taskNoticeNeeded(state, true, false, false));
+            check(Protocol.taskNoticeNeeded(state, false, false));
         check(Protocol.terminalReceipt("succeeded")); check(Protocol.terminalReceipt("failed"));
         check(!Protocol.terminalReceipt("accepted")); check(!Protocol.terminalReceipt("running")); check(!Protocol.terminalReceipt("unknown"));
         check(Protocol.knownReceipt("unknown")); check(!Protocol.knownReceipt("made_up"));

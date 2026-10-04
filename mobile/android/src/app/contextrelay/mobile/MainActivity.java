@@ -90,7 +90,7 @@ public final class MainActivity extends Activity {
     private TextView operation;
     private LinearLayout content;
     private LinearLayout root, header, composer, timeline;
-    private TextView taskStatus;
+    private TextView taskStatus, taskSubtitle;
     private Button send, pause, latest, requestsAction;
     private String originalInfo = "", originalError = "";
     private JSONObject originalPage;
@@ -207,10 +207,10 @@ public final class MainActivity extends Activity {
         }
         root = column();
         background(root, "background", 0);
-        root.setPadding(dp(16), dp(8), dp(16), dp(8));
+        root.setPadding(dp(14), dp(4), dp(14), dp(8));
         root.setOnApplyWindowInsetsListener((view, insets) -> {
-            view.setPadding(dp(16) + insets.getSystemWindowInsetLeft(), dp(4) + insets.getSystemWindowInsetTop(),
-                    dp(16) + insets.getSystemWindowInsetRight(), dp(8) + insets.getSystemWindowInsetBottom());
+            view.setPadding(dp(14) + insets.getSystemWindowInsetLeft(), dp(4) + insets.getSystemWindowInsetTop(),
+                    dp(14) + insets.getSystemWindowInsetRight(), dp(8) + insets.getSystemWindowInsetBottom());
             return insets;
         });
         header = column(); root.addView(header);
@@ -225,7 +225,7 @@ public final class MainActivity extends Activity {
         scroll.setFillViewport(true);
         scroll.setOnScrollChangeListener((view, x, y, oldX, oldY) -> updateLatestButton());
         content = column();
-        spacing(content, 0, 8, 0, 12);
+        spacing(content, 4, 16, 4, 12);
         scroll.addView(content);
         root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
         composer = column(); root.addView(composer);
@@ -311,19 +311,20 @@ public final class MainActivity extends Activity {
     private int color(String role) {
         boolean mint = "mint".equals(theme);
         switch (role) {
-            case "ink": return mint ? 0xff173a34 : INK;
-            case "muted": return mint ? 0xff526f67 : MUTED;
-            case "surface": return mint ? Color.WHITE : SURFACE;
-            case "outline": return mint ? 0xffcfe1d9 : OUTLINE;
-            case "accent": return mint ? 0xff147d6b : ACCENT;
-            case "selection": return mint ? 0xffdeefe7 : SURFACE;
+            case "ink": return mint ? 0xff202927 : INK;
+            case "muted": return mint ? 0xff626e6a : MUTED;
+            case "surface": return mint ? 0xfff7f9f8 : SURFACE;
+            case "outline": return mint ? 0xffe3e7e5 : OUTLINE;
+            case "accent": return mint ? 0xff226356 : ACCENT;
+            case "selection": return mint ? 0xfff0f3f1 : SURFACE;
+            case "on_accent": return Color.WHITE;
             case "warning": return Color.rgb(138, 59, 0);
-            default: return mint ? 0xfff1f8f5 : Color.WHITE;
+            default: return Color.WHITE;
         }
     }
     private void font(TextView view, float sp) {
         view.setTag(FONT_STYLE, sp);
-        view.setTextSize(sp * ("large".equals(fontSize) ? 1.15f : 1)); // SP keeps the system's own font scaling.
+        view.setTextSize(sp * Protocol.appearanceFontScale(fontSize)); // SP keeps the system's own font scaling.
     }
     private TextView ink(TextView view, String role) {
         view.setTag(TEXT_STYLE, role); view.setTextColor(color(role)); return view;
@@ -336,7 +337,9 @@ public final class MainActivity extends Activity {
     }
     private void background(View view, String role, int radius) {
         view.setTag(BACKGROUND_STYLE, new Object[] {role, radius});
-        view.setBackground(surface(color(role), radius));
+        GradientDrawable shape = surface(color(role), radius);
+        if ("entry".equals(role)) shape.setStroke(dp(1), color("outline"));
+        view.setBackground(shape);
     }
     private GradientDrawable surface(int color, int radius) {
         GradientDrawable shape = new GradientDrawable(); shape.setColor(color); shape.setCornerRadius(dp(radius)); return shape;
@@ -418,13 +421,24 @@ public final class MainActivity extends Activity {
         }
         return group;
     }
+    private void menuSection(LinearLayout parent, String title) {
+        TextView label = ink(text(parent, title, 13), "muted");
+        label.setTextIsSelectable(false); spacing(label, 0, 14, 0, 6);
+    }
     private void showAppearance() {
         if (!authorized() || !dialogs.isEmpty() || busy || refreshing) return;
         LinearLayout box = column(); spacing(box, 16, 8, 16, 8); background(box, "background", 0);
-        RadioGroup themes = appearanceChoices(box, "主题", new String[] {"经典蓝", "淡绿青"}, new String[] {"blue", "mint"}, theme);
+        menuSection(box, "阅读");
         RadioGroup fonts = appearanceChoices(box, "字号", new String[] {"标准", "大字"}, new String[] {"standard", "large"}, fontSize);
+        LinearLayout preview = column(); background(preview, "surface", 12); spacing(preview, 12, 10, 12, 10); box.addView(preview);
+        ink(text(preview, "字号预览 · 保存后应用", 12), "muted").setTextIsSelectable(false);
+        TextView sample = text(preview, "把聊天放在前面，接着说说你的想法。", 17);
+        sample.setLineSpacing(dp(5), 1); sample.setTextIsSelectable(false);
+        fonts.setOnCheckedChangeListener((group, selected) -> sample.setTextSize(17 * Protocol.appearanceFontScale(group.findViewById(selected).getTag())));
         RadioGroup spaces = appearanceChoices(box, "间距", new String[] {"舒适", "紧凑"}, new String[] {"comfortable", "compact"}, density);
-        ink(text(box, "仅保存在这台手机；系统字体大小仍然有效。", 13), "muted");
+        menuSection(box, "外观");
+        RadioGroup themes = appearanceChoices(box, "主题", new String[] {"经典蓝", "淡绿青"}, new String[] {"blue", "mint"}, theme);
+        ink(text(box, "保留白色聊天背景。仅保存到这台手机，字号同时跟随系统设置。", 13), "muted");
         TextView notice = ink(text(box, appearanceReadFailed ? "未能读取外观设置，当前使用默认外观。" : "", 13), "warning");
         ScrollView viewport = new ScrollView(this); viewport.addView(box);
         AlertDialog dialog = new AlertDialog.Builder(this).setTitle("外观与偏好").setView(viewport)
@@ -506,7 +520,7 @@ public final class MainActivity extends Activity {
     private void clearPage() {
         generation++; content.removeAllViews(); header.removeAllViews(); composer.removeAllViews();
         actions.clear(); message = null; timeline = null; timelineSignature = ""; listSignature = "";
-        taskStatus = null; send = null; pause = null; latest = null; requestsAction = null;
+        taskStatus = null; taskSubtitle = null; send = null; pause = null; latest = null; requestsAction = null;
         originalInfo = ""; originalError = ""; statusPinned = false; status.setVisibility(View.GONE);
         originalPage = null; originalCursor = null; originalView = false; originalChoice = false;
         status.setMaxLines(2); operation.setMaxLines(2);
@@ -782,6 +796,11 @@ public final class MainActivity extends Activity {
             ink(text(content, offline ? "连接电脑后刷新，已有授权不会因此改变。" : "在电脑选择允许手机访问的任务，再生成配对信息。", 15), "muted");
             button(content, "刷新列表", connection() != null, this::refresh);
         }
+        spacing(composer, 0, 8, 0, 0);
+        View divider = new View(this); background(divider, "outline", 0);
+        composer.addView(divider, new LinearLayout.LayoutParams(-1, dp(1)));
+        Button settings = button(composer, "设置 · 外观与偏好", true, this::showAppearance);
+        settings.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
         listSignature = tasks.toString();
         int bound = generation;
         scroll.post(() -> { if (authorized() && bound == generation) scroll.scrollTo(0, position); });
@@ -852,14 +871,20 @@ public final class MainActivity extends Activity {
         back.setContentDescription("返回任务列表"); font(back, 28);
         spacing(back, 0, 8, 0, 8);
         back.setLayoutParams(new LinearLayout.LayoutParams(dp(48), -2));
-        TextView title = text(navigation, task.optString("title", "对话"), 18);
+        LinearLayout heading = column(); navigation.addView(heading, new LinearLayout.LayoutParams(0, -2, 1));
+        TextView title = text(heading, task.optString("title", "对话"), 16);
         title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         title.setMaxLines(1); title.setEllipsize(TextUtils.TruncateAt.END);
-        title.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
+        spacing(title, 0, 2, 0, 2);
+        taskSubtitle = ink(text(heading, "正在读取任务…", 12), "muted");
+        taskSubtitle.setMaxLines(1); taskSubtitle.setEllipsize(TextUtils.TruncateAt.END);
+        taskSubtitle.setTextIsSelectable(false); spacing(taskSubtitle, 0, 2, 0, 4);
         Button more = button(navigation, "⋯", fullTask(task), this::showDetails);
         more.setContentDescription("更多操作与完整任务名称"); font(more, 24);
         spacing(more, 0, 8, 0, 8);
         more.setLayoutParams(new LinearLayout.LayoutParams(dp(48), -2));
+        View divider = new View(this); background(divider, "outline", 0);
+        header.addView(divider, new LinearLayout.LayoutParams(-1, dp(1)));
         taskStatus = text(header, "", 14); compactStatus(taskStatus);
         requestsAction = button(header, "处理请求", true, this::showRequests);
         requestsAction.setVisibility(View.GONE);
@@ -871,7 +896,8 @@ public final class MainActivity extends Activity {
             taskStatus.setVisibility(View.VISIBLE);
             text(timeline, "可先写草稿，读到最新状态后再发送。", 17);
             spacing(composer, 0, 8, 0, 0);
-            draftInput(composer, id, "写下消息，连接后再发送");
+            messageEntry(id, "写下消息，连接后再发送");
+            compactChat();
             controls();
             return;
         }
@@ -881,14 +907,12 @@ public final class MainActivity extends Activity {
             else { scroll.scrollTo(0, Math.max(0, content.getHeight() - scroll.getHeight())); updateLatestButton(); }
         });
         latest.setVisibility(View.GONE);
-        LinearLayout entry = new LinearLayout(this); entry.setGravity(Gravity.BOTTOM);
-        background(entry, "surface", 16); spacing(entry, 4, 4, 4, 4); composer.addView(entry);
-        draftInput(entry, id, "发送消息…");
-        message.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
-        message.setBackgroundColor(Color.TRANSPARENT);
-        message.setTag(BACKGROUND_STYLE, null); // The shared composer surface owns this background.
-        LinearLayout commands = column(); entry.addView(commands, new LinearLayout.LayoutParams(dp(80), -2));
+        LinearLayout entry = messageEntry(id, "继续说说你的想法…");
+        LinearLayout commands = new LinearLayout(this); commands.setGravity(Gravity.CENTER_VERTICAL);
+        entry.addView(commands, new LinearLayout.LayoutParams(-1, -2));
         pause = button(commands, "暂停", false, () -> command(task, "pause", new JSONObject(), "暂停任务", "请求电脑暂停；收到原生终态之前不能假定已停止。", null));
+        pause.setLayoutParams(new LinearLayout.LayoutParams(dp(80), -2));
+        commands.addView(new View(this), new LinearLayout.LayoutParams(0, dp(1), 1));
         send = button(commands, "发送", false, () -> {
             try {
                 String value = Protocol.messageInput(draft(id));
@@ -897,7 +921,19 @@ public final class MainActivity extends Activity {
             } catch (Exception ex) { error(ex); }
         });
         styleButton(send, true);
+        send.setLayoutParams(new LinearLayout.LayoutParams(dp(96), -2));
         updateTask();
+    }
+
+    private LinearLayout messageEntry(String id, String hint) {
+        LinearLayout entry = column(); composer.addView(entry);
+        background(entry, "entry", 16); spacing(entry, 10, 6, 8, 8);
+        draftInput(entry, id, hint);
+        message.setBackgroundColor(Color.TRANSPARENT);
+        message.setTag(BACKGROUND_STYLE, null); // The shared composer surface owns this background.
+        spacing(message, 4, 8, 4, 8);
+        message.setGravity(Gravity.TOP | Gravity.START); message.setMinLines(2); message.setMaxLines(4);
+        return entry;
     }
 
     private void draftInput(LinearLayout parent, String id, String hint) {
@@ -921,6 +957,7 @@ public final class MainActivity extends Activity {
             return;
         }
         if (!fullTask(task)) {
+            taskSubtitle.setText("已保存的对话 · 等待更新");
             if (send != null) { send.setTag(false); send.setText("等待更新"); }
             if (pause != null) { pause.setTag(false); pause.setVisibility(View.GONE); }
             if (requestsAction != null) requestsAction.setVisibility(View.GONE);
@@ -931,6 +968,8 @@ public final class MainActivity extends Activity {
             return;
         }
         boolean control = controlAllowed(task);
+        taskSubtitle.setText(("workspace-write".equals(task.optString("mode")) ? "项目可写" : "项目只读")
+                + " · " + (!control ? "手机仅查看" : Protocol.quiet(task.optString("state")) ? "等待继续" : stateLabel(task.optString("state"))));
         boolean mutable = pending() == null && !task.optBoolean("archived") && !offline && control;
         boolean waitingBrief = !"direct".equals(task.optString("connection_mode"))
                 && task.optBoolean("brief_required") && candidate(task.optJSONObject("brief"));
@@ -946,12 +985,11 @@ public final class MainActivity extends Activity {
         requestsAction.setText("处理请求（" + requestCount + "）");
         String notice = requestCount > 0 ? " · 等待你处理请求" : "";
         if (waitingBrief) notice = " · 简报待核对，请点更多";
-        taskStatus.setText((control ? "" : "手机仅查看：请在电脑选择任务，并以“查看与控制”重新配对。\n")
-                + (task.optBoolean("archived") ? "任务已归档；请先在电脑取消归档，手机不能继续执行。\n" : "")
+        taskStatus.setText((task.optBoolean("archived") ? "任务已归档；请先在电脑取消归档，手机不能继续执行。\n" : "")
                 + (originalView && !originalError.isEmpty() ? "原文未更新：" + originalError + "\n" : "")
-                + (offline ? "离线快照 · " : "") + stateLabel(task.optString("state")) + " · " + ("workspace-write".equals(task.optString("mode")) ? "项目可写" : "项目只读") + notice
+                + (offline ? "连接未更新 · 草稿保留，不会自动重发" : stateLabel(task.optString("state"))) + notice
                 + (task.optString("error").isEmpty() ? "" : "\n" + task.optString("error")));
-        taskStatus.setVisibility(Protocol.taskNoticeNeeded(task.optString("state"), control, offline,
+        taskStatus.setVisibility(Protocol.taskNoticeNeeded(task.optString("state"), offline,
                 task.optBoolean("archived") || waitingBrief || requestCount > 0 || !task.optString("error").isEmpty()
                         || originalView && !originalError.isEmpty()) ? View.VISIBLE : View.GONE);
         compactChat();
@@ -974,7 +1012,8 @@ public final class MainActivity extends Activity {
         taskStatus.setMaxLines(keyboardOpen ? 1 : 2);
         status.setMaxLines(keyboardOpen ? 1 : 2);
         operation.setMaxLines(keyboardOpen ? 1 : 2);
-        message.setMaxLines(keyboardOpen ? 2 : 3);
+        message.setMinLines(keyboardOpen ? 1 : 2);
+        message.setMaxLines(keyboardOpen ? 2 : 4);
         JSONArray requests = task == null ? null : task.optJSONArray("pending");
         requestsAction.setVisibility(requests != null && requests.length() > 0 ? View.VISIBLE : View.GONE);
         updateLatestButton();
@@ -1035,7 +1074,7 @@ public final class MainActivity extends Activity {
     private void messageBody(LinearLayout parent, String value) {
         for (String[] block : Protocol.messageBlocks(value)) {
             if (!"code".equals(block[0])) {
-                TextView body = text(parent, "", 17); body.setText(styledText(block[2])); body.setLineSpacing(dp(3), 1);
+                TextView body = text(parent, "", 17); body.setText(styledText(block[2])); body.setLineSpacing(dp(5), 1);
                 continue;
             }
             LinearLayout bar = new LinearLayout(this); bar.setGravity(Gravity.CENTER_VERTICAL); parent.addView(bar);
@@ -1061,18 +1100,30 @@ public final class MainActivity extends Activity {
     private void chatMessage(String role, String value, String at, String notice, boolean verbatim) {
         boolean mine = "user".equals(role);
         LinearLayout bubble = column();
-        LinearLayout.LayoutParams layout = new LinearLayout.LayoutParams(-1, -2);
-        layout.setMargins(mine ? dp(32) : 0, dp(8), 0, dp(12));
-        spacing(bubble, mine ? 14 : 0, 8, mine ? 14 : 0, 8);
+        LinearLayout.LayoutParams layout = new LinearLayout.LayoutParams(mine ? -2 : -1, -2);
+        layout.gravity = mine ? Gravity.END : Gravity.START;
+        layout.setMargins(mine ? dp(24) : 0, 0, 0, dp(22));
+        spacing(bubble, mine ? 14 : 0, mine ? 8 : 0, mine ? 14 : 0, mine ? 8 : 0);
         if (mine) background(bubble, "selection", 16);
         timeline.addView(bubble, layout);
-        LinearLayout caption = new LinearLayout(this); caption.setGravity(Gravity.CENTER_VERTICAL); bubble.addView(caption);
-        TextView label = text(caption, (mine ? "你" : "Codex") + (at.isEmpty() ? "" : " · " + timeLabel(at)), 12);
-        label.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
-        ink(label, "muted"); label.setTextIsSelectable(false);
+        if (!mine) {
+            LinearLayout caption = new LinearLayout(this); caption.setGravity(Gravity.CENTER_VERTICAL);
+            spacing(caption, 0, 0, 0, 8); bubble.addView(caption);
+            TextView mark = text(caption, "C", 12); mark.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+            mark.setGravity(Gravity.CENTER); mark.setMinWidth(dp(24)); mark.setMinHeight(dp(24));
+            mark.setLayoutParams(new LinearLayout.LayoutParams(-2, -2)); spacing(mark, 5, 4, 5, 4);
+            background(mark, "accent", 6); ink(mark, "on_accent"); mark.setTextIsSelectable(false);
+            mark.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+            TextView label = text(caption, "Codex" + (at.isEmpty() ? "" : " · " + timeLabel(at)), 12);
+            label.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1)); spacing(label, 8, 0, 0, 0);
+            ink(label, "muted"); label.setTextIsSelectable(false);
+        } else {
+            TextView label = ink(text(bubble, "你" + (at.isEmpty() ? "" : " · " + timeLabel(at)), 11), "muted");
+            label.setGravity(Gravity.END); label.setTextIsSelectable(false); spacing(label, 0, 0, 0, 2);
+        }
         copyMenu(bubble, value, "完整消息");
-        if (!notice.isEmpty()) text(bubble, notice, 13);
-        if (verbatim) { TextView body = text(bubble, value, 17); body.setLineSpacing(dp(3), 1); }
+        if (!notice.isEmpty()) ink(text(bubble, notice, 13), "muted");
+        if (verbatim) { TextView body = text(bubble, value, 17); body.setLineSpacing(dp(5), 1); }
         else messageBody(bubble, value);
     }
 
@@ -1208,29 +1259,57 @@ public final class MainActivity extends Activity {
         if (!authorized() || !dialogs.isEmpty()) return;
         if (task != null && !fullTask(task)) { showStatus("完整任务尚未读取，暂不能打开任务操作。"); return; }
         LinearLayout box = column(); box.setPadding(dp(16), dp(8), dp(16), dp(8));
-        button(box, "外观与偏好", !refreshing, () -> {
-            if (dialogs.size() != 1 || busy || refreshing) return;
-            dismissDialogs(); showAppearance();
-        });
         if (task == null) {
+            menuSection(box, "连接");
             text(box, "这里只列出本次配对获授权的任务。请在电脑创建或导入、选择任务后连接手机。", 16);
             if (connection() != null && connection().has("expires_at"))
                 text(box, "连接授权到期：" + timeLabel(connection().optString("expires_at")), 14);
             button(box, "刷新任务列表", connection() != null, () -> { dismissDialogs(); refresh(); });
             button(box, "更换电脑 / 重新配对", pending() == null, () -> { dismissDialogs(); showPairing(); });
-            if (pending() != null) button(box, "查看待核对操作", true, () -> { dismissDialogs(); showOperationDetails(); });
-            showPanel("更多", box);
-            return;
+        } else {
+            text(box, task.optString("title", "对话"), 20).setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+            menuSection(box, "对话");
+            button(box, "刷新当前对话", true, () -> { dismissDialogs(); refresh(); });
+            button(box, originalView ? "查看管理记录" : "查看原始对话", true, () -> {
+                dismissDialogs(); generation++; originalChoice = true; originalView = !originalView;
+                timelineSignature = ""; originalPage = null; originalCursor = null; originalError = "";
+                updateTask();
+                if (originalView) readOriginal(null, false, true);
+            });
+            if (originalView) {
+                if (originalPage != null) ink(text(box, "原始对话 · 第 " + originalPage.optInt("page", 1)
+                        + " / " + originalPage.optInt("pages", 1) + " 页", 13), "muted");
+                LinearLayout pages = new LinearLayout(this); box.addView(pages);
+                String older = pageCursor("older_cursor"), newer = pageCursor("newer_cursor");
+                Button previous = button(pages, "较早", older != null, () -> { dismissDialogs(); readOriginal(older, false, true); });
+                Button next = button(pages, "较新", newer != null, () -> { dismissDialogs(); readOriginal(newer, false, true); });
+                Button newest = button(pages, "最新", true, () -> { dismissDialogs(); readOriginal(null, false, true); });
+                for (Button item : new Button[] {previous, next, newest}) item.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
+            }
+            menuSection(box, "任务");
+            if (!controlAllowed(task)) text(box, "手机仅查看。如需操作，请在电脑选择“查看与控制”后重新配对；项目权限仍以电脑设置为准。", 14);
+            JSONArray requests = task.optJSONArray("pending");
+            if (requests != null && requests.length() > 0)
+                button(box, "处理请求（" + requests.length() + "）", true, () -> { dismissDialogs(); showRequests(); });
+            boolean waitingBrief = !"direct".equals(task.optString("connection_mode"))
+                    && task.optBoolean("brief_required") && candidate(task.optJSONObject("brief"));
+            button(box, waitingBrief ? "核对简报与任务详情" : "任务详情与操作", true, () -> { dismissDialogs(); showTaskDetails(); });
         }
-        final JSONObject displayed = task;
-        text(box, displayed.optString("title", "对话"), 20).setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-        button(box, "刷新当前对话", true, () -> { dismissDialogs(); refresh(); });
-        button(box, originalView ? "查看管理记录" : "查看原始对话", true, () -> {
-            dismissDialogs(); generation++; originalChoice = true; originalView = !originalView;
-            timelineSignature = ""; originalPage = null; originalCursor = null; originalError = "";
-            updateTask();
-            if (originalView) readOriginal(null, false, true);
+        if (pending() != null) button(box, "查看待核对操作", true, () -> { dismissDialogs(); showOperationDetails(); });
+        menuSection(box, "设置");
+        button(box, "外观与偏好", !refreshing, () -> {
+            if (dialogs.size() != 1 || busy || refreshing) return;
+            dismissDialogs(); showAppearance();
         });
+        showPanel("更多", box);
+    }
+
+    private void showTaskDetails() {
+        if (!authorized() || !dialogs.isEmpty()) return;
+        if (!fullTask(task)) { showStatus("完整任务尚未读取，暂不能打开任务操作。"); return; }
+        final JSONObject displayed = task;
+        LinearLayout box = column(); box.setPadding(dp(16), dp(8), dp(16), dp(8));
+        text(box, displayed.optString("title", "对话"), 20).setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         if (originalView) {
             text(box, originalInfo.isEmpty() ? "原始对话尚未读取。" : originalInfo, 14);
             JSONArray entries = originalPage == null ? null : originalPage.optJSONArray("entries");
@@ -1240,14 +1319,7 @@ public final class MainActivity extends Activity {
                 text(box, "消息 " + (i + 1) + " · " + entry.optString("role") + " · 第 " + entry.optInt("part") + " / " + entry.optInt("parts")
                         + " 段 · " + entry.optString("turn_status", "unknown") + (entry.isNull("phase") ? "" : " · " + entry.optString("phase")), 13);
             }
-            LinearLayout pages = new LinearLayout(this); box.addView(pages);
-            String older = pageCursor("older_cursor"), newer = pageCursor("newer_cursor");
-            Button previous = button(pages, "较早", older != null, () -> { dismissDialogs(); readOriginal(older, false, true); });
-            Button next = button(pages, "较新", newer != null, () -> { dismissDialogs(); readOriginal(newer, false, true); });
-            Button newest = button(pages, "最新", true, () -> { dismissDialogs(); readOriginal(null, false, true); });
-            for (Button item : new Button[] {previous, next, newest}) item.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
         }
-        if (pending() != null) button(box, "查看待核对操作", true, () -> { dismissDialogs(); showOperationDetails(); });
         text(box, stateLabel(displayed.optString("state")) + " · " + ("workspace-write".equals(displayed.optString("mode")) ? "项目可写" : "项目只读")
                 + " · " + (controlAllowed(displayed) ? "手机可控制" : "手机仅查看"), 14);
         text(box, "长按消息边缘可复制完整原文；正文可选中文字复制。代码长行可左右滑动，标题旁可复制代码。无障碍操作中也提供完整复制。", 14);
@@ -1261,11 +1333,8 @@ public final class MainActivity extends Activity {
             button(box, "暂停任务", mutable, () -> command(displayed, "pause", new JSONObject(), "暂停任务", "请求电脑暂停；以原生终态确认结果。", null));
         button(box, "只读核对恢复", mutable && !Protocol.active(displayed.optString("state")),
                 () -> command(displayed, "reconcile", new JSONObject(), "核对恢复", "只读查询已知执行结果。不会自动继续或重试未知操作。", null));
-        JSONArray requests = displayed.optJSONArray("pending");
-        if (requests != null && requests.length() > 0)
-            button(box, "处理请求（" + requests.length() + "）", true, () -> { dismissDialogs(); showRequests(); });
         renderAssessments(box, displayed, quiet);
-        showPanel("更多", box);
+        showPanel("任务详情与操作", box);
     }
 
     private boolean candidate(JSONObject value) { return value != null && "current".equals(value.optString("status")) && "pending".equals(value.optString("decision")); }

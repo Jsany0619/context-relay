@@ -76,9 +76,10 @@ class ImportUiTests(unittest.TestCase):
     tearDown = base_ui.TkSmokeTests.tearDown
 
     def setUp(self):
+        base_ui.install_quiet_toplevels(self)
         try:
             self.root = tk.Tk()
-            self.root.withdraw()
+            base_ui.quiet_window(self.root)
         except tk.TclError as error:
             self.skipTest(f"Tk display unavailable: {error}")
         self.temp = tempfile.TemporaryDirectory()
@@ -131,7 +132,9 @@ class ImportUiTests(unittest.TestCase):
         self.assertTrue(all(thread != self.main_thread for method, thread in self.fake.calls if method == "list_import_threads"))
 
     def test_preview_is_explicit_and_import_requires_fresh_goal_confirmation(self):
+        base_ui.quiet_window(self.root, mapped=True)
         dialog = self.open_import()
+        base_ui.quiet_window(dialog, mapped=True)
         self.assertFalse(dialog.advanced_frame.winfo_ismapped())
         dialog.advanced_open.set(True)
         dialog.toggle_advanced()
@@ -295,6 +298,7 @@ class ImportUiTests(unittest.TestCase):
                 self.app = None
                 gc.collect()
                 self.root = tk.Tk()
+                base_ui.quiet_window(self.root, mapped=True)
                 self.root.tk.call("tk", "scaling", dpi / 72)
 
                 def factory(state_dir=None):
@@ -304,6 +308,7 @@ class ImportUiTests(unittest.TestCase):
                 self.app = RelayApp(self.root, state_dir=self.temp.name, factory=factory)
                 self.wait_for(lambda: self.app.ready and self.app.selected_id == "task-1")
                 dialog = self.open_import()
+                base_ui.quiet_window(dialog, mapped=True)
                 self.root.update()
                 for widget in (dialog.load_button, dialog.preview_button, dialog.save_button, dialog.close_button):
                     self.assertTrue(widget.winfo_ismapped())

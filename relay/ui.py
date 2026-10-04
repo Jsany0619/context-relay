@@ -7,11 +7,14 @@ from pathlib import Path
 import queue
 import struct
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 import zlib
 
 from .budget import budget_status, validate_limits
+from .chat_widgets import ConversationView, TaskCardList
+from .display import enable_native_dpi
 from .preferences import DEFAULTS, load_preferences, save_preferences
 
 
@@ -19,9 +22,9 @@ THEMES = {
     "blue": {"bg": "#f7f8fa", "surface": "#ffffff", "ink": "#17212b",
              "muted": "#606d7d", "accent": "#2457d6", "border": "#dce2e9",
              "select": "#e4ebfb", "control": "#edf0f4", "control_active": "#e3e7ed"},
-    "mint": {"bg": "#f1f8f5", "surface": "#ffffff", "ink": "#173a34",
-             "muted": "#526f67", "accent": "#147d6b", "border": "#cfe1d9",
-             "select": "#deefe7", "control": "#e6f1ed", "control_active": "#d8ebe4"},
+    "mint": {"bg": "#f7f9f8", "surface": "#ffffff", "ink": "#202927",
+             "muted": "#626e6a", "accent": "#226356", "border": "#dbe3df",
+             "select": "#e8eeea", "control": "#eef2f0", "control_active": "#e2e9e5"},
 }
 WARNING_BG = "#fff6e8"
 WARNING = "#8a4b08"
@@ -142,11 +145,11 @@ def apply_theme(root, preferences=None):
     compact = preferences["density"] == "compact"
     root._context_relay_palette = colors
     root.configure(background=colors["bg"])
-    for name, size, weight in (("TkDefaultFont", 10, "normal"), ("TkTextFont", 10, "normal"),
-                               ("TkMenuFont", 10, "normal"), ("TkHeadingFont", 11, "bold")):
+    for name, offset, weight in (("TkDefaultFont", 0, "normal"), ("TkTextFont", 1, "normal"),
+                                 ("TkMenuFont", 0, "normal"), ("TkHeadingFont", 1, "bold")):
         try:
             tkfont.nametofont(name, root=root).configure(
-                family="Segoe UI", size=base + size - 10, weight=weight)
+                family="Segoe UI", size=base + offset, weight=weight)
         except tk.TclError:
             pass
     root.option_add("*Text.background", colors["surface"])
@@ -176,9 +179,9 @@ def apply_theme(root, preferences=None):
     style.configure("Muted.TLabel", background=colors["bg"], foreground=colors["muted"])
     style.configure("Surface.Muted.TLabel", background=colors["surface"], foreground=colors["muted"])
     style.configure("Title.TLabel", background=colors["bg"], foreground=colors["ink"],
-                    font=("Segoe UI", base + 8, "bold"))
-    style.configure("Surface.Title.TLabel", background=colors["surface"], foreground=colors["ink"],
                     font=("Segoe UI", base + 5, "bold"))
+    style.configure("Surface.Title.TLabel", background=colors["surface"], foreground=colors["ink"],
+                    font=("Segoe UI", base + 3, "bold"))
     style.configure("Section.TLabel", background=colors["surface"], foreground=colors["ink"],
                     font=("Segoe UI", base + 1, "bold"))
     style.configure("Alert.TLabel", background=WARNING_BG, foreground=WARNING, padding=(10, 8))
@@ -211,6 +214,20 @@ def apply_theme(root, preferences=None):
                     relief="flat", padding=(6, 5 if compact else 7))
     style.map("Task.Treeview", background=[("selected", colors["select"])],
               foreground=[("selected", colors["ink"])])
+    card_pad = (12, 8) if compact else (14, 11)
+    style.configure("TaskCard.TFrame", background=colors["bg"], padding=card_pad)
+    style.configure("Selected.TaskCard.TFrame", background=colors["select"], padding=card_pad)
+    style.configure("Focused.TaskCard.TFrame", background=colors["control"], padding=card_pad,
+                    relief="solid", borderwidth=1, bordercolor=colors["accent"])
+    style.configure("Focused.SelectedCard.TFrame", background=colors["select"], padding=card_pad,
+                    relief="solid", borderwidth=1, bordercolor=colors["accent"])
+    for selected, background in (("", colors["bg"]), ("Selected.", colors["select"])):
+        style.configure(f"{selected}TaskCardTitle.TLabel", background=background, foreground=colors["ink"],
+                        font=("Segoe UI", base, "bold"))
+        style.configure(f"{selected}TaskCardPreview.TLabel", background=background, foreground=colors["muted"],
+                        font=("Segoe UI", max(9, base - 1)))
+        style.configure(f"{selected}TaskCardMeta.TLabel", background=background, foreground=colors["muted"],
+                        font=("Segoe UI", max(8, base - 2)))
     style.configure("Vertical.TScrollbar", background="#cfd7e1", troughcolor="#f1f3f6",
                     bordercolor="#f1f3f6", lightcolor="#cfd7e1", darkcolor="#cfd7e1",
                     arrowcolor=colors["muted"], relief="flat", borderwidth=0)
@@ -382,6 +399,23 @@ def set_text(widget, value, follow=False):
         widget.see("end")
     else:
         widget.yview_moveto(view[0] if follow else 0)
+
+
+def configure_changed(widget, **values):
+    changed = {key: value for key, value in values.items() if str(widget.cget(key)) != str(value)}
+    if changed:
+        widget.configure(**changed)
+
+
+def set_changed(variable, value):
+    if variable.get() != value:
+        variable.set(value)
+
+
+def menu_changed(menu, index, **values):
+    changed = {key: value for key, value in values.items() if str(menu.entrycget(index, key)) != str(value)}
+    if changed:
+        menu.entryconfigure(index, **changed)
 
 
 def text_area(parent, height):
@@ -761,11 +795,13 @@ class ImportDialog(tk.Toplevel):
 
     def controls(self):
         available = self.app.ready and not self.app.busy and not self.app.closing and self.app.recovery_info is None
-        self.load_button.configure(state="normal" if available else "disabled")
-        self.next_button.configure(state="normal" if available and self.next_cursor else "disabled")
-        self.preview_button.configure(state="normal" if available and self.selected_source else "disabled")
-        self.save_button.configure(state="normal" if available and self.can_save() and self.source_stopped.get() else "disabled")
-        self.connect_button.configure(state="normal" if available and self.can_save() and self.source_stopped.get() else "disabled")
+        configure_changed(self.load_button, state="normal" if available else "disabled")
+        configure_changed(self.next_button, state="normal" if available and self.next_cursor else "disabled")
+        configure_changed(self.preview_button,
+                          state="normal" if available and self.selected_source else "disabled")
+        enabled = available and self.can_save() and self.source_stopped.get()
+        configure_changed(self.save_button, state="normal" if enabled else "disabled")
+        configure_changed(self.connect_button, state="normal" if enabled else "disabled")
 
     def deliver(self, method, token, result=None, error=None):
         if token != (self.generation, self.selected_source):
@@ -796,7 +832,7 @@ class ImportDialog(tk.Toplevel):
                 self.tokens.set(str(existing.get("max_tokens", 0)))
                 self.minutes.set(str(existing.get("max_minutes", 0)))
                 self.auto.set(existing.get("auto_handoff", False))
-                self.save_button.configure(text="更新待启动任务")
+                configure_changed(self.save_button, text="更新待启动任务")
             status = result.get("status", "未知")
             if status == "notLoaded":
                 status = "未在本连接加载（原端状态未知）"
@@ -993,7 +1029,8 @@ class AssessmentDialog(tk.Toplevel):
             self.last_binding = deepcopy(binding)
             self.generation += 1
         kind = analysis_message_kind(task) or ("brief" if task.get("brief_required") else "review" if review else "brief")
-        self.task_status.set(f"任务状态：{STATES.get(task.get('state'), '未知')}\n{assessment_guidance(task, kind)}")
+        set_changed(self.task_status,
+                    f"任务状态：{STATES.get(task.get('state'), '未知')}\n{assessment_guidance(task, kind)}")
         report = brief.get("report") or {}
         fields = (brief.get("adopted_goal", report.get("goal", "")),
                   brief.get("adopted_acceptance", report.get("acceptance", [])))
@@ -1032,9 +1069,9 @@ class AssessmentDialog(tk.Toplevel):
         for widget, allowed in ((self.generate_brief, generate), (self.generate_review, generate and task.get("work_turns", 0) > 0),
                                 (self.adopt_button, brief_pending), (self.accept_button, review_pending and report.get("verdict") == "ready_for_user"),
                                 (self.revise_button, review_pending and generate and bool(task.get("thread_id")))):
-            widget.configure(state="normal" if allowed else "disabled")
+            configure_changed(widget, state="normal" if allowed else "disabled")
         for editor in (self.goal_text, self.acceptance_text):
-            editor.configure(state="normal" if brief_pending else "disabled")
+            configure_changed(editor, state="normal" if brief_pending else "disabled")
 
     def action(self, method, *values):
         button = (self.generate_brief if values == ("brief",) else self.generate_review) if method == "analyze" else {
@@ -1083,9 +1120,24 @@ class PreferencesDialog(tk.Toplevel):
         self.theme = tk.StringVar(value=self._label(self.THEMES, self.original["theme"]))
         self.font_size = tk.StringVar(value=self._label(self.FONT_SIZES, self.original["font_size"]))
         self.density = tk.StringVar(value=self._label(self.DENSITIES, self.original["density"]))
+        ttk.Label(body, text="配色", style="Surface.TLabel").grid(row=2, column=0, sticky="nw", pady=5)
+        theme_choices = ttk.Frame(body, style="Surface.TFrame")
+        theme_choices.grid(row=2, column=1, sticky="ew", padx=(18, 0), pady=5)
+        for column, (label, key) in enumerate(self.THEMES.items()):
+            card = ttk.Frame(theme_choices, style="Surface.TFrame")
+            card.grid(row=0, column=column, sticky="w", padx=(0, 14))
+            ttk.Radiobutton(card, text=label, value=label, variable=self.theme,
+                            command=self.preview).pack(anchor="w")
+            sample = tk.Frame(card, width=74, height=24, background=THEMES[key]["bg"],
+                              highlightthickness=1, highlightbackground=THEMES[key]["border"])
+            sample.pack(anchor="w", padx=(20, 0), pady=(3, 0))
+            sample.pack_propagate(False)
+            tk.Frame(sample, width=22, background=THEMES[key]["select"]).pack(side="left", fill="y")
+            tk.Frame(sample, height=5, background=THEMES[key]["accent"]).pack(
+                side="right", fill="x", expand=True, padx=8, pady=9)
         for row, (label, variable, values) in enumerate((
-                ("配色", self.theme, self.THEMES), ("字号", self.font_size, self.FONT_SIZES),
-                ("间距", self.density, self.DENSITIES)), start=2):
+                ("字号", self.font_size, self.FONT_SIZES),
+                ("间距", self.density, self.DENSITIES)), start=3):
             ttk.Label(body, text=label, style="Surface.TLabel").grid(row=row, column=0, sticky="w", pady=5)
             choice = ttk.Combobox(body, textvariable=variable, values=tuple(values), state="readonly", width=18)
             choice.grid(row=row, column=1, sticky="ew", padx=(18, 0), pady=5)
@@ -1160,6 +1212,12 @@ class RelayApp:
         self.phone_request = None
         self.diagnostics_window = None
         self.preferences_dialog = None
+        self.chat_cache = {}
+        self.chat_request = None
+        self.chat_wanted = None
+        self.chat_native_task = None
+        self.chat_generation = 0
+        self._last_clock_controls = time.monotonic()
         self.preferences = load_preferences()
         self.style = apply_theme(self.root, self.preferences)
         self.root.title("Context Relay · 本机任务管理器")
@@ -1179,28 +1237,14 @@ class RelayApp:
         self.search = tk.StringVar()
         self.state_filter = tk.StringVar(value=FILTERS[0])
         self._build()
-        self.search.trace_add("write", lambda *args: self._apply_filters())
+        self.search.trace_add("write", self._search_changed)
         self.state_filter.trace_add("write", lambda *args: self._apply_filters())
         self.worker = CommandWorker(factory, state_dir)
         self.worker.start()
         self._pump_after = self.root.after(40, self._pump)
 
     def _build(self):
-        compact = self.root.winfo_screenheight() < 900
-        header = ttk.Frame(self.root, style="Sidebar.TFrame")
-        header.pack(fill="x", padx=20, pady=(16, 10))
-        brand = ttk.Frame(header, style="Sidebar.TFrame")
-        brand.pack(side="left")
-        ttk.Label(brand, text="Context Relay", style="Title.TLabel").pack(side="left")
-        ttk.Label(brand, text="本机任务 · 导入不会修改原聊天", style="Muted.TLabel").pack(
-            side="left", padx=(12, 0))
-        self.import_button = ttk.Button(header, text="导入已有 Codex 聊天", command=self._open_import)
-        self.import_button.pack(side="right")
-        self.more_button = ttk.Menubutton(header, text="更多")
-        self.more_button.pack(side="right", padx=8)
-        self.more_menu = tk.Menu(self.more_button, tearoff=False)
-        self.more_button.configure(menu=self.more_menu)
-        self.more_entries = {}
+        compact = self.preferences["density"] == "compact" or self.root.winfo_screenheight() < 900
         self._action_proxies = ttk.Frame(self.root)
         self.phone_button = ttk.Button(self._action_proxies, text="手机连接", command=self._open_phone)
         self.backup_button = ttk.Button(self._action_proxies, text="备份管理器", command=self._backup)
@@ -1210,52 +1254,90 @@ class RelayApp:
         self.diagnostics_button = ttk.Button(self._action_proxies, text="诊断信息", command=self._open_diagnostics)
         self.assessment_button = ttk.Button(self._action_proxies, text="简报 / 审核", command=self._open_assessment)
         self.recovery_banner = ttk.Label(self.root, wraplength=1140, justify="left", style="Alert.TLabel")
+
         panes = ttk.Panedwindow(self.root, orient="horizontal")
         self.panes = panes
-        panes.pack(fill="both", expand=True, padx=16, pady=(0, 8))
-        left = ttk.Frame(panes, padding=(4, 10, 14, 10), style="Sidebar.TFrame")
-        right = ttk.Frame(panes, padding=(18, 14), style="Surface.TFrame")
+        panes.pack(fill="both", expand=True)
+        left = ttk.Frame(panes, width=268, padding=(16, 18, 12, 14), style="Sidebar.TFrame")
+        right = ttk.Frame(panes, padding=(0, 0), style="Surface.TFrame")
         self.sidebar, self.chat_panel = left, right
-        panes.add(left, weight=1)
-        panes.add(right, weight=4)
-        self.new_button = ttk.Button(left, text="新建任务", command=lambda: NewTaskDialog(self.root, self.submit))
-        self.new_button.pack(fill="x", pady=(0, 8))
-        ttk.Label(left, text="搜索名称、目标或目录", style="Muted.TLabel").pack(anchor="w")
-        self.search_entry = ttk.Entry(left, textvariable=self.search)
-        self.search_entry.pack(fill="x", pady=(2, 6))
-        self.filter_choice = ttk.Combobox(left, textvariable=self.state_filter, values=FILTERS, state="readonly")
-        self.filter_choice.pack(fill="x", pady=(0, 6))
+        panes.add(left, weight=0)
+        panes.add(right, weight=1)
+
+        ttk.Label(left, text="我的任务", style="Title.TLabel").pack(anchor="w", pady=(0, 12))
+        create_row = ttk.Frame(left, style="Sidebar.TFrame")
+        create_row.pack(fill="x", pady=(0, 12))
+        self.new_button = ttk.Button(create_row, text="新建", style="Primary.TButton",
+                                     command=lambda: NewTaskDialog(self.root, self.submit))
+        self.new_button.pack(side="left", fill="x", expand=True)
+        self.import_button = ttk.Button(create_row, text="导入", command=self._open_import)
+        self.import_button.pack(side="left", padx=(8, 0))
+        find_row = ttk.Frame(left, style="Sidebar.TFrame")
+        find_row.pack(fill="x", pady=(0, 8))
+        self.search_entry = ttk.Entry(find_row, textvariable=self.search)
+        self.search_entry.pack(side="left", fill="x", expand=True)
+        self.search_placeholder = ttk.Label(find_row, text="搜索任务", style="Muted.TLabel", cursor="xterm")
+        self.search_placeholder.place(in_=self.search_entry, x=9, rely=.5, anchor="w")
+        self.search_placeholder.bind("<Button-1>", lambda _event: self.search_entry.focus_set())
+        self.search_entry.bind("<FocusIn>", lambda _event: self._sync_search_placeholder())
+        self.search_entry.bind("<FocusOut>", lambda _event: self._sync_search_placeholder())
+        self.filter_choice = ttk.Combobox(find_row, width=9, textvariable=self.state_filter,
+                                          values=FILTERS, state="readonly")
+        self.filter_choice.pack(side="left", padx=(7, 0))
         self.attention_button = ttk.Button(left, command=self._show_attention)
-        self.attention_button.pack(fill="x", pady=(0, 8))
+
         self.buttons = {}
         for label, method in (("操作记录", "get_task"), ("归档", "set_archived")):
-            button = ttk.Button(self._action_proxies, text=label, command=lambda action=method: self._action(action))
-            self.buttons[method] = button
-        self.buttons["update_settings"] = ttk.Button(self._action_proxies, text="任务设置", command=lambda: self._action("update_settings"))
-        self.buttons["reopen_task"] = ttk.Button(self._action_proxies, text="重新打开", command=lambda: self._action("reopen_task"))
-        task_list = ttk.Frame(left, style="Sidebar.TFrame")
-        task_list.pack(fill="both", expand=True)
-        self.task_tree = ttk.Treeview(task_list, columns=("state",), show="tree headings",
-                                      selectmode="browse", style="Task.Treeview")
-        self.task_tree.heading("#0", text="任务")
-        self.task_tree.heading("state", text="状态")
-        self.task_tree.column("#0", width=160, minwidth=100)
-        self.task_tree.column("state", width=92, minwidth=75, stretch=False)
-        self.task_tree.pack(side="left", fill="both", expand=True)
-        scrollbar = ttk.Scrollbar(task_list, command=self.task_tree.yview)
-        self.task_tree.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side="right", fill="y")
-        self.task_tree.bind("<<TreeviewSelect>>", self._select_task)
-        task_header = ttk.Frame(right, style="Surface.TFrame")
+            self.buttons[method] = ttk.Button(
+                self._action_proxies, text=label, command=lambda action=method: self._action(action))
+        self.buttons["update_settings"] = ttk.Button(
+            self._action_proxies, text="任务设置", command=lambda: self._action("update_settings"))
+        self.buttons["reopen_task"] = ttk.Button(
+            self._action_proxies, text="重新打开", command=lambda: self._action("reopen_task"))
+        self.settings_button = ttk.Menubutton(left, text="设置", style="Rounded.TMenubutton")
+        self.settings_menu = tk.Menu(self.settings_button, tearoff=False)
+        self.settings_button.configure(menu=self.settings_menu)
+        self.settings_entries = {}
+        self.settings_entry_menus = {}
+        general_menu = tk.Menu(self.settings_menu, tearoff=False)
+        general_menu.add_command(label="外观与偏好", command=self._open_preferences)
+        self.settings_menu.add_cascade(label="通用", menu=general_menu)
+        self.settings_entries["preferences"] = general_menu.index("end")
+        self.settings_entry_menus["preferences"] = general_menu
+        self.settings_menu.add_command(label="手机连接", command=self.phone_button.invoke)
+        self.settings_entries["phone"] = self.settings_menu.index("end")
+        self.settings_entry_menus["phone"] = self.settings_menu
+        data_menu = tk.Menu(self.settings_menu, tearoff=False)
+        for label, key, command in (("备份管理器", "backup", self.backup_button.invoke),
+                                    ("诊断信息", "diagnostics", self.diagnostics_button.invoke)):
+            data_menu.add_command(label=label, command=command)
+            self.settings_entries[key] = data_menu.index("end")
+            self.settings_entry_menus[key] = data_menu
+        self.settings_menu.add_cascade(label="数据与诊断", menu=data_menu)
+        self.settings_button.pack(side="bottom", fill="x", pady=(10, 0))
+        self.task_tree = TaskCardList(left, self._choose_task)
+        self.task_tree.pack(fill="both", expand=True)
+
+        task_header = ttk.Frame(right, padding=(24, 18, 22, 12), style="Surface.TFrame")
         self.task_header = task_header
-        task_header.pack(fill="x", pady=(0, 6))
-        ttk.Label(task_header, textvariable=self.task_heading, style="Surface.Title.TLabel",
-                  wraplength=680, justify="left").pack(side="left", fill="x", expand=True)
-        self.details_button = ttk.Button(task_header, text="显示任务详情", command=self._toggle_details)
-        self.details_button.pack(side="right", padx=(10, 0))
-        self.task_alert_label = ttk.Label(right, textvariable=self.task_alert, wraplength=820,
+        task_header.pack(fill="x")
+        title_area = ttk.Frame(task_header, style="Surface.TFrame")
+        title_area.pack(side="left", fill="x", expand=True)
+        ttk.Label(title_area, textvariable=self.task_heading, style="Surface.Title.TLabel",
+                  wraplength=650, justify="left").pack(anchor="w")
+        self.task_subtitle = tk.StringVar(value="选择左侧任务查看对话")
+        ttk.Label(title_area, textvariable=self.task_subtitle, style="Surface.Muted.TLabel").pack(anchor="w", pady=(2, 0))
+        self.more_button = ttk.Menubutton(task_header, width=3, text="⋯", style="Rounded.TMenubutton")
+        self.more_button.pack(side="right", padx=(8, 0))
+        self.details_button = ttk.Button(task_header, width=4, text="详情", command=self._toggle_details)
+        self.details_button.pack(side="right")
+        self.more_menu = tk.Menu(self.more_button, tearoff=False)
+        self.more_button.configure(menu=self.more_menu)
+        self.more_entries = {}
+
+        self.task_alert_label = ttk.Label(right, textvariable=self.task_alert, wraplength=840,
                                           justify="left", style="Alert.TLabel")
-        self.details_panel = ttk.Frame(right, style="Surface.TFrame")
+        self.details_panel = ttk.Frame(right, padding=(24, 4, 24, 10), style="Surface.TFrame")
         ttk.Label(self.details_panel, textvariable=self.details, wraplength=820, justify="left",
                   style="Surface.TLabel").pack(fill="x", pady=(0, 6))
         self.budget_label = ttk.Label(self.details_panel, textvariable=self.budget_details, wraplength=820,
@@ -1264,11 +1346,8 @@ class RelayApp:
         goal = ttk.LabelFrame(self.details_panel, text="目标", style="Surface.TLabelframe")
         goal.pack(fill="x")
         self.goal_text = text_area(goal, 2 if compact else 3)
-        self.latest_frame = ttk.Frame(right, style="Surface.TFrame")
-        self.latest_frame.pack(fill="both", expand=True, pady=(4, 8))
-        ttk.Label(self.latest_frame, text="最新回复", style="Section.TLabel").pack(anchor="w", pady=(0, 2))
-        self.latest_text = text_area(self.latest_frame, 4 if compact else 8)
-        workflow = ttk.Frame(right, style="Surface.TFrame")
+
+        workflow = ttk.Frame(right, padding=(22, 0, 22, 14), style="Surface.TFrame")
         self.workflow = workflow
         workflow.pack(side="bottom", fill="x")
         self.pending_frame = ttk.LabelFrame(workflow, text="需要审批 / 回答", style="Attention.TLabelframe")
@@ -1278,42 +1357,56 @@ class RelayApp:
         self.request_text = text_area(self.pending_frame, 3 if compact else 4)
         self.answer_frame = ttk.Frame(self.pending_frame, padding=(6, 0, 6, 6), style="Surface.TFrame")
         self.answer_frame.pack(fill="x")
-        self.approval_allow = ttk.Button(self.answer_frame, text="仅此一次允许", command=lambda: self._answer_approval("accept"))
-        self.approval_decline = ttk.Button(self.answer_frame, text="拒绝", command=lambda: self._answer_approval("decline"))
+        self.approval_allow = ttk.Button(
+            self.answer_frame, text="仅此一次允许", command=lambda: self._answer_approval("accept"))
+        self.approval_decline = ttk.Button(
+            self.answer_frame, text="拒绝", command=lambda: self._answer_approval("decline"))
         self.controls_frame = ttk.Frame(workflow, style="Surface.TFrame")
         self.controls_frame.pack(fill="x")
-        ttk.Separator(self.controls_frame).pack(fill="x", pady=(2, 10))
-        ttk.Label(self.controls_frame, text="发给 Codex（可留空继续）",
-                  style="Surface.Muted.TLabel").pack(anchor="w")
         colors = self.root._context_relay_palette
-        self.composer_frame = ttk.Frame(self.controls_frame, style="RoundedEntry.TFrame", padding=(8, 2))
-        self.composer_frame.pack(fill="x", pady=(4, 8))
-        self.message_text = tk.Text(self.composer_frame, height=1 if compact else 2, wrap="word", relief="flat",
+        self.composer_frame = ttk.Frame(self.controls_frame, style="RoundedEntry.TFrame", padding=(12, 8))
+        self.composer_frame.pack(fill="x", pady=(8, 0))
+        self.primary_actions = ttk.Frame(self.composer_frame, style="Surface.TFrame")
+        self.primary_actions.pack(side="bottom", fill="x", pady=(5, 0))
+        ttk.Label(self.primary_actions, text="原话发送 · 可换行", style="Surface.Muted.TLabel").pack(side="left")
+        for label, method in (("核对恢复", "reconcile"), ("暂停", "pause"), ("发送 / 继续", "start")):
+            button = ttk.Button(self.primary_actions, text=label,
+                                style="Primary.TButton" if method == "start" else "Secondary.TButton",
+                                command=lambda action=method: self._action(action))
+            button.pack(side="right", padx=(6, 0))
+            self.buttons[method] = button
+        self.message_text = tk.Text(self.composer_frame, height=2 if compact else 3, wrap="word", relief="flat",
                                     background=colors["surface"], foreground=colors["ink"],
                                     insertbackground=colors["ink"], selectbackground=colors["accent"],
-                                    borderwidth=0, highlightthickness=0, padx=3, pady=6, font="TkTextFont")
+                                    borderwidth=0, highlightthickness=0, padx=3, pady=4, font="TkTextFont")
         self.message_text.pack(fill="x")
-        self.message_text.bind("<FocusIn>", lambda _event: self.composer_frame.state(["focus"]))
-        self.message_text.bind("<FocusOut>", lambda _event: self.composer_frame.state(["!focus"]))
-        self.primary_actions = ttk.Frame(self.controls_frame, style="Surface.TFrame")
-        self.primary_actions.pack(fill="x")
-        for label, method in (("发送 / 继续", "start"), ("暂停", "pause"), ("核对恢复", "reconcile")):
-            button = ttk.Button(self.primary_actions, text=label,
-                                style="Primary.TButton" if method == "start" else "TButton",
-                                command=lambda action=method: self._action(action))
-            button.pack(side="left", padx=(0, 5))
-            self.buttons[method] = button
+        self.message_placeholder = ttk.Label(self.composer_frame, text="输入消息…",
+                                             style="Surface.Muted.TLabel", cursor="xterm")
+        self.message_placeholder.place(in_=self.message_text, x=6, y=7, anchor="nw")
+        self.message_placeholder.bind("<Button-1>", lambda _event: self.message_text.focus_set())
+        self.message_text.bind("<FocusIn>", self._message_focus_in)
+        self.message_text.bind("<FocusOut>", self._message_focus_out)
+        self.message_text.bind("<KeyRelease>", lambda _event: self._sync_message_placeholder())
+
+        self.chat_nav = ttk.Frame(right, padding=(24, 2, 24, 4), style="Surface.TFrame")
+        self.chat_position = tk.StringVar()
+        ttk.Label(self.chat_nav, textvariable=self.chat_position, style="Surface.Muted.TLabel").pack(side="left")
+        self.chat_older = ttk.Button(self.chat_nav, text="较早", command=lambda: self._navigate_chat("older"))
+        self.chat_latest = ttk.Button(self.chat_nav, text="最新", command=lambda: self._navigate_chat("latest"))
+        self.chat_latest.pack(side="right")
+        self.chat_older.pack(side="right", padx=(0, 6))
+        self.latest_frame = ConversationView(right)
+        self.latest_frame.configure_tags(colors)
+        self.latest_frame.pack(fill="both", expand=True)
+        self.latest_text = self.latest_frame.text
+
         for label, method in (("预备快照", "prepare_snapshot"), ("交接", "handoff"),
                               ("标记完成", "finish"), ("导出", "export_task")):
             self.buttons[method] = ttk.Button(self._action_proxies, text=label,
                                                command=lambda action=method: self._action(action))
         for label, key, command in (
-                ("手机连接", "phone", self.phone_button.invoke),
-                ("外观与偏好", "preferences", self._open_preferences),
-                ("备份管理器", "backup", self.backup_button.invoke),
-                ("诊断信息", "diagnostics", self.diagnostics_button.invoke),
                 ("任务设置", "update_settings", self.buttons["update_settings"].invoke),
-                ("查看 Codex 原始对话", "open_chat", self.open_chat),
+                ("刷新原始对话", "open_chat", self.open_chat),
                 ("操作记录", "get_task", self.buttons["get_task"].invoke),
                 ("核对恢复", "reconcile", self.buttons["reconcile"].invoke),
                 ("简报 / 审核", "assessment", self.assessment_button.invoke),
@@ -1328,17 +1421,42 @@ class RelayApp:
             self.more_menu.add_command(label=label, command=command)
             self.more_entries[key] = self.more_menu.index("end")
         ttk.Label(self.root, textvariable=self.status, wraplength=1140, justify="left",
-                  style="Muted.TLabel").pack(fill="x", padx=20, pady=(2, 12))
+                  style="Muted.TLabel").pack(fill="x", padx=18, pady=(5, 8))
         self._controls()
+
+    def _search_changed(self, *_args):
+        self._sync_search_placeholder()
+        self._apply_filters()
+
+    def _sync_search_placeholder(self):
+        if not self.search.get() and self.root.focus_get() is not self.search_entry:
+            self.search_placeholder.place(in_=self.search_entry, x=9, rely=.5, anchor="w")
+        else:
+            self.search_placeholder.place_forget()
+
+    def _sync_message_placeholder(self):
+        if (not self.message_text.get("1.0", "end-1c")
+                and self.root.focus_get() is not self.message_text):
+            self.message_placeholder.place(in_=self.message_text, x=6, y=7, anchor="nw")
+        else:
+            self.message_placeholder.place_forget()
+
+    def _message_focus_in(self, _event):
+        self.composer_frame.state(["focus"])
+        self._sync_message_placeholder()
+
+    def _message_focus_out(self, _event):
+        self.composer_frame.state(["!focus"])
+        self.root.after_idle(self._sync_message_placeholder)
 
     def _toggle_details(self):
         self.details_expanded = not self.details_expanded
         if self.details_expanded:
             self.details_panel.pack(fill="x", before=self.latest_frame)
-            self.details_button.configure(text="收起任务详情")
+            self.details_button.configure(text="收起")
         else:
             self.details_panel.pack_forget()
-            self.details_button.configure(text="显示任务详情")
+            self.details_button.configure(text="详情")
 
     def submit(self, method, *args, _before_enqueue=None, **kwargs):
         if not self.ready or self.busy or self.closing:
@@ -1375,6 +1493,8 @@ class RelayApp:
     def apply_preferences(self, values):
         self.preferences = dict(values)
         self.style = apply_theme(self.root, self.preferences)
+        if hasattr(self, "latest_frame"):
+            self.latest_frame.configure_tags(self.root._context_relay_palette)
         self.root.update_idletasks()
 
     def submit_remote(self, dialog, method, *args):
@@ -1464,16 +1584,120 @@ class RelayApp:
             self.diagnostics_window.destroy()
 
     def open_chat(self):
-        if self.busy or self.closing or self.selected_id not in self.visible_ids:
+        self._request_chat(None, force=True)
+
+    def _choose_task(self, task_id):
+        self.selected_id = task_id if task_id in self.visible_ids else None
+        self._render_task()
+
+    def _visible_messages(self, task):
+        visible = []
+        for message in task.get("messages") or []:
+            if (isinstance(message, dict) and message.get("role") in ("user", "assistant")
+                    and message.get("status") == "completed" and message.get("purpose") == "work"
+                    and isinstance(message.get("text"), str) and message["text"]):
+                visible.append({"role": message["role"], "text": message["text"]})
+        if not visible:
+            reply = task_reply(task)
+            if reply and reply != "尚无回复。":
+                visible.append({"role": "assistant", "text": reply})
+        return visible
+
+    def _chat_marker(self, task):
+        return tuple(task.get(key) for key in (
+            "state", "turn_id", "last_message", "updated_at", "work_turns", "generation"))
+
+    def _task_preview(self, task):
+        messages = self._visible_messages(task)
+        value = messages[-1]["text"] if messages else "尚无已完成回复"
+        value = " ".join(value.split())
+        return value[:24] + ("…" if len(value) > 24 else "")
+
+    def _task_card(self, task):
+        state = "已归档" if task.get("archived") else STATES.get(task.get("state"), task.get("state", "未知"))
+        stamp = task.get("updated_at") or task.get("created_at") or ""
+        stamp = str(stamp).replace("T", " ")[:16]
+        footer = f"{state}  ·  {stamp}" if stamp else state
+        return {"id": task["id"], "title": task["title"],
+                "preview": self._task_preview(task), "meta": footer}
+
+    def _request_chat(self, cursor=None, force=False):
+        task = self.tasks.get(self.selected_id)
+        if (not task or self.closing or self.recovery_info is not None
+                or task.get("connection_mode") != "direct" and not force):
+            return False
+        if force or task.get("connection_mode") == "direct":
+            self.chat_native_task = task["id"]
+        self.chat_wanted = (task["id"], cursor, self.chat_generation)
+        return self._maybe_request_chat()
+
+    def _maybe_request_chat(self):
+        wanted = self.chat_wanted
+        if wanted is None or self.chat_request is not None or self.busy or not self.ready or self.closing:
+            return False
+        task_id, cursor, generation = wanted
+        if task_id != self.selected_id or task_id not in self.visible_ids:
+            return False
+        def mark():
+            self.chat_request = (task_id, cursor, generation)
+            self.chat_wanted = None
+        if self.submit("read_chat", task_id, cursor, _before_enqueue=mark):
+            self._render_conversation(self.tasks.get(task_id), loading=True)
+            return True
+        return False
+
+    def _navigate_chat(self, direction):
+        cached = self.chat_cache.get(self.selected_id) or {}
+        cursor = cached.get("older_cursor") if direction == "older" else None
+        if direction == "older" and cursor is None:
             return
-        previous = getattr(self, "conversation_window", None)
-        if previous is not None and previous.winfo_exists():
-            previous.destroy()
-        self.conversation_window = tk.Toplevel(self.root)
-        self.conversation_window.title("Codex 原始对话")
-        self.conversation_window.geometry("800x650")
-        ttk.Label(self.conversation_window, text="正在读取原文…").pack(padx=16, pady=16)
-        self.submit("read_chat", self.selected_id)
+        self._request_chat(cursor, force=True)
+
+    def _render_conversation(self, task, loading=False):
+        if not task:
+            self.chat_nav.pack_forget()
+            self.latest_frame.render([], ())
+            return
+        if task.get("connection_mode") == "direct" or self.chat_native_task == task["id"]:
+            cached = self.chat_cache.get(task["id"])
+            messages = []
+            notices = []
+            if isinstance(cached, dict) and isinstance(cached.get("entries"), list):
+                messages = [{"role": item["role"], "text": item["text"]} for item in cached["entries"]
+                            if isinstance(item, dict) and item.get("role") in ("user", "assistant")
+                            and item.get("turn_status") == "completed"
+                            and isinstance(item.get("text"), str)]
+                notices.append((cached.get("notice", ""), "notice"))
+                if cached.get("newer_available"):
+                    notices.append(("任务有新状态；当前仍保留较早页。点击“最新”读取新内容。", "notice"))
+                if cached.get("error"):
+                    notices.append((f"刷新失败：{cached['error']}。已保留上次读取内容。", "error"))
+                self.chat_position.set(f"原始对话 · 第 {cached.get('page', '?')} / {cached.get('pages', '?')} 页")
+                self.chat_older.configure(state="normal" if cached.get("older_cursor") else "disabled")
+                self.chat_latest.configure(state="normal")
+                self.chat_nav.pack(fill="x", before=self.latest_frame)
+            else:
+                self.chat_position.set("原始对话")
+                self.chat_nav.pack(fill="x", before=self.latest_frame)
+                self.chat_older.configure(state="disabled")
+                self.chat_latest.configure(state="disabled" if loading else "normal")
+                if isinstance(cached, dict) and cached.get("error"):
+                    notices.append((f"原始对话读取失败：{cached['error']}。未用任务摘要代替。", "error"))
+            if loading:
+                notices.append(("正在只读读取原始对话…", "notice"))
+            elif not cached:
+                notices.append(("尚未读到原始对话；不会用任务摘要代替。", "notice"))
+            self.latest_frame.render(messages, notices, follow=not loading)
+            return
+        self.chat_nav.pack_forget()
+        messages = self._visible_messages(task)
+        notices = []
+        if task.get("messages_truncated") or any(
+                message.get("truncated") for message in task.get("messages") or [] if isinstance(message, dict)):
+            notices.append(("较早的本机对话已截短；这里仅显示当前保留的已完成工作消息。", "notice"))
+        if any(message.get("historical") for message in task.get("messages") or [] if isinstance(message, dict)):
+            notices.append(("含导入的历史消息；它们不代表本机已重新执行。", "notice"))
+        self.latest_frame.render(messages, notices, follow=True)
 
     def _action(self, method):
         if self.selected_id not in self.visible_ids or self.buttons[method].instate(["disabled"]):
@@ -1509,8 +1733,21 @@ class RelayApp:
         self._render_task()
 
     def _render_tasks(self, tasks):
+        previous = self.tasks.get(self.selected_id)
         self.tasks = {task["id"]: task for task in tasks}
         self._apply_filters()
+        current = self.tasks.get(self.selected_id)
+        if (previous and current and previous.get("id") == current.get("id")
+                and current.get("connection_mode") == "direct"
+                and self._chat_marker(previous) != self._chat_marker(current)
+                and current["id"] in self.chat_cache):
+            cached = self.chat_cache[current["id"]]
+            if cached.get("newer_cursor") or cached.get("page", 1) < cached.get("pages", 1):
+                cached["newer_available"] = True
+                self._render_conversation(current)
+            elif self.recovery_info is None:
+                self.chat_wanted = (current["id"], None, self.chat_generation)
+                self.root.after_idle(self._maybe_request_chat)
 
     def _show_attention(self):
         if self.closing or not self.attention_count:
@@ -1537,19 +1774,9 @@ class RelayApp:
                 continue
             visible.append(task)
         self.visible_ids = {task["id"] for task in visible}
-        for item in self.task_tree.get_children():
-            if item not in self.visible_ids:
-                self.task_tree.delete(item)
-        for task in visible:
-            values = ("已归档" if task.get("archived") else STATES.get(task.get("state"), task.get("state", "未知")),)
-            if self.task_tree.exists(task["id"]):
-                self.task_tree.item(task["id"], text=task["title"], values=values)
-            else:
-                self.task_tree.insert("", "end", iid=task["id"], text=task["title"], values=values)
         if self.selected_id not in self.visible_ids:
             self.selected_id = visible[0]["id"] if visible else None
-        if self.selected_id:
-            self.task_tree.selection_set(self.selected_id)
+        self.task_tree.render([self._task_card(task) for task in visible], self.selected_id)
         self._render_task()
 
     def _render_task(self):
@@ -1560,18 +1787,23 @@ class RelayApp:
                 self.message_drafts[self.rendered_task_id] = self.message_text.get("1.0", "end-1c")
             self.message_text.delete("1.0", "end")
             self.message_text.insert("1.0", self.message_drafts.get(self.selected_id, ""))
+            self._sync_message_placeholder()
             if self.details_expanded:
                 self.details_expanded = False
                 self.details_panel.pack_forget()
-                self.details_button.configure(text="显示任务详情")
+                self.details_button.configure(text="详情")
+            self.chat_generation += 1
+            self.chat_wanted = None
+            self.chat_native_task = self.selected_id if task and task.get("connection_mode") == "direct" else None
         self.rendered_task_id = self.selected_id
         if not task:
             self.task_heading.set("请选择任务")
             self.task_alert.set("")
             self.task_alert_label.pack_forget()
             self.details.set("选择左侧任务查看详情。")
+            self.task_subtitle.set("选择左侧任务查看对话")
             set_text(self.goal_text, "")
-            set_text(self.latest_text, "")
+            self._render_conversation(None)
             self._render_pending([])
             self._controls()
             return
@@ -1585,10 +1817,9 @@ class RelayApp:
         draft = task.get("draft")
         source = task.get("source_snapshot")
         state_text = STATES.get(task.get("state"), task.get("state", "未知"))
-        self.task_heading.set(f"{task['title']} · {state_text}")
+        self.task_heading.set(task["title"])
+        self.task_subtitle.set(f"{state_text} · {'只读' if task.get('mode') == 'read-only' else '可修改工作区'}")
         alerts = []
-        if task.get("mode") == "read-only":
-            alerts.append("当前权限为只读；不会修改工作区。")
         if task.get("state") == "needs_reconcile":
             alerts.append("需要核对恢复后才能继续。")
         if task.get("error"):
@@ -1617,7 +1848,11 @@ class RelayApp:
                          + ("\n首次启动先只读整理简报，会消耗模型用量；在“简报 / 审核”采用后再执行。" if task.get("brief_required") else "")
                          + (f"\n需要处理：{task_error(task)}" if task.get("error") else ""))
         set_text(self.goal_text, task.get("goal"))
-        set_text(self.latest_text, task_reply(task), follow=True)
+        self._render_conversation(task, loading=(task.get("connection_mode") == "direct"
+                                                   and task["id"] not in self.chat_cache))
+        if switched and task.get("connection_mode") == "direct" and self.recovery_info is None:
+            self.chat_wanted = (task["id"], None, self.chat_generation)
+            self.root.after_idle(self._maybe_request_chat)
         if switched or task.get("pending", []) != self.pending_requests:
             self._render_pending(task.get("pending", []))
         elif self._current_request() and self._current_request().get("method") in APPROVALS:
@@ -1741,25 +1976,32 @@ class RelayApp:
         available = self.ready and not self.busy and not self.closing
         inspection = self.recovery_info is not None
         self.attention_count = sum(needs_attention(task) for task in self.tasks.values())
-        self.attention_button.configure(text=f"待处理 {self.attention_count} 项 · 查看",
-                                        state="normal" if self.attention_count and not self.closing else "disabled")
-        self.new_button.configure(state="normal" if available and not inspection else "disabled")
-        self.import_button.configure(state="normal" if available and not inspection else "disabled")
-        self.phone_button.configure(state="normal" if available and not inspection else "disabled")
+        configure_changed(self.attention_button, text=f"待处理 {self.attention_count} 项 · 查看",
+                          state="normal" if self.attention_count and not self.closing else "disabled")
+        if self.attention_count:
+            if not self.attention_button.winfo_manager():
+                self.attention_button.pack(fill="x", pady=(0, 8), before=self.task_tree)
+        elif self.attention_button.winfo_manager():
+            self.attention_button.pack_forget()
+        configure_changed(self.new_button, state="normal" if available and not inspection else "disabled")
+        configure_changed(self.import_button, state="normal" if available and not inspection else "disabled")
+        configure_changed(self.phone_button, state="normal" if available and not inspection else "disabled")
         if self.phone_dialog is not None and self.phone_dialog.winfo_exists():
             self.phone_dialog.controls()
         if self.import_dialog is not None and self.import_dialog.winfo_exists():
             self.import_dialog.controls()
         backup_safe = not any(task.get("state") in ACTIVE or task.get("pending") for task in self.tasks.values())
-        self.backup_button.configure(state="normal" if available and not inspection and backup_safe else "disabled")
-        self.diagnostics_button.configure(state="normal" if available else "disabled")
+        configure_changed(self.backup_button,
+                          state="normal" if available and not inspection and backup_safe else "disabled")
+        configure_changed(self.diagnostics_button, state="normal" if available else "disabled")
         if self.diagnostics_window is not None and self.diagnostics_window.winfo_exists():
-            self.diagnostics_window.save_button.configure(
-                state="normal" if available and self.diagnostics_window.report_ready else "disabled")
-        self.message_text.configure(state="disabled" if inspection else "normal")
+            configure_changed(self.diagnostics_window.save_button,
+                              state="normal" if available and self.diagnostics_window.report_ready else "disabled")
+        configure_changed(self.message_text, state="disabled" if inspection else "normal")
         task = self.tasks.get(self.selected_id) if self.selected_id in self.visible_ids else None
-        self.details_button.configure(state="normal" if task else "disabled")
-        self.assessment_button.configure(state="normal" if task and not self.closing and task.get("connection_mode") != "direct" else "disabled")
+        configure_changed(self.details_button, state="normal" if task else "disabled")
+        configure_changed(self.assessment_button,
+                          state="normal" if task and not self.closing and task.get("connection_mode") != "direct" else "disabled")
         for task_id, dialog in list(self.assessment_dialogs.items()):
             if not dialog.winfo_exists():
                 del self.assessment_dialogs[task_id]
@@ -1779,9 +2021,9 @@ class RelayApp:
                 text += "\n已达预算：先调整预算或核对结果，再继续执行。"
             if task.get("telemetry_model_valid", True) is False:
                 text += "\n模型口径无效，不能开启自动交接，请先核对遥测。"
-            self.budget_details.set(text)
+            set_changed(self.budget_details, text)
         else:
-            self.budget_details.set("")
+            set_changed(self.budget_details, "")
         allowed = {"start": state in ("queued", "paused", "idle"), "pause": state in ACTIVE,
                    "prepare_snapshot": state in ("idle", "paused"),
                    "handoff": state == "idle", "finish": state in ("idle", "paused"),
@@ -1796,37 +2038,49 @@ class RelayApp:
         brief = (task.get("brief") or {}) if task else {}
         if task and task.get("brief_required") and brief.get("status") == "current" and brief.get("decision") == "pending":
             allowed["start"] = False
-        self.buttons["start"].configure(text="先整理简报" if task and task.get("brief_required") else "发送 / 继续")
+        configure_changed(self.buttons["start"],
+                          text="先整理简报" if task and task.get("brief_required") else "发送 / 继续")
         if archived:
             for method in ("start", "pause", "prepare_snapshot", "handoff", "finish", "reconcile"):
                 allowed[method] = False
         if inspection:
             allowed = {method: bool(task) and method in ("get_task", "export_task") for method in allowed}
-        self.buttons["set_archived"].configure(text="取消归档" if archived else "归档")
+        configure_changed(self.buttons["set_archived"], text="取消归档" if archived else "归档")
         for method, button in self.buttons.items():
-            button.configure(state="normal" if available and allowed[method] else "disabled")
-        for method in ("start", "pause", "reconcile"):
-            self.buttons[method].pack_forget()
+            configure_changed(button, state="normal" if available and allowed[method] else "disabled")
         primary = ("pause",) if state in ACTIVE else (("reconcile",) if state in ("needs_reconcile", "blocked") else
                   ("start",) if state in ("queued", "paused", "idle") else ())
+        for method in ("start", "pause", "reconcile"):
+            button = self.buttons[method]
+            if method not in primary and button.winfo_manager():
+                button.pack_forget()
         for method in primary:
-            self.buttons[method].pack(side="left", padx=(0, 5))
-        menu_widgets = {
-            "phone": self.phone_button, "backup": self.backup_button, "diagnostics": self.diagnostics_button,
-            "assessment": self.assessment_button, **{key: value for key, value in self.buttons.items()
-                                                    if key in self.more_entries},
-        }
+            button = self.buttons[method]
+            if not button.winfo_manager():
+                button.pack(side="right", padx=(6, 0))
+        menu_widgets = {"assessment": self.assessment_button,
+                        **{key: value for key, value in self.buttons.items() if key in self.more_entries}}
         for key, widget in menu_widgets.items():
-            self.more_menu.entryconfigure(self.more_entries[key], state="disabled" if widget.instate(["disabled"]) else "normal")
+            menu_changed(self.more_menu, self.more_entries[key],
+                         state="disabled" if widget.instate(["disabled"]) else "normal")
+        for key, widget in (("phone", self.phone_button), ("backup", self.backup_button),
+                            ("diagnostics", self.diagnostics_button)):
+            menu_changed(self.settings_entry_menus[key], self.settings_entries[key],
+                         state="disabled" if widget.instate(["disabled"]) else "normal")
+        menu_changed(self.settings_entry_menus["preferences"], self.settings_entries["preferences"],
+                     state="disabled" if self.closing else "normal")
+        configure_changed(self.settings_button, state="disabled" if self.closing else "normal")
         can_open_chat = bool(task) and available and not inspection and bool(task.get("thread_id") or task.get("source_snapshot"))
-        self.more_menu.entryconfigure(self.more_entries["open_chat"], state="normal" if can_open_chat else "disabled")
-        self.more_menu.entryconfigure(self.more_entries["set_archived"],
-                                      label="取消归档" if archived else "归档")
-        self.more_button.configure(state="disabled" if self.closing else "normal")
+        menu_changed(self.more_menu, self.more_entries["open_chat"],
+                     state="normal" if can_open_chat else "disabled")
+        menu_changed(self.more_menu, self.more_entries["set_archived"],
+                     label="取消归档" if archived else "归档")
+        configure_changed(self.more_button, state="disabled" if self.closing else "normal")
         request = self._current_request()
         allow_approval = available and not inspection and request and request.get("method") in APPROVALS
-        self.approval_decline.configure(state="normal" if allow_approval else "disabled")
-        self.approval_allow.configure(state="normal" if allow_approval and self._has_action(request) else "disabled")
+        configure_changed(self.approval_decline, state="normal" if allow_approval else "disabled")
+        configure_changed(self.approval_allow,
+                          state="normal" if allow_approval and self._has_action(request) else "disabled")
 
     def _callback_error(self, exception_type, exception, _traceback):
         message = f"{exception_type.__name__}: {exception}"
@@ -1838,11 +2092,13 @@ class RelayApp:
 
     def _pump(self):
         self._pump_after = None
+        changed = False
         while True:
             try:
                 kind, value = self.worker.events.get_nowait()
             except queue.Empty:
                 break
+            changed = True
             if kind == "ready":
                 self.ready = True
                 self.recovery_info = value
@@ -1853,7 +2109,7 @@ class RelayApp:
                     self.recovery_banner.pack(fill="x", padx=16, pady=(0, 8), before=self.panes)
                     self.status.set("恢复库已加载；不连接 Codex，只检视本地历史记录。")
                 else:
-                    self.status.set("本机任务已加载；启动任务时连接 Codex。")
+                    self.status.set("本机任务已加载；原话任务选中后读取对话，发送才继续任务。")
             elif kind == "tasks":
                 self._render_tasks(value)
             elif kind == "command_done":
@@ -1882,23 +2138,14 @@ class RelayApp:
                     if window is not None and window.winfo_exists():
                         set_text(window.report_text, json.dumps(result, ensure_ascii=False, indent=2))
                         window.report_ready = True
-                if method == "read_chat" and isinstance(result, dict) and not self.closing:
-                    window = getattr(self, "conversation_window", None)
-                    if window is None or not window.winfo_exists() or args[0] != self.selected_id:
-                        continue
-                    for child in window.winfo_children():
-                        child.destroy()
-                    ttk.Label(window, text=f"会话：{result['thread_id']}\n读取时间：{result['checked_at']} · 第 {result['page']}/{result['pages']} 页",
-                              wraplength=760).pack(fill="x", padx=10, pady=8)
-                    body = text_area(window, 22)
-                    set_text(body, "\n\n".join(f"[{entry['role']} · {entry['part']}/{entry['parts']} 段]\n{entry['text']}"
-                                               for entry in result["entries"]))
-                    ttk.Label(window, text=result["notice"], wraplength=760).pack(fill="x", padx=10)
-                    nav = ttk.Frame(window)
-                    nav.pack(pady=8)
-                    for label, cursor in (("较早", result["older_cursor"]), ("较新", result["newer_cursor"]), ("最新", None)):
-                        ttk.Button(nav, text=label, state="normal" if cursor is not None or label == "最新" else "disabled",
-                                   command=lambda value=cursor, task_id=args[0]: self.submit("read_chat", task_id, value)).pack(side="left", padx=8)
+                if method == "read_chat" and isinstance(result, dict):
+                    request = self.chat_request
+                    self.chat_request = None
+                    if request is not None and request[0] == args[0]:
+                        self.chat_cache[args[0]] = result
+                        if (not self.closing and self.selected_id == args[0]
+                                and request[2] == self.chat_generation):
+                            self._render_conversation(self.tasks.get(args[0]))
                 if method == "backup_state" and isinstance(result, dict):
                     self.status.set(f"备份已保存：{result['path']}\n任务 {result['task_count']} · 事件 {result['event_count']} · "
                                     f"文件 {result['file_count']} · 创建时间 {result['created_at']}")
@@ -1914,6 +2161,15 @@ class RelayApp:
             elif kind in ("command_error", "poll_error", "startup_error", "close_error"):
                 if kind == "command_error":
                     self.busy = False
+                    if value[0] == "read_chat":
+                        request = self.chat_request
+                        self.chat_request = None
+                        if request is not None:
+                            cached = dict(self.chat_cache.get(request[0]) or {})
+                            cached["error"] = value[1]
+                            self.chat_cache[request[0]] = cached
+                            if self.selected_id == request[0] and request[2] == self.chat_generation:
+                                self._render_conversation(self.tasks.get(request[0]))
                     self._import_result(value[0], error=value[1])
                     self._assessment_result(value[0], error=value[1])
                     self._phone_result(value[0], error=value[1])
@@ -1932,7 +2188,15 @@ class RelayApp:
                 self.closed = True
                 self.root.destroy()
                 return
-        self._controls()
+        now = time.monotonic()
+        clock_due = (now - self._last_clock_controls >= 1.0
+                     and any(task.get("state") in ACTIVE and task.get("run_started") is not None
+                             for task in self.tasks.values()))
+        if changed or clock_due:
+            self._controls()
+            self._last_clock_controls = now
+        if changed:
+            self._maybe_request_chat()
         self._pump_after = self.root.after(40, self._pump)
 
     def request_close(self):
@@ -1955,6 +2219,7 @@ class RelayApp:
 
 
 def main(state_dir=None):
+    enable_native_dpi()
     root = tk.Tk()
     app = RelayApp(root, state_dir=state_dir)
     root.mainloop()

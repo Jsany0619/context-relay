@@ -77,9 +77,10 @@ class AssessmentUiTests(unittest.TestCase):
     tearDown = base_ui.TkSmokeTests.tearDown
 
     def setUp(self):
+        base_ui.install_quiet_toplevels(self)
         try:
             self.root = tk.Tk()
-            self.root.withdraw()
+            base_ui.quiet_window(self.root)
         except tk.TclError as error:
             self.skipTest(f"Tk display unavailable: {error}")
         self.temp = tempfile.TemporaryDirectory()
@@ -318,9 +319,11 @@ class AssessmentUiTests(unittest.TestCase):
                 self.app = None
                 gc.collect()
                 self.root = tk.Tk()
+                base_ui.quiet_window(self.root, mapped=True)
                 self.root.tk.call("tk", "scaling", dpi / 72)
                 self.make_app()
                 dialog = self.open_assessment()
+                base_ui.quiet_window(dialog, mapped=True)
                 for tab in (0, 1):
                     dialog.tabs.select(tab)
                     self.root.update()
