@@ -13,7 +13,7 @@ from tkinter import filedialog, font as tkfont, messagebox, ttk
 import zlib
 
 from .budget import budget_status, validate_limits
-from .chat_widgets import ConversationView, TaskCardList
+from .chat_widgets import ConversationView, TaskCardList, bind_mousewheel_tree
 from .display import enable_native_dpi
 from .preferences import DEFAULTS, load_preferences, save_preferences
 
@@ -443,10 +443,12 @@ def text_area(parent, height):
                      insertbackground=colors["ink"], selectbackground=colors["accent"],
                      borderwidth=0, highlightthickness=0, padx=10, pady=8, font="TkTextFont")
     scrollbar = ttk.Scrollbar(frame, orient="vertical", command=widget.yview)
+    scrollbar._context_relay_wheel_target = widget
     widget.configure(yscrollcommand=scrollbar.set)
     widget.pack(side="left", fill="both", expand=True)
     scrollbar.pack(side="right", fill="y")
     frame.pack(fill="both", expand=True, padx=6, pady=6)
+    bind_mousewheel_tree(frame, widget)
     return widget
 
 
@@ -527,7 +529,7 @@ class NewTaskDialog(tk.Toplevel):
         self.mode = tk.StringVar(value="只读")
         ttk.Combobox(body, textvariable=self.mode, values=("只读", "允许修改工作区"),
                      state="readonly").grid(row=2, column=1, sticky="w", pady=5)
-        ttk.Label(body, text="任务目标与完成标准").grid(row=3, column=0, columnspan=3, sticky="w")
+        ttk.Label(body, text="任务备注（可留空，不会自动发送）").grid(row=3, column=0, columnspan=3, sticky="w")
         self.goal = tk.Text(body, height=7, width=68, wrap="word")
         self.goal.grid(row=4, column=0, columnspan=3, sticky="ew", pady=6)
         self.advanced_open = tk.BooleanVar(value=False)
@@ -565,8 +567,8 @@ class NewTaskDialog(tk.Toplevel):
     def save(self):
         values = {key: value.get().strip() for key, value in self.fields.items()}
         values["goal"] = self.goal.get("1.0", "end").strip()
-        if not values["title"] or not values["goal"] or not values["cwd"]:
-            messagebox.showwarning("请补全任务", "任务名称、工作目录和目标不能为空。", parent=self)
+        if not values["title"] or not values["cwd"]:
+            messagebox.showwarning("请补全任务", "任务名称和工作目录不能为空。", parent=self)
             return
         try:
             directory = Path(values["cwd"]).expanduser().resolve()
@@ -579,7 +581,7 @@ class NewTaskDialog(tk.Toplevel):
             messagebox.showwarning("输入有误", str(error), parent=self)
             return
         values.update(mode="read-only" if self.mode.get() == "只读" else "workspace-write",
-                      auto_handoff=self.auto_handoff.get())
+                      auto_handoff=self.auto_handoff.get(), direct=True)
         if self.submit("create_task", **values):
             self.destroy()
 
@@ -678,12 +680,21 @@ class ImportDialog(tk.Toplevel):
         self.transient(app.root)
         footer = ttk.Frame(self, padding=10)
         footer.pack(side="bottom", fill="x")
+        safety = ttk.Frame(footer)
+        safety.pack(fill="x", pady=(0, 6))
+        ttk.Label(safety, text="权限").pack(side="left")
+        self.mode_box = ttk.Combobox(safety, textvariable=self.mode, values=("read-only", "workspace-write"),
+                                     state="readonly", width=18)
+        self.mode_box.pack(side="left", padx=6)
+        self.source_confirm = ttk.Checkbutton(safety, text="我确认原聊天及同项目的其他操作已停止",
+                                              variable=self.source_stopped, command=self.controls)
+        self.source_confirm.pack(side="left", padx=(12, 0))
         ttk.Label(footer, textvariable=self.info, wraplength=820, justify="left").pack(fill="x", pady=(0, 6))
         self.close_button = ttk.Button(footer, text="关闭", command=self.destroy)
         self.close_button.pack(side="right")
-        self.save_button = ttk.Button(footer, text="导入为待启动任务", command=self.save)
+        self.save_button = ttk.Button(footer, text="连接原聊天（原话接续）", command=lambda: self.save(direct=True))
         self.save_button.pack(side="right", padx=8)
-        self.connect_button = ttk.Button(footer, text="连接原聊天（原话接续）", command=lambda: self.save(direct=True))
+        self.connect_button = ttk.Button(footer, text="高级：导入为旧式托管待办", command=self.save)
         self.connect_button.pack(side="right", padx=8)
         top = ttk.Frame(self, padding=10)
         top.pack(fill="x")
@@ -705,18 +716,21 @@ class ImportDialog(tk.Toplevel):
             self.tree.column(column, width=width, minwidth=60)
         self.tree.pack(side="left", fill="x", expand=True)
         scroll = ttk.Scrollbar(listing, command=self.tree.yview)
+        scroll._context_relay_wheel_target = self.tree
         scroll.pack(side="right", fill="y")
         self.tree.configure(yscrollcommand=scroll.set)
         self.tree.bind("<<TreeviewSelect>>", self.select_source)
+        bind_mousewheel_tree(listing, self.tree)
         self.preview_button = ttk.Button(top, text="预览选定聊天", command=self.preview_selected)
         self.preview_button.pack(anchor="w")
         scrolling = ttk.Frame(self)
         scrolling.pack(fill="both", expand=True, padx=10)
         self.canvas = tk.Canvas(scrolling, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(scrolling, command=self.canvas.yview)
-        scrollbar.pack(side="right", fill="y")
+        self.canvas_scrollbar = ttk.Scrollbar(scrolling, command=self.canvas.yview)
+        self.canvas_scrollbar._context_relay_wheel_target = self.canvas
+        self.canvas_scrollbar.pack(side="right", fill="y")
         self.canvas.pack(side="left", fill="both", expand=True)
-        self.canvas.configure(yscrollcommand=scrollbar.set)
+        self.canvas.configure(yscrollcommand=self.canvas_scrollbar.set)
         body = ttk.Frame(self.canvas, padding=(0, 0, 8, 8))
         body_id = self.canvas.create_window((0, 0), window=body, anchor="nw")
         body.bind("<Configure>", lambda event: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
@@ -725,13 +739,9 @@ class ImportDialog(tk.Toplevel):
         self.preview_text = text_area(body, 6)
         ttk.Label(body, text="任务名称").pack(anchor="w")
         ttk.Entry(body, textvariable=self.title_value).pack(fill="x", pady=(2, 6))
-        ttk.Label(body, text="补充想法（可留空；留空时首次启动先整理简报，消耗模型用量）").pack(anchor="w")
+        ttk.Label(body, text="补充说明（可留空；默认连接时仅作元数据，不会自动发送）").pack(anchor="w")
         self.goal_text = tk.Text(body, height=3, wrap="word")
         self.goal_text.pack(fill="x", pady=(2, 6))
-        options = ttk.Frame(body)
-        options.pack(fill="x", pady=4)
-        ttk.Label(options, text="权限").grid(row=0, column=0, sticky="w")
-        ttk.Combobox(options, textvariable=self.mode, values=("read-only", "workspace-write"), state="readonly", width=18).grid(row=0, column=1, padx=6)
         self.advanced_open = tk.BooleanVar(value=False)
         ttk.Checkbutton(body, text="显示预算与自动交接", variable=self.advanced_open,
                         command=self.toggle_advanced).pack(anchor="w", pady=(4, 0))
@@ -746,14 +756,13 @@ class ImportDialog(tk.Toplevel):
         ttk.Checkbutton(self.advanced_frame, text="允许满足阈值后自动交接（可选）",
                         variable=self.auto).grid(row=2, column=0, columnspan=4, sticky="w", pady=6)
         self.advanced_frame.pack_forget()
-        self.source_confirm = ttk.Checkbutton(body, text="我确认原聊天及同项目的其他操作已停止",
-                                              variable=self.source_stopped, command=self.controls)
-        self.source_confirm.pack(anchor="w", pady=6)
+        bind_mousewheel_tree(scrolling, self.canvas)
+        bind_mousewheel_tree(safety, self.canvas)
         self.controls()
 
     def toggle_advanced(self):
         if self.advanced_open.get():
-            self.advanced_frame.pack(fill="x", before=self.source_confirm)
+            self.advanced_frame.pack(fill="x")
         else:
             self.advanced_frame.pack_forget()
 
@@ -768,7 +777,7 @@ class ImportDialog(tk.Toplevel):
         self.auto.set(False)
         self.source_stopped.set(False)
         set_text(self.preview_text, "")
-        self.save_button.configure(text="导入为待启动任务")
+        self.save_button.configure(text="连接原聊天（原话接续）")
 
     def request(self, method, *args, **kwargs):
         token = (self.generation, self.selected_source)
@@ -849,7 +858,7 @@ class ImportDialog(tk.Toplevel):
                 self.tokens.set(str(existing.get("max_tokens", 0)))
                 self.minutes.set(str(existing.get("max_minutes", 0)))
                 self.auto.set(existing.get("auto_handoff", False))
-                configure_changed(self.save_button, text="更新待启动任务")
+                configure_changed(self.save_button, text="连接原聊天（原话接续）")
             status = result.get("status", "未知")
             if status == "notLoaded":
                 status = "未在本连接加载（原端状态未知）"
@@ -861,7 +870,7 @@ class ImportDialog(tk.Toplevel):
                          for warning in result.get("warnings", []))
             lines.extend(f"\n[{item.get('role', '未知')}] {item.get('text', '')}" for item in result.get("messages", []))
             set_text(self.preview_text, "\n".join(lines))
-            self.info.set("确认原操作已停止；想法可留空，导入仅保存待办。首次整理简报会消耗模型用量。" if self.can_save() else
+            self.info.set("确认原操作已停止；备注可留空，默认原话连接且不会自动发送。" if self.can_save() else
                           "不能导入：已有任务已启动、已归档，或来源不满足条件；请核对预览提示。")
         elif method == "import_thread":
             self.destroy()
@@ -883,8 +892,8 @@ class ImportDialog(tk.Toplevel):
         existing = self.preview.get("existing_task")
         self.request("import_thread", self.selected_source, self.preview["fingerprint"], title=title, goal=goal,
                      mode=self.mode.get(), source_stopped=True, existing_task_id=existing["id"] if existing else None,
-                     max_tokens=tokens, max_minutes=minutes, auto_handoff=False if direct else self.auto.get(),
-                     **({"direct": True} if direct else {}))
+                     max_tokens=tokens, max_minutes=minutes, auto_handoff=self.auto.get(),
+                     direct=direct)
 
 
 def assessment_content(value):
@@ -1001,7 +1010,7 @@ class AssessmentDialog(tk.Toplevel):
         brief, review = ttk.Frame(self.tabs), ttk.Frame(self.tabs)
         self.tabs.add(brief, text="任务简报")
         self.tabs.add(review, text="阶段审核")
-        brief_actions, brief_body = self.page(brief)
+        brief_actions, brief_body, brief_scrolling, brief_canvas = self.page(brief)
         self.generate_brief = ttk.Button(brief_actions, text="生成 / 重新整理简报", command=lambda: self.action("analyze", "brief"))
         self.generate_brief.pack(side="left", padx=4)
         self.adopt_button = ttk.Button(brief_actions, text="采用目标与验收标准", command=self.adopt)
@@ -1013,7 +1022,8 @@ class AssessmentDialog(tk.Toplevel):
         self.acceptance_text = tk.Text(brief_body, height=4, wrap="word")
         self.acceptance_text.pack(fill="x", pady=4)
         self.brief_text = text_area(brief_body, 16)
-        review_actions, review_body = self.page(review)
+        bind_mousewheel_tree(brief_scrolling, brief_canvas)
+        review_actions, review_body, review_scrolling, review_canvas = self.page(review)
         self.generate_review = ttk.Button(review_actions, text="审核当前成果", command=lambda: self.action("analyze", "review"))
         self.generate_review.pack(side="left", padx=4)
         self.accept_button = ttk.Button(review_actions, text="人工采用本阶段结果", command=lambda: self.action("accept_review"))
@@ -1021,6 +1031,7 @@ class AssessmentDialog(tk.Toplevel):
         self.revise_button = ttk.Button(review_actions, text="按意见开始返工", command=lambda: self.action("revise_from_review"))
         self.revise_button.pack(side="left", padx=4)
         self.review_text = text_area(review_body, 24)
+        bind_mousewheel_tree(review_scrolling, review_canvas)
         self.refresh(task)
 
     def page(self, parent):
@@ -1030,6 +1041,7 @@ class AssessmentDialog(tk.Toplevel):
         scrolling.pack(fill="both", expand=True)
         canvas = tk.Canvas(scrolling, highlightthickness=0)
         scrollbar = ttk.Scrollbar(scrolling, command=canvas.yview)
+        scrollbar._context_relay_wheel_target = canvas
         scrollbar.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
         canvas.configure(yscrollcommand=scrollbar.set)
@@ -1037,7 +1049,7 @@ class AssessmentDialog(tk.Toplevel):
         body_id = canvas.create_window((0, 0), window=body, anchor="nw")
         body.bind("<Configure>", lambda event: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", lambda event: canvas.itemconfigure(body_id, width=event.width))
-        return actions, body
+        return actions, body, scrolling, canvas
 
     def refresh(self, task):
         brief, review = task.get("brief") or {}, task.get("review") or {}
@@ -1644,20 +1656,23 @@ class RelayApp:
         if (not task or self.closing or self.recovery_info is not None
                 or task.get("connection_mode") != "direct" and not force):
             return False
+        source = task.get("source_snapshot") or {}
+        if not task.get("thread_id") and not source.get("thread_id"):
+            return False
         if force or task.get("connection_mode") == "direct":
             self.chat_native_task = task["id"]
-        self.chat_wanted = (task["id"], cursor, self.chat_generation)
+        self.chat_wanted = (task["id"], cursor, self.chat_generation, task.get("generation", 0))
         return self._maybe_request_chat()
 
     def _maybe_request_chat(self):
         wanted = self.chat_wanted
         if wanted is None or self.chat_request is not None or self.busy or not self.ready or self.closing:
             return False
-        task_id, cursor, generation = wanted
+        task_id, cursor, generation, task_generation = wanted
         if task_id != self.selected_id or task_id not in self.visible_ids:
             return False
         def mark():
-            self.chat_request = (task_id, cursor, generation)
+            self.chat_request = (task_id, cursor, generation, task_generation)
             self.chat_wanted = None
         if self.submit("read_chat", task_id, cursor, _before_enqueue=mark):
             self._render_conversation(self.tasks.get(task_id), loading=True)
@@ -1680,12 +1695,19 @@ class RelayApp:
             cached = self.chat_cache.get(task["id"])
             messages = []
             notices = []
+            source = task.get("source_snapshot") or {}
+            conversation_available = bool(task.get("thread_id") or source.get("thread_id"))
             if isinstance(cached, dict) and isinstance(cached.get("entries"), list):
                 messages = [{"role": item["role"], "text": item["text"]} for item in cached["entries"]
                             if isinstance(item, dict) and item.get("role") in ("user", "assistant")
                             and item.get("turn_status") == "completed"
                             and isinstance(item.get("text"), str)]
                 notices.append((cached.get("notice", ""), "notice"))
+                purposes = {item.get("control_purpose") for item in cached["entries"] if isinstance(item, dict)}
+                labels = [label for purpose, label in (("summary", "交接准备"), ("verify", "接收核验"))
+                          if purpose in purposes]
+                if labels:
+                    notices.append((f"系统控制回合标记：{' / '.join(labels)}；正文保持原文。", "notice"))
                 if cached.get("newer_available"):
                     notices.append(("任务有新状态；当前仍保留较早页。点击“最新”读取新内容。", "notice"))
                 if cached.get("error"):
@@ -1696,14 +1718,17 @@ class RelayApp:
                 self.chat_nav.pack(fill="x", before=self.latest_frame)
             else:
                 self.chat_position.set("原始对话")
-                self.chat_nav.pack(fill="x", before=self.latest_frame)
+                if conversation_available:
+                    self.chat_nav.pack(fill="x", before=self.latest_frame)
+                else:
+                    self.chat_nav.pack_forget()
                 self.chat_older.configure(state="disabled")
                 self.chat_latest.configure(state="disabled" if loading else "normal")
                 if isinstance(cached, dict) and cached.get("error"):
                     notices.append((f"原始对话读取失败：{cached['error']}。未用任务摘要代替。", "error"))
             if loading:
                 notices.append(("正在只读读取原始对话…", "notice"))
-            elif not cached:
+            elif not cached and conversation_available:
                 notices.append(("尚未读到原始对话；不会用任务摘要代替。", "notice"))
             self.latest_frame.render(messages, notices, follow=not loading)
             return
@@ -1753,9 +1778,24 @@ class RelayApp:
     def _render_tasks(self, tasks):
         previous = self.tasks.get(self.selected_id)
         self.tasks = {task["id"]: task for task in tasks}
+        current = self.tasks.get(self.selected_id)
+        refreshed_id = current.get("id") if current else None
+        same_task = bool(previous and current and previous.get("id") == current.get("id"))
+        generation_changed = same_task and previous.get("generation", 0) != current.get("generation", 0)
+        previous_source = (previous or {}).get("source_snapshot") or {}
+        current_source = (current or {}).get("source_snapshot") or {}
+        conversation_became_available = (same_task and not (previous.get("thread_id") or previous_source.get("thread_id"))
+                                         and bool(current.get("thread_id") or current_source.get("thread_id")))
+        if generation_changed:
+            self.chat_cache.pop(current["id"], None)
         self._apply_filters()
         current = self.tasks.get(self.selected_id)
-        if (previous and current and previous.get("id") == current.get("id")
+        if (current and current.get("id") == refreshed_id and current.get("connection_mode") == "direct"
+                and self.recovery_info is None
+                and (generation_changed or conversation_became_available)):
+            self.chat_wanted = (current["id"], None, self.chat_generation, current.get("generation", 0))
+            self.root.after_idle(self._maybe_request_chat)
+        elif (same_task and current and current.get("id") == refreshed_id
                 and current.get("connection_mode") == "direct"
                 and self._chat_marker(previous) != self._chat_marker(current)
                 and current["id"] in self.chat_cache):
@@ -1764,7 +1804,7 @@ class RelayApp:
                 cached["newer_available"] = True
                 self._render_conversation(current)
             elif self.recovery_info is None:
-                self.chat_wanted = (current["id"], None, self.chat_generation)
+                self.chat_wanted = (current["id"], None, self.chat_generation, current.get("generation", 0))
                 self.root.after_idle(self._maybe_request_chat)
 
     def _show_attention(self):
@@ -1866,10 +1906,13 @@ class RelayApp:
                          + ("\n首次启动先只读整理简报，会消耗模型用量；在“简报 / 审核”采用后再执行。" if task.get("brief_required") else "")
                          + (f"\n需要处理：{task_error(task)}" if task.get("error") else ""))
         set_text(self.goal_text, task.get("goal"))
+        source = task.get("source_snapshot") or {}
+        conversation_available = bool(task.get("thread_id") or source.get("thread_id"))
         self._render_conversation(task, loading=(task.get("connection_mode") == "direct"
-                                                   and task["id"] not in self.chat_cache))
-        if switched and task.get("connection_mode") == "direct" and self.recovery_info is None:
-            self.chat_wanted = (task["id"], None, self.chat_generation)
+                                                   and conversation_available and task["id"] not in self.chat_cache))
+        if (switched and task.get("connection_mode") == "direct" and conversation_available
+                and self.recovery_info is None):
+            self.chat_wanted = (task["id"], None, self.chat_generation, task.get("generation", 0))
             self.root.after_idle(self._maybe_request_chat)
         if switched or task.get("pending", []) != self.pending_requests:
             self._render_pending(task.get("pending", []))
@@ -2051,8 +2094,6 @@ class RelayApp:
                    "update_settings": quiet and state in ("queued", "idle", "paused") and not archived}
         if budget and budget["reached"]:
             allowed["start"] = allowed["handoff"] = False
-        if task and task.get("connection_mode") == "direct":
-            allowed["handoff"] = False
         brief = (task.get("brief") or {}) if task else {}
         if task and task.get("brief_required") and brief.get("status") == "current" and brief.get("decision") == "pending":
             allowed["start"] = False
@@ -2159,7 +2200,9 @@ class RelayApp:
                 if method == "read_chat" and isinstance(result, dict):
                     request = self.chat_request
                     self.chat_request = None
-                    if request is not None and request[0] == args[0]:
+                    current = self.tasks.get(args[0])
+                    if (request is not None and request[0] == args[0] and current
+                            and request[3] == current.get("generation", 0)):
                         self.chat_cache[args[0]] = result
                         if (not self.closing and self.selected_id == args[0]
                                 and request[2] == self.chat_generation):
@@ -2182,11 +2225,13 @@ class RelayApp:
                     if value[0] == "read_chat":
                         request = self.chat_request
                         self.chat_request = None
-                        if request is not None:
+                        current = self.tasks.get(request[0]) if request is not None else None
+                        if request is not None and current and request[3] == current.get("generation", 0):
                             cached = dict(self.chat_cache.get(request[0]) or {})
                             cached["error"] = value[1]
                             self.chat_cache[request[0]] = cached
-                            if self.selected_id == request[0] and request[2] == self.chat_generation:
+                            if (self.selected_id == request[0] and request[2] == self.chat_generation and current
+                                    and request[3] == current.get("generation", 0)):
                                 self._render_conversation(self.tasks.get(request[0]))
                     self._import_result(value[0], error=value[1])
                     self._assessment_result(value[0], error=value[1])

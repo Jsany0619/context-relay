@@ -210,7 +210,7 @@ def run(root: Path) -> int:
             "external tools, background processes, or subagents. Handoff summaries must report no unknown external "
             "operations and must treat the task as unfinished while counter.txt is below 3."
         )
-        created = manager.create_task("Controlled counter handoff", project, goal, mode="workspace-write")
+        created = manager.create_task("Controlled counter handoff", project, goal, mode="workspace-write", direct=False)
         task_id = created["id"]
         manager.start(task_id)
         first = wait_for_idle(manager, task_id, 0, 1)

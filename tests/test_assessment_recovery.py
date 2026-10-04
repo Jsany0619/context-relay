@@ -29,7 +29,7 @@ class AssessmentRecoveryTests(unittest.TestCase):
 
     def task(self, **settings):
         return self.manager.create_task("Assessment recovery", self.project, "Compare the existing candidate",
-                                        mode="workspace-write", **settings)
+                                        mode="workspace-write", **settings, direct=False)
 
     def complete(self, task, report=None):
         thread_id = task.get("analysis_thread_id") or task["thread_id"]

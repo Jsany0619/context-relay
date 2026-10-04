@@ -17,7 +17,7 @@ class ConversationTests(unittest.TestCase):
         self.client = FakeClient()
         self.manager = Manager(self.root / "state", self.client)
         self.addCleanup(self.manager.close)
-        self.task = self.manager.create_task("Phone", self.project, "Inspect only")
+        self.task = self.manager.create_task("Phone", self.project, "Inspect only", direct=False)
 
     def start(self, message=None):
         task = self.manager.start(self.task["id"], message)

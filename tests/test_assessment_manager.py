@@ -56,12 +56,12 @@ class AssessmentManagerTests(unittest.TestCase):
         self.addCleanup(self.manager.close)
 
     def task(self):
-        return self.manager.create_task("Project", self.project, "Improve the candidate", mode="workspace-write")
+        return self.manager.create_task("Project", self.project, "Improve the candidate", mode="workspace-write", direct=False)
 
     def imported(self):
         preview = self.manager.preview_import(SOURCE)
         return self.manager.import_thread(SOURCE, preview["fingerprint"], title="Import", goal="", source_stopped=True,
-                                         mode="workspace-write")
+                                         mode="workspace-write", direct=False)
 
     def complete(self, task, report=None):
         thread_id = task.get("analysis_thread_id") or task["thread_id"]
@@ -291,7 +291,7 @@ class AssessmentManagerTests(unittest.TestCase):
         self.client.source["updatedAt"] += 1
         preview = self.manager.preview_import(SOURCE)
         refreshed = self.manager.import_thread(SOURCE, preview["fingerprint"], title="Refreshed", goal="",
-                         source_stopped=True, existing_task_id=task["id"])
+                         source_stopped=True, existing_task_id=task["id"], direct=False)
         self.assertEqual(refreshed["usage"], 42)
         self.assertEqual(refreshed["history"], task["history"])
         self.assertTrue(refreshed["brief_required"])

@@ -64,6 +64,48 @@ class FakeManager:
 
 
 class GatewayTests(unittest.TestCase):
+    def test_empty_direct_conversation_does_not_advertise_native_history(self):
+        raw = task(connection_mode="direct", thread_id=None, source_snapshot=None,
+                   state="queued", messages=[], last_message="")
+        self.core.publish_tasks([raw], connection_id="empty-direct")
+        device = self.core_device()
+        before = self.core.get_task_snapshot(device["device_id"], TASK_ID)
+        self.assertIs(before["conversation_available"], False)
+        self.assertEqual(before["connection_mode"], "direct")
+        self.assertEqual(before["conversation_generation"], 0)
+        for changed in (dict(raw, thread_id="native-owner"),
+                        dict(raw, source_snapshot={"thread_id": "original-owner"})):
+            self.core.publish_tasks([changed], connection_id="empty-direct")
+            after = self.core.get_task_snapshot(device["device_id"], TASK_ID)
+            self.assertIs(after["conversation_available"], True)
+            self.assertNotEqual(before["etag"], after["etag"])
+            self.assertNotIn("owner", json.dumps(after))
+        self.core.publish_tasks([dict(raw, thread_id="receiver-owner", generation=1)],
+                                connection_id="empty-direct")
+        self.assertEqual(self.core.get_task_snapshot(device["device_id"], TASK_ID)["conversation_generation"], 1)
+
+    def test_large_private_checkpoint_keeps_phone_projection_bounded_and_versioned(self):
+        raw = task(checkpoint={"files": {"large-private-manifest": "x" * (1024 * 1024)}})
+        self.core.publish_tasks([raw], connection_id="large-checkpoint")
+        device = self.core_device()
+        before = self.core.get_task_snapshot(device["device_id"], TASK_ID)
+        self.assertNotIn("checkpoint", before)
+        self.assertLess(len(json.dumps(before)), 64 * 1024)
+        raw["checkpoint"]["files"]["large-private-manifest"] += "changed"
+        self.core.publish_tasks([raw], connection_id="large-checkpoint")
+        after = self.core.get_task_snapshot(device["device_id"], TASK_ID)
+        self.assertNotEqual(before["etag"], after["etag"])
+        request_id = str(uuid.uuid4())
+        message = "  原话\r\n$context-handoff  "
+        body = {"request_id": request_id, "task_id": TASK_ID, "command": "start",
+                "expected_etag": after["etag"], "payload": {"message": message}}
+        self.core.submit_command(device["device_id"], body)
+        manager = FakeManager(raw)
+        receipt = self.core.execute(request_id, manager)
+        self.assertEqual(receipt["state"], "succeeded")
+        self.assertEqual(manager.calls, [("start", TASK_ID, message)])
+        self.assertNotIn("checkpoint", receipt["result"]["task"])
+
     def test_task_list_previews_stay_bounded_and_full_details_remain_exact(self):
         messages = [{"id": f"m{i}", "role": "assistant", "text": "x" * 3000,
                      "created_at": "synthetic", "status": "completed", "purpose": "work"}
@@ -282,7 +324,7 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(set(dto), {"id", "title", "state", "goal", "mode", "last_message", "error",
             "usage", "max_tokens", "max_minutes", "work_turns", "brief_required", "acceptance_criteria",
             "archived", "etag", "pending", "brief", "review", "messages", "messages_truncated",
-            "remote_access"})
+            "remote_access", "conversation_available", "conversation_generation"})
         self.assertNotIn("must-not-leak", json.dumps(dto))
         self.assertTrue(dto["pending"][0]["can_approve"])
         self.assertEqual(dto["pending"][0]["params"]["command"], "python -m unittest")

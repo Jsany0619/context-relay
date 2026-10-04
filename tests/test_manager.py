@@ -23,6 +23,7 @@ class FakeClient:
         self.thread_count = 0
         self.turn_count = 0
         self.interrupt_completes = True
+        self.threads = {}
 
     def request(self, method, params=None, timeout=30):
         self.calls.append((method, copy.deepcopy(params or {})))
@@ -30,10 +31,14 @@ class FakeClient:
             result = self.responses[method].popleft()
             if isinstance(result, BaseException):
                 raise result
+            if method == "thread/read" and isinstance(result, dict) and isinstance(result.get("thread"), dict):
+                self.threads[params["threadId"]] = copy.deepcopy(result["thread"])
             return copy.deepcopy(result)
         if method == "thread/start":
             self.thread_count += 1
             sandbox = "workspaceWrite" if params.get("sandbox") == "workspace-write" else "readOnly"
+            self.threads[f"thread-{self.thread_count}"] = {"id": f"thread-{self.thread_count}",
+                "status": {"type": "idle"}, "turns": [], "cwd": params["cwd"], "source": "appServer", "updatedAt": 1}
             return {"thread": {"id": f"thread-{self.thread_count}", "turns": []},
                     "cwd": params.get("cwd"), "model": params.get("model") or "test-model",
                     "sandbox": {"type": sandbox}, "approvalPolicy": params.get("approvalPolicy")}
@@ -48,7 +53,8 @@ class FakeClient:
                     "turn": {"id": params["turnId"], "status": "interrupted", "items": []}})
             return {}
         if method == "thread/read":
-            return {"thread": {"id": params["threadId"], "status": {"type": "idle"}, "turns": []}}
+            return {"thread": copy.deepcopy(self.threads.get(params["threadId"],
+                {"id": params["threadId"], "status": {"type": "idle"}, "turns": []}))}
         if method == "config/read":
             return {"config": {"mcp_servers": {}}}
         if method == "mcpServerStatus/list":
@@ -76,6 +82,146 @@ class FakeClient:
 
 
 class ManagerContractTests(unittest.TestCase):
+    def test_direct_first_send_is_exact_and_creation_is_local(self):
+        task = self.manager.create_task("Raw", self.project, "")
+        self.assertEqual(task["connection_mode"], "direct")
+        self.assertEqual(task["messages"], [])
+        self.assertEqual(self.client.calls, [])
+        raw = "  $context-handoff\r\n原话  "
+        started = self.manager.start(task["id"], raw)
+        self.assertEqual(self.client.calls_for("turn/start")[-1]["input"][0]["text"], raw)
+        self.assertEqual(len(self.client.calls_for("thread/start")), 1)
+        instructions = self.client.calls_for("thread/start")[0]["developerInstructions"]
+        self.assertIn("optional metadata", instructions)
+        self.assertIn("managed-adapter.md", instructions)
+        self.assertEqual(started["raw_user_messages"], [raw])
+
+    def test_snapshot_cancellation_is_not_partial_success(self):
+        (self.project / "large.bin").write_bytes(b"x" * (2 * 1024 * 1024))
+        calls = []
+        def stopped():
+            calls.append(True)
+            return len(calls) > 3
+        with self.assertRaisesRegex(RuntimeError, "取消"):
+            workspace_snapshot(self.project, stopped)
+
+    def test_snapshot_has_no_fixed_file_or_byte_limit(self):
+        for index in range(4097):
+            (self.project / str(index)).touch()
+        large = self.project / "large.bin"
+        with large.open("wb") as stream:
+            stream.truncate(129 * 1024 * 1024)
+        result = workspace_snapshot(self.project)
+        self.assertEqual(len(result), 4098)
+        import hashlib
+        expected = hashlib.sha256()
+        for _ in range(129):
+            expected.update(b"\0" * 1024 * 1024)
+        self.assertEqual(result["large.bin"], expected.hexdigest())
+
+    def direct_receiver(self):
+        task = self.manager.create_task("Raw", self.project)
+        task = self.manager.start(task["id"], "  $context-handoff\n先核对  ")
+        self.complete(task)
+        evidence = self.project / "sample.txt"
+        evidence.write_text("evidence", encoding="utf-8")
+        self.manager.handoff(task["id"])
+        return self.finish_summary(task, evidence)
+
+    def test_direct_ready_waits_for_real_user_and_preserves_raw_evidence(self):
+        verifying = self.direct_receiver()
+        self.assertEqual(verifying["state"], "verifying")
+        self.assertEqual(verifying["checkpoint"]["connection_mode"], "direct")
+        self.assertEqual(verifying["checkpoint"]["raw_user_messages"], ["  $context-handoff\n先核对  "])
+        count = len(self.client.calls_for("turn/start"))
+        self.finish_ready(verifying)
+        paused = self.manager.get_task(verifying["id"])
+        self.assertEqual(paused["state"], "paused")
+        self.assertEqual(paused["thread_id"], verifying["receiver_id"])
+        self.assertEqual(len(self.client.calls_for("turn/start")), count)
+        resumed = self.manager.start(paused["id"], "  下一条真实消息  ")
+        self.assertEqual(resumed["thread_id"], paused["thread_id"])
+        self.assertEqual(self.client.calls_for("turn/start")[-1]["input"][0]["text"], "  下一条真实消息  ")
+        self.assertEqual(len(self.client.calls_for("thread/start")), 2)
+
+    def test_ready_source_turn_change_blocks_transfer(self):
+        verifying = self.direct_receiver()
+        self.client.threads[verifying["thread_id"]]["turns"].append({"id": "outside", "status": "completed", "items": []})
+        self.finish_ready(verifying)
+        held = self.manager.get_task(verifying["id"])
+        self.assertEqual(held["state"], "needs_reconcile")
+        self.assertEqual(held["thread_id"], verifying["thread_id"])
+
+    def test_summary_interleaving_blocks_freeze(self):
+        source, evidence = self.begin_handoff()
+        self.client.threads[source["thread_id"]]["turns"].append({"id": "outside", "status": "completed", "items": []})
+        held = self.finish_summary(source, evidence)
+        self.assertEqual(held["state"], "needs_reconcile")
+        self.assertIsNone(held["receiver_id"])
+
+    def test_ready_standalone_conflict_blocks_owner_transfer(self):
+        verifying = self.direct_receiver()
+        from relay.manager import handoff_rules
+        with patch.object(handoff_rules, "guard", return_value={"status": "frozen", "owner": verifying["thread_id"],
+                                                               "can_write_project": False}):
+            self.finish_ready(verifying)
+        held = self.manager.get_task(verifying["id"])
+        self.assertEqual(held["state"], "needs_reconcile")
+        self.assertEqual(held["thread_id"], verifying["thread_id"])
+
+    def test_ready_permission_ceiling_change_blocks_transfer(self):
+        verifying = self.direct_receiver()
+        verifying["mode"] = "workspace-write"
+        self.manager._save(verifying)
+        self.finish_ready(verifying)
+        held = self.manager.get_task(verifying["id"])
+        self.assertEqual(held["state"], "needs_reconcile")
+        self.assertEqual(held["thread_id"], verifying["thread_id"])
+
+    def test_control_messages_are_labelled_without_changing_native_text(self):
+        verifying = self.direct_receiver()
+        control = verifying["control_turns"][0]
+        raw = "  原始管理提示\n保持字节语义  "
+        self.client.threads[verifying["thread_id"]]["turns"] = [{"id": control["turn_id"], "status": "completed",
+            "items": [{"type": "agentMessage", "id": "control-result", "text": raw}]}]
+        page = self.manager.read_chat(verifying["id"])
+        self.assertEqual(page["entries"][0]["text"], raw)
+        self.assertEqual(page["entries"][0]["control_purpose"], "summary")
+
+    def test_standalone_guard_blocks_raw_send_without_writing_ledger(self):
+        from relay.manager import handoff_rules
+        task = self.manager.create_task("Raw", self.project)
+        task = self.manager.start(task["id"], "first")
+        self.complete(task)
+        ledger = self.root / "standalone"
+        member = handoff_rules.member_file(ledger, task["thread_id"])
+        member.parent.mkdir(parents=True)
+        member.write_text("{broken", encoding="utf-8")
+        before = member.read_bytes()
+        original = handoff_rules.guard
+        with patch.object(handoff_rules, "codex_home", return_value=self.root), patch.object(
+                handoff_rules, "guard", wraps=lambda root, actor: original(ledger, actor)) as guard:
+            with self.assertRaises(ValueError):
+                self.manager.start(task["id"], "must not send")
+            self.assertEqual(guard.call_args.args[1], task["thread_id"])
+        self.assertEqual(member.read_bytes(), before)
+        self.assertEqual(len(self.client.calls_for("turn/start")), 1)
+
+    def test_orphan_standalone_state_does_not_count_as_unmanaged(self):
+        from relay.manager import handoff_rules
+        task = self.manager.create_task("Raw", self.project)
+        task = self.manager.start(task["id"], "first")
+        self.complete(task)
+        state = handoff_rules.state_file(self.root / "context-handoffs", task["thread_id"])
+        state.parent.mkdir(parents=True)
+        state.write_text("{broken", encoding="utf-8")
+        with patch.object(handoff_rules, "codex_home", return_value=self.root):
+            with self.assertRaises(ValueError):
+                self.manager.start(task["id"], "must not send")
+        self.assertEqual(state.read_text(encoding="utf-8"), "{broken")
+        self.assertEqual(len(self.client.calls_for("turn/start")), 1)
+
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -87,7 +233,7 @@ class ManagerContractTests(unittest.TestCase):
         self.addCleanup(self.manager.close)
 
     def task(self, **kwargs):
-        return self.manager.create_task("Example", str(self.project), "Inspect the sample only", **kwargs)
+        return self.manager.create_task("Example", str(self.project), "Inspect the sample only", **kwargs, direct=False)
 
     def start_task(self, **kwargs):
         task = self.task(**kwargs)
@@ -499,7 +645,7 @@ class ManagerContractTests(unittest.TestCase):
 
         other_project = self.root / "other-project"
         other_project.mkdir()
-        new_task = self.manager.create_task("Other task", str(other_project), "Inspect another sample")
+        new_task = self.manager.create_task("Other task", str(other_project), "Inspect another sample", direct=False)
         replacement = FakeClient()
         replacement.responses["thread/start"].append(RequestTimeout("thread/start", 2, 0.01))
         with patch("relay.transport.CodexClient", return_value=replacement):

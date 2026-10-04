@@ -4,6 +4,56 @@ import tkinter as tk
 from tkinter import font as tkfont, ttk
 
 
+def _scroll_once(widget, steps):
+    try:
+        first, last = map(float, widget.yview())
+        if last - first >= .999 or (steps < 0 and first <= 0) or (steps > 0 and last >= 1):
+            return False
+        before = (first, last)
+        widget.yview_scroll(steps, "units")
+        return tuple(map(float, widget.yview())) != before
+    except (AttributeError, tk.TclError, TypeError):
+        return False
+
+
+def bind_mousewheel_tree(region, target):
+    """Route vertical wheel input inside one widget tree; never installs a global binding."""
+    def wheel(event):
+        if getattr(event, "state", 0) & 0x0001:  # Keep native Shift+wheel horizontal behavior.
+            return None
+        delta = int(getattr(event, "delta", 0))
+        if not delta:
+            return None
+        steps = (-1 if delta > 0 else 1) * max(1, abs(delta) // 120)
+        candidate = None
+        widget = event.widget
+        while widget is not None:
+            assigned = getattr(widget, "_context_relay_wheel_target", None)
+            if assigned is not None:
+                candidate = assigned
+                break
+            if isinstance(widget, ttk.Combobox):
+                break
+            if widget is target or isinstance(widget, (tk.Text, tk.Listbox, ttk.Treeview)):
+                candidate = widget
+                break
+            if widget is region:
+                break
+            widget = getattr(widget, "master", None)
+        fallback = getattr(event.widget, "_context_relay_wheel_fallback", target)
+        if candidate is not None and _scroll_once(candidate, steps):
+            return "break"
+        _scroll_once(fallback, steps)
+        return "break"
+
+    pending = [region]
+    while pending:
+        widget = pending.pop()
+        widget._context_relay_wheel_fallback = target
+        widget.bind("<MouseWheel>", wheel)
+        pending.extend(widget.winfo_children())
+
+
 def _wrapped_line_count(value, font, width):
     """Measure word wrapping without forcing Tk to rebuild Text display lines."""
     width = max(1, width)
@@ -49,6 +99,7 @@ class TaskCardList(ttk.Frame):
         self.canvas = tk.Canvas(self, width=255, highlightthickness=0, borderwidth=0)
         self.inner = ttk.Frame(self.canvas, style="Sidebar.TFrame")
         self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.scrollbar._context_relay_wheel_target = self.canvas
         self.canvas.configure(yscrollcommand=self.scrollbar.set)
         self.window = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
         self._canvas_width = 0
@@ -57,8 +108,7 @@ class TaskCardList(ttk.Frame):
         self.scrollbar.pack(side="right", fill="y")
         self.inner.bind("<Configure>", self._update_region)
         self.canvas.bind("<Configure>", self._resize_inner)
-        self.canvas.bind("<MouseWheel>", self._wheel)
-        self.inner.bind("<MouseWheel>", self._wheel)
+        bind_mousewheel_tree(self, self.canvas)
 
     def _update_region(self, _event=None):
         region = self.canvas.bbox("all")
@@ -70,13 +120,6 @@ class TaskCardList(ttk.Frame):
         if event.width != self._canvas_width:
             self._canvas_width = event.width
             self.canvas.itemconfigure(self.window, width=event.width)
-
-    def _wheel(self, event):
-        widget = self.winfo_containing(event.x_root, event.y_root) if self.winfo_exists() else None
-        while widget is not None and widget is not self:
-            widget = widget.master
-        if widget is self:
-            self.canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
 
     def render(self, rows, selected=None):
         wanted = [row["id"] for row in rows]
@@ -102,7 +145,7 @@ class TaskCardList(ttk.Frame):
                 self._parts[identifier] = (title, preview, meta)
                 for widget in (card, title, preview, meta):
                     widget.bind("<Button-1>", lambda _event, value=identifier: self.selection_set(value, focus=True))
-                    widget.bind("<MouseWheel>", self._wheel)
+                bind_mousewheel_tree(card, self.canvas)
                 card.bind("<Return>", lambda _event, value=identifier: self.selection_set(value, focus=True))
                 card.bind("<space>", lambda _event, value=identifier: self.selection_set(value, focus=True))
                 card.bind("<Up>", lambda _event, value=identifier: self._move(value, -1))
@@ -184,10 +227,11 @@ class ConversationView(ttk.Frame):
         self.canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0)
         self.inner = tk.Frame(self.canvas)
         self.window = self.canvas.create_window(0, 0, anchor="nw", window=self.inner)
-        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=scrollbar.set)
+        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.scrollbar._context_relay_wheel_target = self.canvas
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
         self.canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        self.scrollbar.pack(side="right", fill="y")
         self.rows = []
         self.message_widgets = []
         self.notice_widgets = []
@@ -200,8 +244,7 @@ class ConversationView(ttk.Frame):
         self.context_menu = tk.Menu(self, tearoff=False)
         self.canvas.bind("<Configure>", self._resize)
         self.inner.bind("<Configure>", self._region)
-        self.canvas.bind("<MouseWheel>", self._wheel)
-        self.inner.bind("<MouseWheel>", self._wheel)
+        bind_mousewheel_tree(self, self.canvas)
 
     def configure_tags(self, colors):
         self._colors = colors
@@ -274,10 +317,6 @@ class ConversationView(ttk.Frame):
             label.configure(wraplength=available)
         self._region()
 
-    def _wheel(self, event):
-        self.canvas.yview_scroll(-max(1, abs(event.delta) // 120) if event.delta > 0 else max(1, abs(event.delta) // 120), "units")
-        return "break"
-
     def _copy(self, value):
         self.clipboard_clear()
         self.clipboard_append(value)
@@ -307,10 +346,10 @@ class ConversationView(ttk.Frame):
                        exportselection=False)
         text.insert("1.0", value)
         text.configure(state="disabled")
+        text._context_relay_wheel_target = self.canvas
         window = bubble.create_window(0, 0, window=text, anchor="nw")
         row = dict(frame=frame, label=label, bubble=bubble, shape=shape, text=text, window=window, role=role, value=value)
         for widget in (frame, label, bubble, text):
-            widget.bind("<MouseWheel>", self._wheel)
             widget.bind("<Button-3>", lambda event, original=value: self._menu(event, original))
         text.bind("<Control-a>", lambda _event: (text.tag_add("sel", "1.0", "end-1c"), "break")[-1])
         text.bind("<Configure>", lambda _event: self._schedule_layout())
@@ -319,6 +358,7 @@ class ConversationView(ttk.Frame):
         self.rows.append(row)
         self.message_widgets.append(text)
         self._style(row)
+        bind_mousewheel_tree(frame, self.canvas)
 
     def render(self, messages, notices=(), follow=False):
         signature = (tuple((message["role"], message["text"]) for message in messages), tuple(notices))
@@ -350,7 +390,7 @@ class ConversationView(ttk.Frame):
                              background=self._colors["surface"], foreground="#8a4b08" if kind == "error" else self._colors["muted"])
             label.notice_kind = kind
             label.pack(fill="x", padx=18, pady=10)
-            label.bind("<MouseWheel>", self._wheel)
+            bind_mousewheel_tree(label, self.canvas)
             self.notice_widgets.append(label)
         self._schedule_layout()
         return True

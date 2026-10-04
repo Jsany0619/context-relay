@@ -163,7 +163,7 @@ class PhoneDialog(tk.Toplevel):
         self.device_page = ttk.Frame(self.sections, padding=12, style="Surface.TFrame")
         self.sections.add(self.pair_page, text="配对手机")
         self.sections.add(self.device_page, text="设备与设置")
-        ttk.Label(self.pair_page, text="选择任务和权限，再生成配对信息。电脑需保持开机且管理器运行。",
+        ttk.Label(self.pair_page, text="新增任务不会自动授权给已配对手机。请选择任务和权限，生成新配对信息后在手机重新配对。",
                   wraplength=610, justify="left", style="Surface.Muted.TLabel").pack(fill="x", pady=(0, 12))
         address_row = ttk.Frame(self.device_page, style="Surface.TFrame")
         address_row.pack(fill="x")
@@ -188,9 +188,12 @@ class PhoneDialog(tk.Toplevel):
         self.scope_box.bind("<<ComboboxSelected>>", self._pairing_choices_changed)
         ttk.Label(permission_row, text="控制权限可发送、暂停和审批任务。",
                   style="Surface.Muted.TLabel").pack(side="left")
-        ttk.Label(self.pair_page, text="允许访问的任务（可多选）",
-                  style="Surface.TLabel").pack(anchor="w", pady=(6, 0))
-        self.task_list = tk.Listbox(self.pair_page, height=4, selectmode="extended", exportselection=False,
+        task_heading = ttk.Frame(self.pair_page, style="Surface.TFrame")
+        task_heading.pack(fill="x", pady=(6, 0))
+        ttk.Label(task_heading, text="允许访问的任务（可多选）", style="Surface.TLabel").pack(side="left")
+        self.selection_count = tk.StringVar()
+        ttk.Label(task_heading, textvariable=self.selection_count, style="Surface.Muted.TLabel").pack(side="right")
+        self.task_list = tk.Listbox(self.pair_page, height=4, selectmode="multiple", exportselection=False,
                                     background=colors["surface"], foreground=colors["ink"],
                                     selectbackground=colors["accent"], selectforeground=colors["surface"],
                                     relief="flat", borderwidth=0, highlightthickness=1,
@@ -198,6 +201,13 @@ class PhoneDialog(tk.Toplevel):
                                     font="TkTextFont")
         self.task_list.pack(fill="x", pady=(3, 8))
         self.task_list.bind("<<ListboxSelect>>", self._pairing_choices_changed)
+        selection_row = ttk.Frame(self.pair_page, style="Surface.TFrame")
+        selection_row.pack(fill="x", pady=(0, 8))
+        ttk.Label(selection_row, text="点击选择，再点取消", style="Surface.Muted.TLabel").pack(side="left")
+        self.clear_selection_button = ttk.Button(selection_row, text="清空选择", command=lambda: self._select_tasks(False))
+        self.clear_selection_button.pack(side="right")
+        self.select_all_button = ttk.Button(selection_row, text="全选任务", command=lambda: self._select_tasks(True))
+        self.select_all_button.pack(side="right", padx=8)
         self.task_ids = []
         self._sync_tasks()
         buttons = ttk.Frame(self.pair_page, style="Surface.TFrame")
@@ -289,6 +299,14 @@ class PhoneDialog(tk.Toplevel):
         if self._pairing_snapshot is not None and self._choice_snapshot() != self._pairing_snapshot:
             self._clear_pairing("选择已变化，旧配对信息已清除；请重新生成。")
         self.controls()
+
+    def _select_tasks(self, select_all):
+        if not (self.app.ready and not self.app.busy and not self.app.closing and self.app.recovery_info is None):
+            return
+        self.task_list.selection_clear(0, "end")
+        if select_all and self.task_ids:
+            self.task_list.selection_set(0, len(self.task_ids) - 1)
+        self._pairing_choices_changed()
 
     def _clear_pairing(self, message=None):
         self._pairing_serial += 1
@@ -439,11 +457,17 @@ class PhoneDialog(tk.Toplevel):
             elif not visible and widget.winfo_manager():
                 widget.pack_forget()
         available = self.app.ready and not self.app.busy and not self.app.closing and self.app.recovery_info is None
-        selected = bool(self._choice_snapshot()[0])
+        selected_count = len(self._choice_snapshot()[0])
+        count = f"已选 {selected_count} / 共 {len(self.task_ids)}"
+        if self.selection_count.get() != count:
+            self.selection_count.set(count)
+        selected = bool(selected_count)
         for widget, enabled in ((self.enable_button, not self.enabled),
                                 (self.pair_button, self.enabled and selected and self._pairing_request is None),
                                 (self.stop_button, self.enabled), (self.refresh_button, True),
                                 (self.network_button, True),
+                                (self.select_all_button, selected_count < len(self.task_ids)),
+                                (self.clear_selection_button, selected),
                                 (self.revoke_button, self.enabled and bool(self.devices))):
             self._set_state(widget, "normal" if available and enabled else "disabled")
         self._set_state(self.copy_button, "normal" if self.enabled and self._pairing_snapshot is not None

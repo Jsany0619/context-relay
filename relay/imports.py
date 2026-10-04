@@ -55,7 +55,7 @@ def _message(role: str, text: str, turn_id: str, item_id: str) -> dict[str, str]
 
 
 def normalize_thread(thread: Any, expected_id: str | None = None, *,
-                     include_messages: bool = True) -> dict[str, Any]:
+                     include_messages: bool = True, managed_owner: bool = False) -> dict[str, Any]:
     """Return a bounded, inert snapshot from a v2 ``thread/read`` Thread object."""
     if not isinstance(thread, dict):
         raise ValueError("thread must be an object")
@@ -72,7 +72,7 @@ def normalize_thread(thread: Any, expected_id: str | None = None, *,
     if not isinstance(updated_at, int) or isinstance(updated_at, bool) or updated_at < 0:
         raise ValueError("thread updatedAt must be a non-negative integer")
     source = thread.get("source")
-    if source != "vscode":
+    if source not in (("vscode", "cli", "exec", "appServer") if managed_owner else ("vscode",)):
         raise ValueError("only vscode-source Codex threads can be imported")
     status_value = thread.get("status")
     if not isinstance(status_value, dict) or status_value.get("type") not in _THREAD_STATUSES:

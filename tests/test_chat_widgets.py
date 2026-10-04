@@ -3,6 +3,7 @@ import tkinter as tk
 import time
 import unittest
 from unittest import mock
+from tkinter import ttk
 
 from relay.chat_widgets import ConversationView
 from relay.ui import THEMES, apply_theme
@@ -78,6 +79,17 @@ class BubbleTests(unittest.TestCase):
         self.assertEqual(text.cget("background"), THEMES["blue"]["bubble_user"])
         self.assertEqual(self.view.notice_widgets[0].cget("text"), "原文读取失败")
         self.assertIsNotNone(text.dlineinfo("end-1c"))
+
+    def test_wheel_over_scrollbar_scrolls_the_conversation(self):
+        self.view.render([{"role": "assistant", "text": f"消息 {index}\n" * 5}
+                          for index in range(20)])
+        self.root.update()
+        scrollbar = next(child for child in self.view.winfo_children() if isinstance(child, ttk.Scrollbar))
+        self.view.canvas.yview_moveto(0)
+        before = self.view.canvas.yview()
+        scrollbar.event_generate("<MouseWheel>", delta=-120)
+        self.root.update()
+        self.assertGreater(self.view.canvas.yview()[0], before[0])
 
     def test_mixed_whitespace_tabs_and_unbroken_text_keep_the_final_line_visible(self):
         values = [

@@ -197,7 +197,6 @@ class GatewayCore:
         self._closed = False
         self._payloads: dict[str, dict[str, Any]] = {}
         self._tasks: dict[str, dict[str, Any]] = {}
-        self._raw_tasks: dict[str, dict[str, Any]] = {}
         self._connection_id: str | None = None
         self._cursor = 0
         self._recovery_info = None
@@ -516,6 +515,9 @@ class GatewayCore:
             raise ValueError("任务快照无效。")
         messages, messages_truncated = self._messages(task.get("messages"))
         dto = {key: _json_copy(task.get(key)) for key in _TASK_FIELDS}
+        dto["conversation_available"] = bool(task.get("thread_id") or
+                                             (task.get("source_snapshot") or {}).get("thread_id"))
+        dto["conversation_generation"] = task.get("generation", 0)
         if task.get("connection_mode") == "direct":
             dto["connection_mode"] = "direct"
         if (task.get("last_message_kind") in {"brief", "review", "summary", "verify"}
@@ -532,16 +534,15 @@ class GatewayCore:
     def publish_tasks(self, raw_tasks, recovery_info=None, connection_id=None):
         if not isinstance(raw_tasks, list) or connection_id is not None and not isinstance(connection_id, str):
             raise ValueError("任务快照无效。")
-        copied, projected = {}, {}
+        projected = {}
         for task in raw_tasks:
-            item = _json_copy(task, maximum=1024 * 1024)
-            dto = self._task_dto(item, connection_id)
-            copied[item["id"]], projected[item["id"]] = item, dto
+            dto = self._task_dto(task, connection_id)
+            projected[task["id"]] = dto
         with self._lock:
             if (projected != self._tasks or recovery_info != self._recovery_info
                     or connection_id != self._connection_id):
                 self._cursor += 1
-            self._raw_tasks, self._tasks = copied, projected
+            self._tasks = projected
             self._recovery_info = _json_copy(recovery_info) if recovery_info is not None else None
             self._connection_id = connection_id
             return self._cursor
@@ -767,7 +768,7 @@ class GatewayCore:
             current = next((item for item in tasks if item.get("id") == command["task_id"]), None)
             if current is None:
                 return self._failed_receipt(request_id, "not_found", "找不到任务。")
-            current_etag = self._task_dto(_json_copy(current, maximum=1024 * 1024), self._connection_id)["etag"]
+            current_etag = self._task_dto(current, self._connection_id)["etag"]
             if current_etag != command["expected_etag"]:
                 return self._failed_receipt(request_id, "stale_task", "任务已经变化，请刷新后再操作。")
             name, task_id, payload = command["command"], command["task_id"], command["payload"]
@@ -807,8 +808,7 @@ class GatewayCore:
                 self._finish(request_id, "unknown", error_code="outcome_unknown",
                              error_message="电脑端需要核对原生结果；不要重发原操作。", expected_state="running")
                 return self._command_receipt(request_id)
-            dto = self._task_dto(_json_copy(current, maximum=1024 * 1024), self._connection_id,
-                                  access["scope"])
+            dto = self._task_dto(current, self._connection_id, access["scope"])
             self._finish(request_id, "succeeded", {"task": dto}, expected_state="running")
         except Exception as error:
             unknown = isinstance(error, (RequestTimeout, RpcError))

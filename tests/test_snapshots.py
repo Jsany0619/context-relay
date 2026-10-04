@@ -22,7 +22,7 @@ class SnapshotTests(unittest.TestCase):
         self.addCleanup(self.manager.close)
 
     def start(self, automatic=True):
-        task = self.manager.create_task("Example", self.project, "Inspect adopted.txt", auto_handoff=automatic)
+        task = self.manager.create_task("Example", self.project, "Inspect adopted.txt", auto_handoff=automatic, direct=False)
         return self.manager.start(task["id"])
 
     def usage(self, task, last):
@@ -120,7 +120,7 @@ class SnapshotTests(unittest.TestCase):
         nested.mkdir()
         for directory in (self.root, nested):
             with self.subTest(directory=directory), self.assertRaises(ValueError):
-                self.manager.create_task("Overlap", directory, "Read files only")
+                self.manager.create_task("Overlap", directory, "Read files only", direct=False)
 
     def test_legacy_overlap_cannot_write_snapshot_into_read_only_project(self):
         task = self.start(False)

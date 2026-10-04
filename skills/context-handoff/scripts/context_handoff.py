@@ -734,7 +734,7 @@ def hook(root, event, origin="manual"):
 def verify_actor_context(actor, cwd):
     if not same_path(os.getcwd(), cwd):
         raise ValueError("Run handoff commands from the original project cwd")
-    signals = inspect_transcript(find_transcript(actor), actor, cwd=cwd)
+    signals = inspect_transcript(find_transcript(actor), actor)
     if not signals["root_verified"]:
         raise ValueError("Only a verified root chat may change handoff ownership")
     if signals["mode"] != "default" or signals.get("read_only"):

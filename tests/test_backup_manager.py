@@ -27,7 +27,7 @@ class BackupManagerTests(unittest.TestCase):
         self.client = FakeClient()
         self.manager = Manager(self.root / "state", self.client)
         self.addCleanup(self.manager.close)
-        self.task = self.manager.create_task("Example", self.project, "Inspect original requirements")
+        self.task = self.manager.create_task("Example", self.project, "Inspect original requirements", direct=False)
 
     def inspection_copy(self):
         destination = self.root / "inspection"
@@ -63,7 +63,7 @@ class BackupManagerTests(unittest.TestCase):
                     lambda: recovered.set_archived(task["id"], False),
                     lambda: recovered.update_settings(task["id"], title="changed", max_tokens=0,
                                                        max_minutes=0, auto_handoff=False),
-                    lambda: recovered.create_task("New", self.project, "Must not run"),
+                    lambda: recovered.create_task("New", self.project, "Must not run", direct=False),
                     lambda: recovered.backup_state(self.root / "nested.zip"),
                 ):
                     with self.assertRaisesRegex(ValueError, "只读"):

@@ -168,7 +168,7 @@ def run(root: Path) -> int:
             "Read sentinel.txt and report its complete contents. This is a read-only local task. "
             "Do not modify files, use network, MCP servers, apps, subagents, or background processes."
         )
-        created = first_manager.create_task("Controlled interrupted read", project, goal, mode="read-only")
+        created = first_manager.create_task("Controlled interrupted read", project, goal, mode="read-only", direct=False)
         task_id = created["id"]
         started = first_manager.start(task_id)
         interrupted_turn = started["turn_id"]

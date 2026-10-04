@@ -25,7 +25,7 @@ class DisconnectTests(unittest.TestCase):
 
     def start(self):
         task = self.manager.create_task("Disconnect", self.project, "Inspect the fake sample only",
-                                        mode="workspace-write")
+                                        mode="workspace-write", direct=False)
         self.manager.start(task["id"])
         self.manager.poll()
         return self.manager.get_task(task["id"])
@@ -99,7 +99,7 @@ class DisconnectTests(unittest.TestCase):
         self.assertEqual([], fresh.answers)
 
     def test_unknown_creation_is_not_retried_or_bound_to_reused_connection_request_id(self):
-        task = self.manager.create_task("Unknown", self.project, "Inspect only")
+        task = self.manager.create_task("Unknown", self.project, "Inspect only", direct=False)
         self.client.responses["thread/start"].append(RequestTimeout("thread/start", 2, .01))
         with self.assertRaises(RequestTimeout):
             self.manager.start(task["id"])
@@ -111,7 +111,7 @@ class DisconnectTests(unittest.TestCase):
             constructor.assert_not_called()
         other_project = self.root / "other"
         other_project.mkdir()
-        other = self.manager.create_task("Other", other_project, "Inspect other sample")
+        other = self.manager.create_task("Other", other_project, "Inspect other sample", direct=False)
         fresh = FakeClient()
         fresh.responses["thread/start"].append(RequestTimeout("thread/start", 2, .01))
         with patch("relay.transport.CodexClient", return_value=fresh):
@@ -186,7 +186,7 @@ for line in sys.stdin:
         self.addCleanup(native.close)
         manager = Manager(self.root / "local-rpc-state", native)
         self.addCleanup(manager.close)
-        task = manager.create_task("Malformed", self.project, "Fake RPC only")
+        task = manager.create_task("Malformed", self.project, "Fake RPC only", direct=False)
         with self.assertRaises((RpcError, RequestTimeout)):
             manager.start(task["id"])
         deadline = time.monotonic() + 1

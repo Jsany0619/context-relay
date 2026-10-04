@@ -20,7 +20,7 @@ class DiagnosticsTests(unittest.TestCase):
         self.client = FakeClient()
         self.manager = Manager(self.root / 'state', self.client)
         self.addCleanup(self.manager.close)
-        self.task = self.manager.create_task('Example', self.project, 'Inspect only', max_minutes=5)
+        self.task = self.manager.create_task('Example', self.project, 'Inspect only', max_minutes=5, direct=False)
 
     def test_diagnostics_are_readonly_allowlisted_and_budget_is_explained(self):
         task = self.manager._task(self.task['id'])

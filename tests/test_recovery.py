@@ -25,7 +25,7 @@ class RecoveryTests(unittest.TestCase):
     def started_task(self, cwd=None, **options):
         task = self.manager.create_task("Recovery", str(cwd or self.project),
                                         "Inspect the existing sample without repeating completed actions.",
-                                        mode="workspace-write", **options)
+                                        mode="workspace-write", **options, direct=False)
         self.manager.start(task["id"])
         self.manager.poll()
         return self.manager.get_task(task["id"])

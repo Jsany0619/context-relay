@@ -91,6 +91,8 @@ class FakeManager:
         time.sleep(self.delay)
         task = dict(self.tasks[0], **values)
         task.update(id="task-2", state="queued")
+        if values.get("direct"):
+            task.update(connection_mode="direct", thread_id=None)
         self.tasks.append(task)
         self.created_pending = True
         return deepcopy(task)
@@ -904,6 +906,48 @@ class TkSmokeTests(unittest.TestCase):
         self.assertIn("回复-task-1", text)
         self.assertNotIn("原文-task-other", text)
 
+    def test_new_empty_direct_task_keeps_composer_without_native_history_request(self):
+        self.app.submit("create_task", title="空对话", cwd=self.temp.name, goal="", mode="read-only",
+                        auto_handoff=False, max_tokens=0, max_minutes=0, direct=True)
+        self.wait_for(lambda: self.app.selected_id == "task-2" and not self.app.busy)
+        self.assertEqual(self.fake.chat_reads, [])
+        self.assertNotIn("尚未读到原始对话", displayed_conversation(self.app))
+        self.app.message_text.insert("1.0", "第一条原话")
+        self.assertEqual(self.app.message_text.get("1.0", "end-1c"), "第一条原话")
+        next(task for task in self.fake.tasks if task["id"] == "task-2").update(
+            thread_id="synthetic-first-thread", state="idle", work_turns=1)
+        self.wait_for(lambda: ("task-2", None) in self.fake.chat_reads and not self.app.busy)
+        self.assertIn("原文-task-2", displayed_conversation(self.app))
+
+    def test_direct_idle_task_keeps_manual_handoff_under_existing_gates(self):
+        self.fake.tasks[0]["connection_mode"] = "direct"
+        self.wait_for(lambda: not self.app.buttons["handoff"].instate(["disabled"]))
+        self.fake.tasks[0].update(max_minutes=1, elapsed_seconds=60)
+        self.wait_for(lambda: self.app.buttons["handoff"].instate(["disabled"]))
+
+    def test_native_control_turns_are_labeled_without_rewriting_text(self):
+        original = "  原样控制正文\n保留空格  "
+        page = self.fake.read_chat("task-1")
+        page["entries"] = [dict(page["entries"][0], text=original, control_purpose="summary"),
+                           dict(page["entries"][1], control_purpose="verify")]
+        self.fake.tasks[0]["connection_mode"] = "direct"
+        self.app.tasks["task-1"]["connection_mode"] = "direct"
+        self.app.chat_cache["task-1"] = page
+        self.app._render_task()
+        text = displayed_conversation(self.app)
+        self.assertIn(original, text)
+        self.assertIn("交接准备 / 接收核验", text)
+
+    def test_generation_change_discards_old_native_page(self):
+        self.fake.tasks[0]["connection_mode"] = "direct"
+        self.app.tasks["task-1"]["connection_mode"] = "direct"
+        self.app.chat_cache["task-1"] = self.fake.read_chat("task-1")
+        self.fake.tasks[0]["generation"] = 1
+        self.app._render_tasks(deepcopy(self.fake.tasks))
+        self.assertNotIn("原文-task-1", displayed_conversation(self.app))
+        self.wait_for(lambda: self.fake.chat_reads.count(("task-1", None)) >= 2 and not self.app.busy)
+        self.assertIn("原文-task-1", displayed_conversation(self.app))
+
     def test_direct_latest_page_refreshes_read_only_when_task_receives_new_result(self):
         self.add_task(connection_mode="direct")
         self.select_task("task-other")
@@ -1263,8 +1307,19 @@ class TkSmokeTests(unittest.TestCase):
         dialog.fields["max_tokens"].set("1000")
         dialog.save()
         self.assertEqual(submit.call_args.kwargs["mode"], "read-only")
+        self.assertTrue(submit.call_args.kwargs["direct"])
         self.assertFalse(submit.call_args.kwargs["auto_handoff"])
         self.assertEqual(submit.call_args.kwargs["max_tokens"], 1000)
+
+    def test_new_task_allows_empty_optional_metadata(self):
+        submit = mock.Mock(return_value=True)
+        dialog = NewTaskDialog(self.root, submit)
+        dialog.withdraw()
+        dialog.fields["title"].set("空对话")
+        dialog.fields["cwd"].set(self.temp.name)
+        dialog.save()
+        self.assertEqual(submit.call_args.kwargs["goal"], "")
+        self.assertTrue(submit.call_args.kwargs["direct"])
 
 
 class WorkerTests(unittest.TestCase):

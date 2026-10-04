@@ -19,7 +19,7 @@ class OrganizationTests(unittest.TestCase):
         self.client = FakeClient()
         self.manager = Manager(self.root / "state", self.client)
         self.addCleanup(lambda: self.manager.close())
-        self.task = self.manager.create_task("Example", str(self.project), "Inspect only")
+        self.task = self.manager.create_task("Example", str(self.project), "Inspect only", direct=False)
 
     def test_archive_restore_preserves_execution_and_artifacts_across_restart(self):
         artifact = self.project / "adopted.txt"

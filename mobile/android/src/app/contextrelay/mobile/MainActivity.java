@@ -145,6 +145,7 @@ public final class MainActivity extends Activity {
             density = Protocol.appearancePreference("density", values.get("density"));
         } catch (RuntimeException ex) { appearanceReadFailed = true; }
         getWindow().setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE);
+        if (Build.VERSION.SDK_INT >= 33) setRecentsScreenshotEnabled(false);
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
         getWindow().setStatusBarColor(color("background"));
         getWindow().setNavigationBarColor(color("background"));
@@ -328,7 +329,7 @@ public final class MainActivity extends Activity {
                 if (task != null && connection() != null && !connection().optBoolean("needs_pairing")) {
                     JSONObject snapshot = new JSONObject();
                     for (String name : new String[] {"id", "title", "state", "mode", "last_message", "messages", "messages_truncated", "error", "connection_mode",
-                            "summary_only", "message_preview"})
+                            "summary_only", "message_preview", "conversation_available", "conversation_generation"})
                         if (task.has(name)) put(snapshot, name, task.opt(name));
                     put(snapshot, "cached_conversation", conversationAvailable(task));
                     if (snapshot.toString().getBytes(StandardCharsets.UTF_8).length <= 512 * 1024) {
@@ -773,6 +774,9 @@ public final class MainActivity extends Activity {
         return value != null && (fullTask(value) || Protocol.conversationSnapshot(value.optBoolean("summary_only"),
                 value.optBoolean("cached_conversation"), value.has("messages"), value.has("last_message")));
     }
+    private boolean nativeConversationAvailable() {
+        return task != null && task.optBoolean("conversation_available", true);
+    }
     private void expireConnection() {
         if (connection() == null) return;
         cancelScreenshot();
@@ -850,9 +854,10 @@ public final class MainActivity extends Activity {
             handler.post(() -> {
                 if (isDestroyed() || isFinishing()) return;
                 if (silent) refreshing = false; else busy = false;
+                // Release the current page's busy controls even when an older authorization has expired.
+                if (!silent) controls();
                 if (!Protocol.authorized(unlocked, foreground, deviceSecure(), epoch, authEpoch)) return;
                 if (silent && busy) return; // A confirmed command owns the next visible state; its queued dispatch is never dropped.
-                if (!silent) controls();
                 // Reads are bound to their original page; late results never switch tasks.
                 if (bound != generation) return;
                 if (problem != null) { error(problem); return; }
@@ -945,7 +950,8 @@ public final class MainActivity extends Activity {
         text(help, "1  电脑：打开手机连接，选择允许查看的任务和控制权限。\n2  电脑：复制配对信息，通过可信方式传到手机。\n3  手机：粘贴并核对电脑地址与证书指纹。", 16);
         text(help, "手机与电脑须在同一网络或已配置的私有网络。配对信息含一次性密钥，请勿公开。", 14);
         if (pending() != null) {
-            text(content, "仍有结果待核对的操作，不能替换连接或丢弃原请求。请返回查询。", 17);
+            text(content, "有操作结果尚未核对，暂不能更换连接。请先查看并核对结果；原连接和请求会保留，不会自动重发。", 17);
+            button(content, "查看待核对操作", true, this::showOperationDetails);
             button(content, "返回原连接", true, () -> { incomingPair = null; showTasks(); });
             return;
         }
@@ -1010,10 +1016,12 @@ public final class MainActivity extends Activity {
         header.removeAllViews();
         LinearLayout navigation = new LinearLayout(this); navigation.setGravity(Gravity.CENTER_VERTICAL); header.addView(navigation);
         TextView title = text(navigation, "我的任务", 22); title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        title.setMaxLines(1); title.setEllipsize(TextUtils.TruncateAt.END);
         title.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
         LinearLayout details = column(); content.addView(details); disclosure(navigation, details, "tasks", "任务列表");
         ink(text(details, "这里只显示本次配对获授权的任务。", 14), "muted");
         connectionInfo = ink(text(details, "", 14), "muted"); updateConnectionInfo();
+        screenshotButton(navigation);
         Button more = button(navigation, "⋯", true, this::showDetails); more.setContentDescription("更多操作");
         spacing(more, 0, 8, 0, 8);
         font(more, 24); more.setLayoutParams(new LinearLayout.LayoutParams(dp(48), -2));
@@ -1089,6 +1097,10 @@ public final class MainActivity extends Activity {
                 if (!id.equals(result.optString("id")) || !fullTask(result))
                     throw new IllegalArgumentException("对话未能读取，请刷新或更新电脑端。");
                 boolean loading = !fullTask(task);
+                if (task != null && task.optInt("conversation_generation") != result.optInt("conversation_generation")) {
+                    originalPage = null; originalCursor = null; originalError = "";
+                    originalInfo = ""; timelineSignature = "";
+                }
                 task = result;
                 if (timeline == null || loading) showTask(); else updateTask();
             }
@@ -1135,6 +1147,7 @@ public final class MainActivity extends Activity {
         LinearLayout details = column(); content.addView(details); disclosure(navigation, details, "chat", "当前任务");
         taskSubtitle = ink(text(details, "正在读取任务…", 14), "muted");
         connectionInfo = ink(text(details, "", 14), "muted"); updateConnectionInfo();
+        screenshotButton(navigation);
         Button more = button(navigation, "⋯", fullTask(task), this::showDetails);
         more.setContentDescription("更多操作与完整任务名称"); font(more, 24);
         spacing(more, 0, 8, 0, 8);
@@ -1386,7 +1399,7 @@ public final class MainActivity extends Activity {
 
     private void updateTask() {
         if (!authorized() || timeline == null || task == null) return;
-        if (!originalChoice && "direct".equals(task.optString("connection_mode"))) originalView = true;
+        if (!originalChoice) originalView = "direct".equals(task.optString("connection_mode")) && nativeConversationAvailable();
         updateTaskControls();
         if (originalView) {
             if (originalPage == null && !"original-unread".equals(timelineSignature)) {
@@ -1439,6 +1452,10 @@ public final class MainActivity extends Activity {
 
     private void readOriginal(String cursor, boolean silent, boolean changePage) {
         if (changePage) cancelPrivacy();
+        if (!nativeConversationAvailable()) {
+            if (!silent) showStatus("新对话尚未发送消息；发送后可查看原始对话。");
+            return;
+        }
         if (!fullTask(task)) {
             if (!silent) showStatus("完整任务尚未读取，暂不能查看原始对话。");
             return;
@@ -1490,6 +1507,10 @@ public final class MainActivity extends Activity {
                     JSONObject entry = entries.getJSONObject(i);
                     String detail = Protocol.originalNotice(entry.getInt("part"), entry.getInt("parts"),
                             entry.optString("turn_status", "unknown"), entry.isNull("phase") ? "" : entry.optString("phase"));
+                    String control = entry.optString("control_purpose");
+                    if ("summary".equals(control) || "verify".equals(control))
+                        detail = ("summary".equals(control) ? "交接准备 · 内部请求" : "接收核验 · 内部请求")
+                                + (detail.isEmpty() ? "" : "\n" + detail);
                     chatMessage(entry.getString("role"), entry.getString("text"), "", detail, true);
                 }
                 if (entries.length() == 0) text(timeline, "宿主未返回用户或助手文字。非文字记录不在此页展开。", 16);
@@ -1527,6 +1548,15 @@ public final class MainActivity extends Activity {
 
     private boolean screenshotEligible() {
         return screenshotPageKey() != null && dialogs.isEmpty() && !authPending && privacyRequest == null;
+    }
+
+    private void screenshotButton(LinearLayout navigation) {
+        Button capture = new Button(this); capture.setText("截图"); styleButton(capture, false);
+        spacing(capture, 0, 8, 0, 8); capture.setSingleLine(false);
+        capture.setContentDescription("截图：确认风险并验证后保存当前页一次");
+        // Keep this entry reachable so the existing guard can explain why capture is unavailable.
+        capture.setOnClickListener(view -> requestScreenshot());
+        navigation.addView(capture, new LinearLayout.LayoutParams(dp(64), -2));
     }
 
     private void requestScreenshot() {
@@ -1567,12 +1597,12 @@ public final class MainActivity extends Activity {
             if (connection() != null && connection().has("expires_at"))
                 text(box, "连接授权到期：" + timeLabel(connection().optString("expires_at")), 14);
             button(box, "刷新任务列表", connection() != null, () -> { dismissDialogs(); refresh(); });
-            button(box, "更换电脑 / 重新配对", pending() == null, () -> { dismissDialogs(); showPairing(); });
+            button(box, "更换电脑 / 重新配对", true, () -> { dismissDialogs(); showPairing(); });
         } else {
             text(box, task.optString("title", "对话"), 20).setTypeface(Typeface.DEFAULT, Typeface.BOLD);
             menuSection(box, "对话");
             button(box, "刷新当前对话", true, () -> { dismissDialogs(); refresh(); });
-            button(box, originalView ? "查看管理记录" : "查看原始对话", true, () -> {
+            button(box, originalView ? "查看管理记录" : "查看原始对话", originalView || nativeConversationAvailable(), () -> {
                 cancelScreenshot(); cancelPrivacy();
                 dismissDialogs(); generation++; originalChoice = true; originalView = !originalView;
                 timelineSignature = ""; originalPage = null; originalCursor = null; originalError = "";
@@ -1727,6 +1757,7 @@ public final class MainActivity extends Activity {
     private void renderAssessments(LinearLayout parent, JSONObject displayed, boolean quiet) {
         if ("direct".equals(displayed.optString("connection_mode"))) {
             text(parent, "原话连接：直接发送你的要求。需要整理、审核或修改时，请在对话输入框说明；这里不生成管理指令。", 16);
+            text(parent, "需要交接时，请在电脑端选择“交接”，或在那里开启自动交接。核验通过后仍使用此任务，等待你发送下一条消息。", 14);
             return;
         }
         text(parent, "简报 / 阶段审核", 22);

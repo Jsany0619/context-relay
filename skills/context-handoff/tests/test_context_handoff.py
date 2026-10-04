@@ -420,6 +420,32 @@ class HookTests(TranscriptFixture):
         self.assertAlmostEqual(result["pressure"], 0.75)
         self.assertEqual(result["action"], "checkpoint")
         self.assertNotIn("private sentinel", completed.stdout + completed.stderr)
+
+    def test_actor_identity_is_independent_of_chat_creation_directory(self):
+        chat_cwd = self.cwd / "chat-workspace"
+        for invalid in (None, "actual_cwd", "subagent", "id", "conflict", "plan", "read-only"):
+            with self.subTest(invalid=invalid):
+                self.header(cwd=chat_cwd)
+                self.rows[1]["payload"]["collaboration_mode"] = {"mode": "default"}
+                if invalid == "subagent":
+                    self.rows[0]["payload"]["source"] = {"subagent": {"parent_thread_id": SESSION}}
+                elif invalid == "id":
+                    self.rows[0]["payload"]["id"] = OTHER_TARGET
+                elif invalid == "conflict":
+                    self.row("session_meta", {"id": OTHER_TARGET, "cwd": str(chat_cwd), "source": "vscode"})
+                elif invalid == "plan":
+                    self.rows[1]["payload"]["collaboration_mode"] = {"mode": "plan"}
+                elif invalid == "read-only":
+                    self.rows[1]["payload"]["sandbox_policy"] = {"type": "read-only"}
+                self.write_rollout()
+                actual_cwd = chat_cwd if invalid == "actual_cwd" else self.cwd
+                with mock.patch.object(handoff, "find_transcript", return_value=self.path), \
+                        mock.patch.object(handoff.os, "getcwd", return_value=str(actual_cwd)):
+                    if invalid:
+                        with self.assertRaises(ValueError):
+                            handoff.verify_actor_context(SESSION, str(self.cwd))
+                    else:
+                        handoff.verify_actor_context(SESSION, str(self.cwd))
         self.assertFalse(self.root.exists())
 
     def run_hook_command(self, command):
@@ -499,11 +525,11 @@ class ProtocolTests(unittest.TestCase):
                                          checks=["Confirm the expected text"],
                                          stop_conditions=["Stop if an artifact changed after the snapshot"])
 
-    def write_user_log(self, actor, text, *, role="user", at=None):
+    def write_user_log(self, actor, text, *, role="user", at=None, cwd=None):
         at = at or datetime.now(timezone.utc).isoformat()
         rows = [
-            {"timestamp": at, "type": "session_meta", "payload": {"id": actor, "cwd": str(self.cwd), "source": "vscode"}},
-            {"timestamp": at, "type": "turn_context", "payload": {"model": MODEL, "cwd": str(self.cwd),
+            {"timestamp": at, "type": "session_meta", "payload": {"id": actor, "cwd": str(cwd or self.cwd), "source": "vscode"}},
+            {"timestamp": at, "type": "turn_context", "payload": {"model": MODEL, "cwd": str(cwd or self.cwd),
              "turn_id": "test-turn", "collaboration_mode": {"mode": "default"}}},
             {"timestamp": at, "type": "response_item", "payload": {"type": "message", "role": role,
              "content": [{"type": "input_text", "text": text}]}},
@@ -974,12 +1000,12 @@ class ProtocolTests(unittest.TestCase):
             (marker, "user", issued_at - timedelta(seconds=1)),
         ]:
             with self.subTest(role=role, at=at.isoformat()):
-                self.write_user_log(TARGET, text, role=role, at=at.isoformat())
+                self.write_user_log(TARGET, text, role=role, at=at.isoformat(), cwd=self.cwd / "chat-workspace")
                 completed = self.run_cli(arguments, actor=TARGET)
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertIsNone(handoff.read_json(handoff.state_file(self.root, SESSION))["owner"])
         self.write_user_log(TARGET, "Accept this project handoff. " + marker,
-                            at=(issued_at + timedelta(seconds=1)).isoformat())
+                            at=(issued_at + timedelta(seconds=1)).isoformat(), cwd=self.cwd / "chat-workspace")
         completed = self.run_cli(arguments, actor=TARGET)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(json.loads(completed.stdout)["owner"], TARGET)

@@ -18,6 +18,116 @@ class PhoneUiTests(unittest.TestCase):
     tearDown = base_ui.TkSmokeTests.tearDown
     wait_for = base_ui.TkSmokeTests.wait_for
 
+    def test_plain_clicks_toggle_multiple_tasks_without_modifier_keys(self):
+        self.app.tasks["task-two"] = dict(self.app.tasks["task-1"], id="task-two", title="第二个合成任务")
+        with mock.patch("relay.phone.local_addresses", return_value=["127.0.0.1"]):
+            self.app.phone_button.invoke()
+        dialog = self.app.phone_dialog
+        self.wait_for(lambda: not self.app.busy)
+        dialog.deliver({"enabled": True, "endpoint": "https://192.0.2.1:8765", "devices": []})
+        self.root.deiconify()
+        dialog.deiconify()
+        self.root.update()
+
+        def click(index):
+            bounds = dialog.task_list.bbox(index)
+            self.assertIsNotNone(bounds)
+            x, y, width, height = bounds
+            dialog.task_list.event_generate("<Button-1>", x=x + 3, y=y + height // 2, state=0)
+            dialog.task_list.event_generate("<ButtonRelease-1>", x=x + 3, y=y + height // 2, state=0)
+            self.root.update()
+
+        click(0)
+        click(1)
+        self.assertEqual(dialog.task_list.curselection(), (0, 1))
+        self.assertEqual(dialog.selection_count.get(), "已选 2 / 共 2")
+        dialog._show_pairing("contextrelay://pair#synthetic", dialog._choice_snapshot(), time.time() + 300)
+        click(0)
+        self.assertEqual(dialog.task_list.curselection(), (1,))
+        self.assertEqual(dialog.selection_count.get(), "已选 1 / 共 2")
+        self.assertEqual(dialog.pairing.get("1.0", "end-1c"), "")
+        self.app.busy = True
+        try:
+            dialog.controls()
+            click(1)
+            self.assertEqual(dialog.task_list.curselection(), (1,))
+        finally:
+            self.app.busy = False
+        self.assertFalse(self.fake.starts)
+
+    def test_task_selection_shortcuts_count_and_invalidate_pairing_without_granting(self):
+        original = self.app.tasks["task-1"]
+        self.app.tasks["task-two"] = dict(original, id="task-two", title="第二个合成任务")
+        self.app.tasks["task-three"] = dict(original, id="task-three", title="第三个合成任务")
+        self.app.tasks["archived"] = dict(original, id="archived", archived=True)
+        with mock.patch("relay.phone.local_addresses", return_value=["127.0.0.1"]):
+            self.app.phone_button.invoke()
+        dialog = self.app.phone_dialog
+        self.wait_for(lambda: not self.app.busy)
+        devices = [{"id": "synthetic-device", "task_ids": ["task-1"], "scope": "read_only"}]
+        dialog.deliver({"enabled": True, "endpoint": "https://192.0.2.1:8765", "devices": devices})
+        self.assertEqual(dialog.selection_count.get(), "已选 0 / 共 3")
+        with mock.patch.object(dialog, "submit", return_value=True) as submit:
+            dialog.select_all_button.invoke()
+            self.assertEqual(dialog.selection_count.get(), "已选 3 / 共 3")
+            self.assertEqual(dialog._choice_snapshot(), (("task-1", "task-two", "task-three"), "read_only"))
+            submit.assert_not_called()
+            dialog.pair()
+            submit.assert_called_once_with("remote_pair", ["task-1", "task-two", "task-three"], "read_only")
+        dialog._pairing_request = None
+        dialog._show_pairing("contextrelay://pair#synthetic", dialog._choice_snapshot(), time.time() + 300)
+        with mock.patch.object(dialog, "submit") as submit:
+            dialog.clear_selection_button.invoke()
+            submit.assert_not_called()
+        self.assertEqual(dialog.selection_count.get(), "已选 0 / 共 3")
+        self.assertEqual(dialog.pairing.get("1.0", "end-1c"), "")
+        self.assertIsNone(dialog._pairing_snapshot)
+        self.assertTrue(dialog.copy_button.instate(["disabled"]))
+        self.assertEqual(dialog.devices, devices)
+        self.assertEqual(dialog.devices[0]["task_ids"], ["task-1"])
+        self.assertFalse(self.fake.starts)
+
+    def test_new_tasks_remain_unselected_and_selection_count_does_not_flicker(self):
+        with mock.patch("relay.phone.local_addresses", return_value=["127.0.0.1"]):
+            self.app.phone_button.invoke()
+        dialog = self.app.phone_dialog
+        self.wait_for(lambda: not self.app.busy)
+        dialog.select_all_button.invoke()
+        self.app.tasks["task-two"] = dict(self.app.tasks["task-1"], id="task-two", title="新的合成任务")
+        dialog.controls()
+        self.assertEqual(dialog.selection_count.get(), "已选 1 / 共 2")
+        self.assertEqual(dialog._choice_snapshot()[0], ("task-1",))
+        self.app.tasks = dict(reversed(list(self.app.tasks.items())))
+        dialog.controls()
+        self.assertEqual(dialog.task_list.curselection(), (1,))
+        self.assertEqual(dialog._choice_snapshot()[0], ("task-1",))
+        with mock.patch.object(dialog.selection_count, "set", wraps=dialog.selection_count.set) as write:
+            for _ in range(25):
+                dialog.controls()
+            write.assert_not_called()
+
+    def test_task_selection_shortcuts_obey_busy_recovery_and_closing_gates(self):
+        with mock.patch("relay.phone.local_addresses", return_value=["127.0.0.1"]):
+            self.app.phone_button.invoke()
+        dialog = self.app.phone_dialog
+        self.wait_for(lambda: not self.app.busy)
+        for field, blocked in (("busy", True), ("ready", False), ("closing", True), ("recovery_info", {})):
+            previous = getattr(self.app, field)
+            try:
+                setattr(self.app, field, blocked)
+                dialog.controls()
+                self.assertTrue(dialog.select_all_button.instate(["disabled"]))
+                self.assertTrue(dialog.clear_selection_button.instate(["disabled"]))
+                dialog._select_tasks(True)
+                self.assertEqual(dialog.task_list.curselection(), ())
+            finally:
+                setattr(self.app, field, previous)
+        self.app.tasks.clear()
+        dialog.controls()
+        self.assertEqual(dialog.selection_count.get(), "已选 0 / 共 0")
+        self.assertTrue(dialog.select_all_button.instate(["disabled"]))
+        self.assertTrue(dialog.clear_selection_button.instate(["disabled"]))
+
     def test_unchanged_controls_do_not_repack_or_reconfigure(self):
         with mock.patch("relay.phone.local_addresses", return_value=["127.0.0.1"]):
             self.app.phone_button.invoke()

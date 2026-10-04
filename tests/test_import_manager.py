@@ -16,6 +16,35 @@ SOURCE = "019a0000-0000-7000-8000-000000000001"
 
 
 class ImportManagerTests(unittest.TestCase):
+    def test_default_import_is_direct_with_optional_auto_handoff(self):
+        preview = self.preview()
+        self.read_source()
+        task = self.manager.import_thread(SOURCE, preview["fingerprint"], title="Original", goal="",
+                                         source_stopped=True, auto_handoff=True)
+        self.assertEqual(task["connection_mode"], "direct")
+        self.assertEqual(task["thread_id"], SOURCE)
+        self.assertTrue(task["auto_handoff"])
+        self.assertFalse(self.client.calls_for("turn/start"))
+
+    def test_external_app_server_source_is_still_not_importable(self):
+        self.source["source"] = "appServer"
+        with self.assertRaises(ValueError):
+            self.preview()
+
+    def test_direct_resume_rechecks_source_before_raw_send(self):
+        preview = self.preview()
+        self.read_source()
+        task = self.manager.import_thread(SOURCE, preview["fingerprint"], title="Original", goal="",
+                                         source_stopped=True)
+        self.read_source()
+        self.source["turns"][0]["items"][1]["text"] = "Changed during resume"
+        self.read_source()
+        self.client.responses["thread/resume"].append({"thread": {"id": SOURCE}, "cwd": str(self.project),
+            "sandbox": {"type": "readOnly"}, "approvalPolicy": "on-request", "model": "test-model"})
+        with self.assertRaises(ValueError):
+            self.manager.start(task["id"], "Do not send after source changes")
+        self.assertFalse(self.client.calls_for("turn/start"))
+
     def test_direct_connection_preserves_thread_and_sends_only_verbatim_input(self):
         preview = self.preview()
         self.read_source()
@@ -99,7 +128,7 @@ class ImportManagerTests(unittest.TestCase):
         self.read_source()
         return self.manager.import_thread(SOURCE, preview["fingerprint"], title="Continue selected chat",
                                         goal="Verify the candidate against current files", mode=mode,
-                                        source_stopped=True, **kwargs)
+                                        source_stopped=True, **kwargs, direct=False)
 
     def test_list_preview_and_import_are_read_only_and_bind_evidence_atomically(self):
         self.client.responses["thread/list"].append({"data": [self.source], "nextCursor": "next-page"})
@@ -142,7 +171,7 @@ class ImportManagerTests(unittest.TestCase):
         self.read_source()
         with self.assertRaises(ValueError):
             self.manager.import_thread(SOURCE, preview["fingerprint"], title="Example", goal="Inspect",
-                                       source_stopped=True)
+                                       source_stopped=True, direct=False)
         self.assertEqual(self.manager.list_tasks(), [])
         task = self.import_task()
         self.source["turns"][0]["items"][1]["text"] = "Changed after import"
@@ -164,10 +193,10 @@ class ImportManagerTests(unittest.TestCase):
         self.assertEqual(preview["existing_task"]["id"], task["id"])
         with self.assertRaises(ValueError):
             self.manager.import_thread(SOURCE, preview["fingerprint"], title="Another", goal="Duplicate",
-                                       source_stopped=True)
+                                       source_stopped=True, direct=False)
         self.read_source()
         updated = self.manager.import_thread(SOURCE, preview["fingerprint"], title="Updated", goal="Revised goal",
-                                             source_stopped=True, existing_task_id=task["id"])
+                                             source_stopped=True, existing_task_id=task["id"], direct=False)
         self.assertEqual(updated["id"], task["id"])
         self.assertEqual(updated["requirements"], ["Revised goal"])
         self.assertEqual(len(self.manager.list_tasks()), 1)
@@ -176,7 +205,7 @@ class ImportManagerTests(unittest.TestCase):
         preview = self.preview()
         with self.assertRaises(ValueError):
             self.manager.import_thread(SOURCE, preview["fingerprint"], title="Again", goal="Reset active task",
-                                       source_stopped=True, existing_task_id=task["id"])
+                                       source_stopped=True, existing_task_id=task["id"], direct=False)
 
     def test_missing_confirmation_forged_preview_and_bad_settings_have_no_partial_task(self):
         preview = self.preview()
@@ -188,7 +217,7 @@ class ImportManagerTests(unittest.TestCase):
                 values.update(changes)
                 self.read_source()
                 with self.assertRaises(ValueError):
-                    self.manager.import_thread(**values)
+                    self.manager.import_thread(**values, direct=False)
                 self.assertEqual(self.manager.list_tasks(), [])
 
     def test_wrong_identity_subagent_and_unsettled_source_cannot_import(self):
@@ -203,7 +232,7 @@ class ImportManagerTests(unittest.TestCase):
         self.assertFalse(preview["can_import"])
         self.read_source()
         with self.assertRaises(ValueError):
-            self.manager.import_thread(SOURCE, preview["fingerprint"], title="Active", goal="Inspect", source_stopped=True)
+            self.manager.import_thread(SOURCE, preview["fingerprint"], title="Active", goal="Inspect", source_stopped=True, direct=False)
         self.assertFalse(self.client.calls_for("thread/start"))
 
     def test_backup_preserves_evidence_but_inspection_cannot_discover_or_import(self):
@@ -217,7 +246,7 @@ class ImportManagerTests(unittest.TestCase):
         self.addCleanup(with_manager.close)
         self.assertEqual(with_manager.get_task(task["id"])["source_snapshot"], task["source_snapshot"])
         for action in (lambda: with_manager.list_import_threads(), lambda: with_manager.preview_import(SOURCE),
-                       lambda: with_manager.import_thread(SOURCE, "unused", title="Read only", goal="No write")):
+                       lambda: with_manager.import_thread(SOURCE, "unused", title="Read only", goal="No write", direct=False)):
             with self.assertRaises(ValueError):
                 action()
         self.assertEqual(fake.calls, [])
@@ -228,7 +257,7 @@ class ImportManagerTests(unittest.TestCase):
         self.manager.db.commit()
         self.read_source()
         with self.assertRaises(sqlite3.DatabaseError):
-            self.manager.import_thread(SOURCE, preview["fingerprint"], title="Example", goal="Inspect", source_stopped=True)
+            self.manager.import_thread(SOURCE, preview["fingerprint"], title="Example", goal="Inspect", source_stopped=True, direct=False)
         self.assertEqual(self.manager.list_tasks(), [])
 
     def test_import_provenance_survives_preparation_and_formal_handoff(self):

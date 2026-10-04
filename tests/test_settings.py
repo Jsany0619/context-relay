@@ -19,7 +19,7 @@ class SettingsTests(unittest.TestCase):
         self.client = FakeClient()
         self.manager = Manager(self.root / "state", self.client)
         self.addCleanup(lambda: self.manager.close())
-        self.task = self.manager.create_task("Example", self.project, "Inspect only", max_tokens=100, max_minutes=2)
+        self.task = self.manager.create_task("Example", self.project, "Inspect only", max_tokens=100, max_minutes=2, direct=False)
 
     def update(self, **values):
         options = dict(title="Renamed", max_tokens=200, max_minutes=3.5, auto_handoff=True)
@@ -92,7 +92,7 @@ class SettingsTests(unittest.TestCase):
                                max_minutes=2, auto_handoff=False)
                 options.update(override)
                 with self.assertRaises(ValueError):
-                    self.manager.create_task(**options)
+                    self.manager.create_task(**options, direct=False)
                 self.assertEqual(len(self.manager.list_tasks()), 1)
 
     def test_invalid_model_scope_cannot_reenable_automatic_handoff(self):

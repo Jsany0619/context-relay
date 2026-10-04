@@ -49,7 +49,9 @@ class ImportManager(base_ui.FakeManager):
         if self.fail_method == "import_thread":
             raise ValueError("来源已改变，请重新预览")
         task = dict(self.tasks[0], **{key: kwargs[key] for key in ("title", "goal", "mode", "max_tokens", "max_minutes", "auto_handoff")})
-        task.update(id=kwargs.get("existing_task_id") or "imported-task", state="queued", thread_id=None)
+        task.update(id=kwargs.get("existing_task_id") or "imported-task", state="queued",
+                    thread_id=thread_id if kwargs.get("direct") else None,
+                    connection_mode="direct" if kwargs.get("direct") else "managed")
         task["brief_required"] = not bool(kwargs["goal"].strip())
         task["source_snapshot"] = {"thread_id": thread_id}
         self.tasks = [entry for entry in self.tasks if entry["id"] != task["id"]] + [task]
@@ -57,7 +59,7 @@ class ImportManager(base_ui.FakeManager):
 
 
 class ImportUiTests(unittest.TestCase):
-    def test_direct_connection_is_explicit_and_keeps_permission_selection(self):
+    def test_default_import_is_direct_and_keeps_permission_and_auto_handoff(self):
         dialog = self.open_import()
         self.preview(dialog)
         self.assertTrue(dialog.connect_button.instate(["disabled"]))
@@ -65,12 +67,21 @@ class ImportUiTests(unittest.TestCase):
         dialog.mode.set("workspace-write")
         dialog.auto.set(True)
         dialog.controls()
-        dialog.connect_button.invoke()
+        dialog.save_button.invoke()
         self.wait_for(lambda: not self.app.busy)
         args = self.fake.import_calls[-1]
         self.assertTrue(args[-1]["direct"])
-        self.assertFalse(args[-1]["auto_handoff"])
+        self.assertTrue(args[-1]["auto_handoff"])
         self.assertEqual(args[-1]["mode"], "workspace-write")
+
+    def test_advanced_legacy_import_explicitly_disables_direct_mode(self):
+        dialog = self.open_import()
+        self.preview(dialog)
+        dialog.source_stopped.set(True)
+        dialog.controls()
+        dialog.connect_button.invoke()
+        self.wait_for(lambda: not self.app.busy)
+        self.assertIs(self.fake.import_calls[-1][2]["direct"], False)
 
     wait_for = base_ui.TkSmokeTests.wait_for
     tearDown = base_ui.TkSmokeTests.tearDown
@@ -131,7 +142,7 @@ class ImportUiTests(unittest.TestCase):
         self.assertEqual(dialog.tree.get_children(), ("source-b",))
         self.assertTrue(all(thread != self.main_thread for method, thread in self.fake.calls if method == "list_import_threads"))
 
-    def test_preview_is_explicit_and_import_requires_fresh_goal_confirmation(self):
+    def test_preview_is_explicit_and_import_requires_fresh_source_confirmation(self):
         base_ui.quiet_window(self.root, mapped=True)
         dialog = self.open_import()
         base_ui.quiet_window(dialog, mapped=True)
@@ -165,10 +176,77 @@ class ImportUiTests(unittest.TestCase):
         self.assertEqual(values["goal"], "本轮明确目标")
         self.assertEqual((values["mode"], values["max_tokens"], values["max_minutes"]), ("read-only", 1200, 2.5))
         self.assertTrue(values["source_stopped"])
+        self.assertTrue(values["direct"])
         self.assertFalse(values["auto_handoff"])
         self.assertEqual(self.app.selected_id, "imported-task")
         self.assertIn("历史摘录来源：source-a", self.app.details.get())
         self.assertFalse(self.fake.starts)
+
+    def test_wheel_routes_nested_text_boundaries_and_does_not_change_permission(self):
+        base_ui.quiet_window(self.root, mapped=True)
+        dialog = self.open_import()
+        base_ui.quiet_window(dialog, mapped=True)
+        dialog.geometry("900x820")
+        dialog.advanced_open.set(True)
+        dialog.toggle_advanced()
+        dialog.goal_text.configure(height=30)
+        dialog.preview_text.configure(state="normal")
+        dialog.preview_text.insert("1.0", ("预览内容\n" * 80))
+        dialog.preview_text.configure(state="disabled")
+        self.root.update()
+
+        dialog.preview_text.yview_moveto(0)
+        dialog.canvas.yview_moveto(0)
+        outer_before = dialog.canvas.yview()
+        preview_before = dialog.preview_text.yview()
+        dialog.preview_text.event_generate("<MouseWheel>", delta=-120)
+        self.root.update()
+        self.assertGreater(dialog.preview_text.yview()[0], preview_before[0])
+        self.assertEqual(dialog.canvas.yview(), outer_before)
+
+        dialog.preview_text.see("end")
+        self.root.update()
+        self.assertAlmostEqual(dialog.preview_text.yview()[1], 1.0, places=6,
+                               msg=dialog.preview_text.yview())
+        dialog.canvas.yview_moveto(0)
+        outer_before = dialog.canvas.yview()
+        dialog.preview_text.event_generate("<MouseWheel>", delta=-120)
+        self.root.update()
+        self.assertGreater(dialog.canvas.yview()[0], outer_before[0],
+                           (dialog.canvas.yview(), dialog.canvas.bbox("all"), dialog.canvas.winfo_height()))
+
+        dialog.canvas.yview_moveto(0)
+        before = dialog.canvas.yview()
+        dialog.goal_text.event_generate("<MouseWheel>", delta=-120)
+        self.root.update()
+        self.assertGreater(dialog.canvas.yview()[0], before[0])
+
+        dialog.canvas.yview_moveto(0)
+        dialog.mode.set("read-only")
+        dialog.mode_box.event_generate("<MouseWheel>", delta=-120)
+        self.root.update()
+        self.assertEqual(dialog.mode.get(), "read-only")
+        self.assertGreater(dialog.canvas.yview()[0], 0)
+
+        for widget in (dialog.advanced_frame, dialog.canvas_scrollbar):
+            with self.subTest(widget=widget.winfo_class()):
+                dialog.canvas.yview_moveto(0)
+                widget.event_generate("<MouseWheel>", delta=-120)
+                self.root.update()
+                self.assertGreater(dialog.canvas.yview()[0], 0)
+
+        outside = tk.Label(self.root, text="其他窗口区域")
+        outside.pack()
+        dialog.canvas.yview_moveto(0)
+        outside.event_generate("<MouseWheel>", delta=-120)
+        self.root.update()
+        self.assertEqual(dialog.canvas.yview()[0], 0)
+
+        dialog.canvas.yview_moveto(0)
+        dialog.goal_text.event_generate("<MouseWheel>", delta=-120, state=1)
+        dialog.goal_text.event_generate("<MouseWheel>", delta=0)
+        self.root.update()
+        self.assertEqual(dialog.canvas.yview()[0], 0)
 
     def test_preview_selection_clears_authorization_goal_and_late_result(self):
         dialog = self.open_import()
@@ -240,7 +318,7 @@ class ImportUiTests(unittest.TestCase):
         dialog = self.open_import()
         self.preview(dialog)
         self.assertEqual(dialog.goal_text.get("1.0", "end-1c"), "本地待办")
-        self.assertIn("更新待启动任务", dialog.save_button.cget("text"))
+        self.assertIn("连接原聊天", dialog.save_button.cget("text"))
         self.assertFalse(dialog.source_stopped.get())
         dialog.source_stopped.set(True)
         dialog.controls()
@@ -290,7 +368,7 @@ class ImportUiTests(unittest.TestCase):
         self.assertFalse(self.app.submit("preview_import", "source-a"))
 
     def test_import_dialog_footer_visible_at_supported_scaling(self):
-        for dpi in (96, 144):
+        for dpi in (96, 120, 144):
             with self.subTest(dpi=dpi):
                 self.app.request_close()
                 self.wait_for(lambda: self.app.closed)
@@ -309,8 +387,15 @@ class ImportUiTests(unittest.TestCase):
                 self.wait_for(lambda: self.app.ready and self.app.selected_id == "task-1")
                 dialog = self.open_import()
                 base_ui.quiet_window(dialog, mapped=True)
+                dialog.geometry("900x620")
+                dialog.advanced_open.set(True)
+                dialog.toggle_advanced()
                 self.root.update()
-                for widget in (dialog.load_button, dialog.preview_button, dialog.save_button, dialog.close_button):
+                dialog.canvas.yview_moveto(1)
+                self.root.update()
+                for widget in (dialog.load_button, dialog.preview_button, dialog.mode_box,
+                               dialog.source_confirm, dialog.connect_button, dialog.save_button,
+                               dialog.close_button):
                     self.assertTrue(widget.winfo_ismapped())
                     self.assertGreaterEqual(widget.winfo_rooty(), dialog.winfo_rooty())
                     self.assertLessEqual(widget.winfo_rooty() + widget.winfo_height(), dialog.winfo_rooty() + dialog.winfo_height())

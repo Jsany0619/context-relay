@@ -243,7 +243,7 @@ final class VerifiedScreenshot {
                 ContentValues values = new ContentValues();
                 values.put(MediaStore.Images.Media.DISPLAY_NAME, filename());
                 values.put(MediaStore.Images.Media.MIME_TYPE, "image/png");
-                values.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/ContextRelay");
+                values.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/Screenshots");
                 values.put(MediaStore.Images.Media.IS_PENDING, 1);
                 output = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
             } else output = document;
