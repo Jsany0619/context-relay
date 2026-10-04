@@ -77,6 +77,19 @@ public final class Protocol {
         return value;
     }
 
+    public static String taskListPath() { return "/v1/tasks?summary=1"; }
+
+    /** Summary rows are navigation only; commands require a versioned detail response. */
+    public static boolean fullTask(boolean summaryOnly, String etag) {
+        return !summaryOnly && etag != null && etag.matches("[a-fA-F0-9]{64}");
+    }
+
+    /** A sealed local snapshot may be shown, but never satisfies fullTask for actions. */
+    public static boolean conversationSnapshot(boolean summaryOnly, boolean cachedConversation,
+                                               boolean hasMessages, boolean hasLastMessage) {
+        return !summaryOnly && (cachedConversation || hasMessages || hasLastMessage);
+    }
+
     public static String conversationPath(String taskId, String cursor) {
         if (taskId == null || !taskId.matches("[A-Za-z0-9_-]{1,128}")) throw new IllegalArgumentException("任务编号无效。");
         String path = "/v1/tasks/" + taskId + "/conversation";
@@ -104,6 +117,7 @@ public final class Protocol {
         String route = query < 0 ? path : path.substring(0, query);
         if (route.contains("..")) return false;
         if (query < 0) return true;
+        if ("GET".equals(method) && "/v1/tasks".equals(route)) return "/v1/tasks?summary=1".equals(path);
         if (!"GET".equals(method) || !route.matches("/v1/tasks/[A-Za-z0-9_-]{1,128}/conversation")) return false;
         String parameters = path.substring(query + 1);
         if (!parameters.startsWith("cursor=") || parameters.length() <= 7 || parameters.length() > 2167) return false;

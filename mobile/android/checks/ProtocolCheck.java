@@ -54,6 +54,22 @@ public final class ProtocolCheck {
         check(exact.equals(Protocol.messageInput(exact)));
         for (String blank : new String[] {"", " \t\r\n", "\u3000\u00a0"}) rejects(() -> Protocol.messageInput(blank));
         rejects(() -> Protocol.messageInput(null));
+        check("/v1/tasks?summary=1".equals(Protocol.taskListPath()));
+        check(Protocol.validApiPath("GET", Protocol.taskListPath()));
+        for (String bad : new String[] {"/v1/tasks?summary=0", "/v1/tasks?summary=1&extra=1",
+                "/v1/tasks?summary=1#fragment", "/v1/tasks?summary=1?again=1"})
+            check(!Protocol.validApiPath("GET", bad));
+        check(!Protocol.validApiPath("POST", Protocol.taskListPath()));
+        String etag = new String(new char[64]).replace('\0', 'a');
+        check(Protocol.fullTask(false, etag));
+        check(!Protocol.fullTask(true, etag));
+        check(!Protocol.fullTask(false, ""));
+        check(!Protocol.fullTask(false, "not-an-etag"));
+        check(Protocol.conversationSnapshot(false, true, false, false));
+        check(Protocol.conversationSnapshot(false, false, true, false));
+        check(Protocol.conversationSnapshot(false, false, false, true));
+        check(!Protocol.conversationSnapshot(true, true, true, true));
+        check(!Protocol.conversationSnapshot(false, false, false, false));
         check("/v1/tasks/task_1/conversation".equals(Protocol.conversationPath("task_1", null)));
         check("/v1/tasks/task_1/conversation?cursor=a%2Bb%2F%3D%26%3F%23+%E4%B8%AD".equals(Protocol.conversationPath("task_1", "a+b/=&?# 中")));
         rejects(() -> Protocol.conversationPath("../other", null));

@@ -64,6 +64,39 @@ class FakeManager:
 
 
 class GatewayTests(unittest.TestCase):
+    def test_task_list_previews_stay_bounded_and_full_details_remain_exact(self):
+        messages = [{"id": f"m{i}", "role": "assistant", "text": "x" * 3000,
+                     "created_at": "synthetic", "status": "completed", "purpose": "work"}
+                    for i in range(16)]
+        originals = [task(id=f"{i:032x}", last_message="y" * 50000, messages=messages)
+                     for i in range(1, 26)]
+        self.core.publish_tasks(originals, connection_id="large-history")
+        fingerprint, context = self.start_gateway()
+        device, _, _ = self.pair(context, fingerprint,
+                                  task_ids=tuple(item["id"] for item in originals), scope="read_only")
+        status, _, result = self.request(context, "GET", "/v1/tasks?summary=1", token=device["token"])
+        self.assertEqual(status, 200)
+        self.assertEqual(len(result["tasks"]), 25)
+        self.assertLess(len(json.dumps(result).encode()), 32 * 1024)
+        for original, preview in zip(originals, result["tasks"]):
+            self.assertEqual(preview["id"], original["id"])
+            self.assertTrue(preview["summary_only"])
+            self.assertNotIn("last_message", preview)
+            self.assertNotIn("messages", preview)
+            self.assertNotIn("etag", preview)
+            self.assertLess(len(preview["message_preview"]), 300)
+            detail = self.core.get_task_snapshot(device["device_id"], original["id"])
+            self.assertEqual(detail["last_message"], original["last_message"])
+            self.assertTrue(detail["messages"])
+            self.assertNotIn("summary_only", detail)
+        single, _, _ = self.pair(context, fingerprint, task_ids=(originals[0]["id"],), scope="read_only")
+        status, _, result = self.request(context, "GET", "/v1/tasks?summary=1", token=single["token"])
+        self.assertEqual(status, 200)
+        self.assertEqual([item["id"] for item in result["tasks"]], [originals[0]["id"]])
+        for path in ("/v1/tasks?summary=0", "/v1/tasks?summary=1&summary=1",
+                     "/v1/status?summary=1", "/v1/tasks?summary=1&extra=x"):
+            self.assertEqual(self.request(context, "GET", path, token=single["token"])[0], 404)
+
     def test_original_conversation_read_is_scoped_and_never_enqueues_execution(self):
         calls = []
         original = "  中文原话\r\n末尾保留  "

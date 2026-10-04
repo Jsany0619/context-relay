@@ -560,8 +560,21 @@ class GatewayCore:
     def _device_cursor(tasks) -> int:
         return int(_hash(tasks)[:15], 16)
 
-    def list_task_snapshots(self, device_id) -> dict[str, Any]:
+    def list_task_snapshots(self, device_id, *, summary=False) -> dict[str, Any]:
         with self._lock:
+            if summary:
+                access = self._device_access(device_id)
+                tasks = []
+                for task_id in access["task_ids"]:
+                    item = self._tasks.get(task_id)
+                    if item is None:
+                        continue
+                    text = item.get("last_message") or ""
+                    tasks.append({"id": task_id, "title": (item.get("title") or "")[:200],
+                                  "state": item.get("state"), "archived": item.get("archived") is True,
+                                  "message_preview": text[:240] + ("…" if len(text) > 240 else ""),
+                                  "summary_only": True, "remote_access": access["scope"]})
+                return {"tasks": tasks, "cursor": self._device_cursor(tasks)}
             _, tasks = self._device_tasks(device_id)
             return {"tasks": _json_copy(tasks, maximum=2 * 1024 * 1024),
                     "cursor": self._device_cursor(tasks)}
@@ -948,7 +961,8 @@ class _Handler(BaseHTTPRequestHandler):
             device = self._device()
             parsed = urlsplit(self.path)
             conversation = parsed.path.startswith("/v1/tasks/") and parsed.path.endswith("/conversation")
-            if parsed.fragment or parsed.query and not conversation:
+            summary = parsed.path == "/v1/tasks" and parsed.query == "summary=1"
+            if parsed.fragment or parsed.query and not (conversation or summary):
                 raise GatewayError("not_found", "找不到接口。", 404)
             if conversation:
                 query = parse_qs(parsed.query, keep_blank_values=True)
@@ -959,7 +973,7 @@ class _Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/v1/status":
                 self._send(200, self.core.status_snapshot(device))
             elif parsed.path == "/v1/tasks":
-                self._send(200, self.core.list_task_snapshots(device))
+                self._send(200, self.core.list_task_snapshots(device, summary=summary))
             elif parsed.path.startswith("/v1/tasks/"):
                 self._send(200, self.core.get_task_snapshot(device, parsed.path[len("/v1/tasks/"):]))
             elif parsed.path.startswith("/v1/commands/"):
