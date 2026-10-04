@@ -217,6 +217,20 @@ class TkSmokeTests(unittest.TestCase):
         self.app.worker.events.put(("ready", info))
         self.wait_for(lambda: getattr(self.app, "recovery_info", None) == info)
 
+    def test_readonly_alert_stays_below_header_and_does_not_crop_primary_action(self):
+        self.root.deiconify()
+        self.root.update()
+        alert, header = self.app.task_alert_label, self.app.task_header
+        self.assertIs(alert.master, self.app.chat_panel)
+        self.assertTrue(alert.winfo_ismapped())
+        self.assertGreaterEqual(alert.winfo_rooty(), header.winfo_rooty() + header.winfo_height())
+        self.assertGreaterEqual(alert.winfo_width(), self.app.chat_panel.winfo_width() - 50)
+        for widget in (self.app.message_text, self.app.buttons["start"]):
+            self.assertTrue(widget.winfo_ismapped())
+            self.assertLessEqual(widget.winfo_rooty() + widget.winfo_height(),
+                                 self.app.chat_panel.winfo_rooty() + self.app.chat_panel.winfo_height())
+        self.assertEqual(self.app.pending_frame.winfo_manager(), "")
+
     def test_global_backup_does_not_need_selected_task_and_reports_counts(self):
         self.app.search.set("no match")
         self.assertIsNone(self.app.selected_id)

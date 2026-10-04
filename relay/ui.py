@@ -6,9 +6,88 @@ from pathlib import Path
 import queue
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 from .budget import budget_status, validate_limits
+
+
+BG = "#f7f8fa"
+SURFACE = "#ffffff"
+INK = "#17212b"
+MUTED = "#606d7d"
+ACCENT = "#2457d6"
+BORDER = "#dce2e9"
+WARNING_BG = "#fff6e8"
+WARNING = "#8a4b08"
+
+
+def apply_theme(root):
+    root.configure(background=BG)
+    for name, size, weight in (("TkDefaultFont", 10, "normal"), ("TkTextFont", 10, "normal"),
+                               ("TkMenuFont", 10, "normal"), ("TkHeadingFont", 11, "bold")):
+        try:
+            tkfont.nametofont(name, root=root).configure(family="Segoe UI", size=size, weight=weight)
+        except tk.TclError:
+            pass
+    root.option_add("*Text.background", SURFACE)
+    root.option_add("*Text.foreground", INK)
+    root.option_add("*Text.insertBackground", INK)
+    root.option_add("*Text.selectBackground", ACCENT)
+    root.option_add("*Listbox.background", SURFACE)
+    root.option_add("*Listbox.foreground", INK)
+    root.option_add("*Listbox.selectBackground", ACCENT)
+    root.option_add("*Listbox.selectForeground", SURFACE)
+    root.option_add("*Menu.background", SURFACE)
+    root.option_add("*Menu.foreground", INK)
+    root.option_add("*Menu.activeBackground", "#e8eefc")
+    style = ttk.Style(root)
+    if "clam" in style.theme_names():
+        style.theme_use("clam")
+    style.configure(".", font=("Segoe UI", 10), foreground=INK)
+    style.configure("TFrame", background=BG)
+    style.configure("Sidebar.TFrame", background=BG)
+    style.configure("Surface.TFrame", background=SURFACE)
+    style.configure("TLabel", background=BG, foreground=INK)
+    style.configure("Surface.TLabel", background=SURFACE, foreground=INK)
+    style.configure("Muted.TLabel", background=BG, foreground=MUTED)
+    style.configure("Surface.Muted.TLabel", background=SURFACE, foreground=MUTED)
+    style.configure("Title.TLabel", background=BG, foreground=INK, font=("Segoe UI", 18, "bold"))
+    style.configure("Surface.Title.TLabel", background=SURFACE, foreground=INK, font=("Segoe UI", 15, "bold"))
+    style.configure("Section.TLabel", background=SURFACE, foreground=INK, font=("Segoe UI", 11, "bold"))
+    style.configure("Alert.TLabel", background=WARNING_BG, foreground=WARNING, padding=(10, 8))
+    style.configure("TButton", background="#edf0f4", foreground=INK, bordercolor=BORDER,
+                    lightcolor="#edf0f4", darkcolor="#edf0f4", padding=(12, 7), relief="flat")
+    style.map("TButton", background=[("active", "#e3e7ed"), ("pressed", "#d8dee6")],
+              foreground=[("disabled", "#98a3af")])
+    style.configure("Primary.TButton", background=ACCENT, foreground=SURFACE, bordercolor=ACCENT,
+                    lightcolor=ACCENT, darkcolor=ACCENT, padding=(14, 8), relief="flat")
+    style.map("Primary.TButton", background=[("active", "#1f4bbb"), ("pressed", "#193f9e"),
+                                             ("disabled", "#b8c5e3")],
+              foreground=[("disabled", "#f5f7fb")])
+    style.configure("TMenubutton", background="#edf0f4", foreground=INK, bordercolor=BORDER, padding=(12, 7))
+    style.configure("TEntry", fieldbackground=SURFACE, foreground=INK, bordercolor=BORDER, padding=6)
+    style.configure("TCombobox", fieldbackground=SURFACE, foreground=INK, bordercolor=BORDER, padding=5)
+    style.map("TCombobox", fieldbackground=[("readonly", SURFACE)], selectbackground=[("readonly", SURFACE)],
+              selectforeground=[("readonly", INK)])
+    style.configure("Task.Treeview", background=BG, fieldbackground=BG, foreground=INK,
+                    borderwidth=0, relief="flat", rowheight=34, bordercolor=BG,
+                    lightcolor=BG, darkcolor=BG)
+    style.configure("Task.Treeview.Heading", background=BG, foreground=MUTED, relief="flat", padding=(6, 7))
+    style.map("Task.Treeview", background=[("selected", "#e4ebfb")], foreground=[("selected", INK)])
+    style.configure("Vertical.TScrollbar", background="#cfd7e1", troughcolor="#f1f3f6",
+                    bordercolor="#f1f3f6", lightcolor="#cfd7e1", darkcolor="#cfd7e1",
+                    arrowcolor=MUTED, relief="flat", borderwidth=0)
+    style.map("Vertical.TScrollbar", background=[("active", "#bbc6d2")])
+    style.configure("TNotebook", background=BG, borderwidth=0)
+    style.configure("TNotebook.Tab", background="#e9edf2", foreground=MUTED, padding=(14, 8))
+    style.map("TNotebook.Tab", background=[("selected", SURFACE)], foreground=[("selected", INK)])
+    style.configure("Surface.TLabelframe", background=SURFACE, bordercolor=BORDER, relief="solid")
+    style.configure("Surface.TLabelframe.Label", background=SURFACE, foreground=INK,
+                    font=("Segoe UI", 10, "bold"))
+    style.configure("Attention.TLabelframe", background=WARNING_BG, bordercolor="#efd7ae", relief="solid")
+    style.configure("Attention.TLabelframe.Label", background=WARNING_BG, foreground=WARNING,
+                    font=("Segoe UI", 10, "bold"))
+    return style
 
 
 STATES = {
@@ -165,8 +244,11 @@ def set_text(widget, value, follow=False):
 
 
 def text_area(parent, height):
-    frame = ttk.Frame(parent)
-    widget = tk.Text(frame, height=height, wrap="word", state="disabled", relief="flat")
+    frame = ttk.Frame(parent, style="Surface.TFrame")
+    widget = tk.Text(frame, height=height, wrap="word", state="disabled", relief="flat",
+                     background=SURFACE, foreground=INK, insertbackground=INK,
+                     selectbackground=ACCENT, borderwidth=0, highlightthickness=0,
+                     padx=10, pady=8, font=("Segoe UI", 10))
     scrollbar = ttk.Scrollbar(frame, orient="vertical", command=widget.yview)
     widget.configure(yscrollcommand=scrollbar.set)
     widget.pack(side="left", fill="both", expand=True)
@@ -860,6 +942,7 @@ class RelayApp:
         self.phone_dialog = None
         self.phone_request = None
         self.diagnostics_window = None
+        self.style = apply_theme(self.root)
         self.root.title("Context Relay · 本机任务管理器")
         width = min(1180, max(1, self.root.winfo_screenwidth() - 80))
         height = min(850, max(1, self.root.winfo_screenheight() - 120))
@@ -885,9 +968,13 @@ class RelayApp:
 
     def _build(self):
         compact = self.root.winfo_screenheight() < 900
-        header = ttk.Frame(self.root)
-        header.pack(fill="x", padx=16, pady=(12, 0))
-        ttk.Label(header, text="Context Relay", font=("Segoe UI", 17, "bold")).pack(side="left")
+        header = ttk.Frame(self.root, style="Sidebar.TFrame")
+        header.pack(fill="x", padx=20, pady=(16, 10))
+        brand = ttk.Frame(header, style="Sidebar.TFrame")
+        brand.pack(side="left")
+        ttk.Label(brand, text="Context Relay", style="Title.TLabel").pack(side="left")
+        ttk.Label(brand, text="本机任务 · 导入不会修改原聊天", style="Muted.TLabel").pack(
+            side="left", padx=(12, 0))
         self.import_button = ttk.Button(header, text="导入已有 Codex 聊天", command=self._open_import)
         self.import_button.pack(side="right")
         self.more_button = ttk.Menubutton(header, text="更多")
@@ -903,17 +990,18 @@ class RelayApp:
             text="本地明文记录，含导入摘录；不含项目文件、登录信息或完整原生聊天。")
         self.diagnostics_button = ttk.Button(self._action_proxies, text="诊断信息", command=self._open_diagnostics)
         self.assessment_button = ttk.Button(self._action_proxies, text="简报 / 审核", command=self._open_assessment)
-        ttk.Label(self.root, text="仅管理这里创建或主动导入的任务；导入不会修改原聊天。", foreground="#555555").pack(anchor="w", padx=16, pady=(0, 8))
-        self.recovery_banner = ttk.Label(self.root, wraplength=1140, justify="left", foreground="#8a3b00")
+        self.recovery_banner = ttk.Label(self.root, wraplength=1140, justify="left", style="Alert.TLabel")
         panes = ttk.Panedwindow(self.root, orient="horizontal")
         self.panes = panes
-        panes.pack(fill="both", expand=True, padx=12)
-        left, right = ttk.Frame(panes, padding=4), ttk.Frame(panes, padding=4)
+        panes.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+        left = ttk.Frame(panes, padding=(4, 10, 14, 10), style="Sidebar.TFrame")
+        right = ttk.Frame(panes, padding=(18, 14), style="Surface.TFrame")
+        self.sidebar, self.chat_panel = left, right
         panes.add(left, weight=1)
         panes.add(right, weight=4)
         self.new_button = ttk.Button(left, text="新建任务", command=lambda: NewTaskDialog(self.root, self.submit))
         self.new_button.pack(fill="x", pady=(0, 8))
-        ttk.Label(left, text="搜索名称、目标或目录").pack(anchor="w")
+        ttk.Label(left, text="搜索名称、目标或目录", style="Muted.TLabel").pack(anchor="w")
         self.search_entry = ttk.Entry(left, textvariable=self.search)
         self.search_entry.pack(fill="x", pady=(2, 6))
         self.filter_choice = ttk.Combobox(left, textvariable=self.state_filter, values=FILTERS, state="readonly")
@@ -926,9 +1014,10 @@ class RelayApp:
             self.buttons[method] = button
         self.buttons["update_settings"] = ttk.Button(self._action_proxies, text="任务设置", command=lambda: self._action("update_settings"))
         self.buttons["reopen_task"] = ttk.Button(self._action_proxies, text="重新打开", command=lambda: self._action("reopen_task"))
-        task_list = ttk.Frame(left)
+        task_list = ttk.Frame(left, style="Sidebar.TFrame")
         task_list.pack(fill="both", expand=True)
-        self.task_tree = ttk.Treeview(task_list, columns=("state",), show="tree headings", selectmode="browse")
+        self.task_tree = ttk.Treeview(task_list, columns=("state",), show="tree headings",
+                                      selectmode="browse", style="Task.Treeview")
         self.task_tree.heading("#0", text="任务")
         self.task_tree.heading("state", text="状态")
         self.task_tree.column("#0", width=160, minwidth=100)
@@ -938,42 +1027,57 @@ class RelayApp:
         self.task_tree.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
         self.task_tree.bind("<<TreeviewSelect>>", self._select_task)
-        ttk.Label(right, textvariable=self.task_heading, font=("Segoe UI", 13, "bold"),
-                  wraplength=820, justify="left").pack(fill="x", pady=(0, 3))
+        task_header = ttk.Frame(right, style="Surface.TFrame")
+        self.task_header = task_header
+        task_header.pack(fill="x", pady=(0, 6))
+        ttk.Label(task_header, textvariable=self.task_heading, style="Surface.Title.TLabel",
+                  wraplength=680, justify="left").pack(side="left", fill="x", expand=True)
+        self.details_button = ttk.Button(task_header, text="显示任务详情", command=self._toggle_details)
+        self.details_button.pack(side="right", padx=(10, 0))
         self.task_alert_label = ttk.Label(right, textvariable=self.task_alert, wraplength=820,
-                                          justify="left", foreground="#8a3b00")
-        self.details_button = ttk.Button(right, text="显示任务详情", command=self._toggle_details)
-        self.details_button.pack(anchor="w", pady=(0, 5))
-        self.details_panel = ttk.Frame(right)
-        ttk.Label(self.details_panel, textvariable=self.details, wraplength=820, justify="left").pack(fill="x", pady=(0, 6))
-        self.budget_label = ttk.Label(self.details_panel, textvariable=self.budget_details, wraplength=820, justify="left")
+                                          justify="left", style="Alert.TLabel")
+        self.details_panel = ttk.Frame(right, style="Surface.TFrame")
+        ttk.Label(self.details_panel, textvariable=self.details, wraplength=820, justify="left",
+                  style="Surface.TLabel").pack(fill="x", pady=(0, 6))
+        self.budget_label = ttk.Label(self.details_panel, textvariable=self.budget_details, wraplength=820,
+                                      justify="left", style="Surface.Muted.TLabel")
         self.budget_label.pack(fill="x", pady=(0, 6))
-        goal = ttk.LabelFrame(self.details_panel, text="目标")
+        goal = ttk.LabelFrame(self.details_panel, text="目标", style="Surface.TLabelframe")
         goal.pack(fill="x")
         self.goal_text = text_area(goal, 2 if compact else 3)
-        self.latest_frame = ttk.LabelFrame(right, text="最新回复")
-        self.latest_frame.pack(fill="both", expand=True, pady=6)
-        self.latest_text = text_area(self.latest_frame, 6 if compact else 8)
-        workflow = ttk.Frame(right)
+        self.latest_frame = ttk.Frame(right, style="Surface.TFrame")
+        self.latest_frame.pack(fill="both", expand=True, pady=(4, 8))
+        ttk.Label(self.latest_frame, text="最新回复", style="Section.TLabel").pack(anchor="w", pady=(0, 2))
+        self.latest_text = text_area(self.latest_frame, 4 if compact else 8)
+        workflow = ttk.Frame(right, style="Surface.TFrame")
+        self.workflow = workflow
         workflow.pack(side="bottom", fill="x")
-        self.pending_frame = ttk.LabelFrame(workflow, text="需要审批 / 回答")
+        self.pending_frame = ttk.LabelFrame(workflow, text="需要审批 / 回答", style="Attention.TLabelframe")
         self.pending_choice = ttk.Combobox(self.pending_frame, state="disabled")
         self.pending_choice.pack(fill="x", padx=6, pady=(6, 0))
         self.pending_choice.bind("<<ComboboxSelected>>", lambda event: self._render_request())
         self.request_text = text_area(self.pending_frame, 3 if compact else 4)
-        self.answer_frame = ttk.Frame(self.pending_frame, padding=(6, 0, 6, 6))
+        self.answer_frame = ttk.Frame(self.pending_frame, padding=(6, 0, 6, 6), style="Surface.TFrame")
         self.answer_frame.pack(fill="x")
         self.approval_allow = ttk.Button(self.answer_frame, text="仅此一次允许", command=lambda: self._answer_approval("accept"))
         self.approval_decline = ttk.Button(self.answer_frame, text="拒绝", command=lambda: self._answer_approval("decline"))
-        self.controls_frame = ttk.Frame(workflow)
+        self.controls_frame = ttk.Frame(workflow, style="Surface.TFrame")
         self.controls_frame.pack(fill="x")
-        ttk.Label(self.controls_frame, text="发给 Codex（可留空继续）").pack(anchor="w")
-        self.message_text = tk.Text(self.controls_frame, height=2, wrap="word")
-        self.message_text.pack(fill="x", pady=(2, 6))
-        self.primary_actions = ttk.Frame(self.controls_frame)
+        ttk.Separator(self.controls_frame).pack(fill="x", pady=(2, 10))
+        ttk.Label(self.controls_frame, text="发给 Codex（可留空继续）",
+                  style="Surface.Muted.TLabel").pack(anchor="w")
+        self.message_text = tk.Text(self.controls_frame, height=1 if compact else 2, wrap="word", relief="flat",
+                                    background=SURFACE, foreground=INK, insertbackground=INK,
+                                    selectbackground=ACCENT, borderwidth=0, highlightthickness=1,
+                                    highlightbackground=BORDER, highlightcolor=ACCENT,
+                                    padx=10, pady=8, font=("Segoe UI", 10))
+        self.message_text.pack(fill="x", pady=(4, 8))
+        self.primary_actions = ttk.Frame(self.controls_frame, style="Surface.TFrame")
         self.primary_actions.pack(fill="x")
         for label, method in (("发送 / 继续", "start"), ("暂停", "pause"), ("核对恢复", "reconcile")):
-            button = ttk.Button(self.primary_actions, text=label, command=lambda action=method: self._action(action))
+            button = ttk.Button(self.primary_actions, text=label,
+                                style="Primary.TButton" if method == "start" else "TButton",
+                                command=lambda action=method: self._action(action))
             button.pack(side="left", padx=(0, 5))
             self.buttons[method] = button
         for label, method in (("预备快照", "prepare_snapshot"), ("交接", "handoff"),
@@ -999,7 +1103,8 @@ class RelayApp:
                 self.more_menu.add_separator()
             self.more_menu.add_command(label=label, command=command)
             self.more_entries[key] = self.more_menu.index("end")
-        ttk.Label(self.root, textvariable=self.status, wraplength=1140, justify="left").pack(fill="x", padx=16, pady=10)
+        ttk.Label(self.root, textvariable=self.status, wraplength=1140, justify="left",
+                  style="Muted.TLabel").pack(fill="x", padx=20, pady=(2, 12))
         self._controls()
 
     def _toggle_details(self):
@@ -1266,7 +1371,7 @@ class RelayApp:
             alerts.append("恢复库为只读检视，不能执行或修改任务。")
         self.task_alert.set("\n".join(dict.fromkeys(alerts)))
         if alerts:
-            self.task_alert_label.pack(fill="x", pady=(0, 5), before=self.details_button)
+            self.task_alert_label.pack(fill="x", pady=(0, 5), before=self.latest_frame)
         else:
             self.task_alert_label.pack_forget()
         self.details.set(f"{task['title']} · {STATES.get(task.get('state'), task.get('state', '未知'))}\n"

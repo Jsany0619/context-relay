@@ -11,6 +11,13 @@ import time
 import webbrowser
 
 
+BG = "#f7f8fa"
+SURFACE = "#ffffff"
+INK = "#17212b"
+ACCENT = "#2457d6"
+BORDER = "#dce2e9"
+
+
 def private_address(value):
     address = ipaddress.IPv4Address(value)
     if (address.is_unspecified or address.is_multicast or address.is_link_local
@@ -143,63 +150,81 @@ class PhoneDialog(tk.Toplevel):
         self._pairing_request = self._pairing_snapshot = None
         self._pairing_deadline = self._pairing_timer = None
         self._pairing_serial = 0
+        self.configure(background=BG)
         self.title("手机连接 · Context Relay")
         self.transient(app.root)
-        self.geometry(f"{min(720, self.winfo_screenwidth() - 80)}x{min(600, self.winfo_screenheight() - 120)}")
-        body = ttk.Frame(self, padding=16)
+        desired_height = 680 if float(self.tk.call("tk", "scaling")) >= 1.75 else 600
+        self.geometry(f"{min(720, self.winfo_screenwidth() - 80)}x"
+                      f"{min(desired_height, self.winfo_screenheight() - 80)}")
+        body = ttk.Frame(self, padding=18, style="Sidebar.TFrame")
         body.pack(fill="both", expand=True)
         self.info = tk.StringVar(value="连接未开启。配对信息只发给自己的手机。")
-        ttk.Label(body, textvariable=self.info, wraplength=650, justify="left").pack(fill="x", pady=(0, 10))
+        ttk.Label(body, textvariable=self.info, wraplength=650, justify="left",
+                  style="Muted.TLabel").pack(fill="x", pady=(0, 12))
         ttk.Button(body, text="关闭此窗口", command=self.destroy).pack(side="bottom", anchor="e", pady=(8, 0))
         self.sections = ttk.Notebook(body)
         self.sections.pack(fill="both", expand=True)
-        self.pair_page = ttk.Frame(self.sections, padding=12)
-        self.device_page = ttk.Frame(self.sections, padding=12)
+        self.pair_page = ttk.Frame(self.sections, padding=12, style="Surface.TFrame")
+        self.device_page = ttk.Frame(self.sections, padding=12, style="Surface.TFrame")
         self.sections.add(self.pair_page, text="配对手机")
         self.sections.add(self.device_page, text="设备与设置")
         ttk.Label(self.pair_page, text="选择任务和权限，再生成配对信息。电脑需保持开机且管理器运行。",
-                  wraplength=610, justify="left").pack(fill="x", pady=(0, 10))
-        address_row = ttk.Frame(self.device_page)
+                  wraplength=610, justify="left", style="Surface.Muted.TLabel").pack(fill="x", pady=(0, 12))
+        address_row = ttk.Frame(self.device_page, style="Surface.TFrame")
         address_row.pack(fill="x")
-        ttk.Label(address_row, text="本机地址").pack(side="left")
+        ttk.Label(address_row, text="本机地址", style="Surface.TLabel").pack(side="left")
         addresses = local_addresses()
         self.address = tk.StringVar(value=addresses[0])
         self.address_box = ttk.Combobox(address_row, values=addresses, textvariable=self.address, width=24)
         self.address_box.pack(side="left", padx=8)
-        ttk.Label(address_row, text="端口").pack(side="left")
+        ttk.Label(address_row, text="端口", style="Surface.TLabel").pack(side="left")
         self.port = tk.StringVar(value="8765")
         self.port_box = ttk.Entry(address_row, textvariable=self.port, width=8)
         self.port_box.pack(side="left", padx=8)
         ttk.Label(self.device_page, text="同一 Wi-Fi 选局域网地址；异地选已连接的私有网络地址。",
-                  wraplength=610, justify="left").pack(fill="x", pady=(4, 12))
-        permission_row = ttk.Frame(self.pair_page)
+                  wraplength=610, justify="left", style="Surface.Muted.TLabel").pack(fill="x", pady=(4, 14))
+        permission_row = ttk.Frame(self.pair_page, style="Surface.TFrame")
         permission_row.pack(fill="x", pady=(0, 6))
-        ttk.Label(permission_row, text="手机权限").pack(side="left")
+        ttk.Label(permission_row, text="手机权限", style="Surface.TLabel").pack(side="left")
         self.scope = tk.StringVar(value="仅查看")
         self.scope_box = ttk.Combobox(permission_row, textvariable=self.scope,
                                       values=("仅查看", "查看与控制"), state="readonly", width=14)
         self.scope_box.pack(side="left", padx=8)
         self.scope_box.bind("<<ComboboxSelected>>", self._pairing_choices_changed)
-        ttk.Label(permission_row, text="控制权限可发送、暂停和审批任务。").pack(side="left")
-        ttk.Label(self.pair_page, text="允许访问的任务（可多选）").pack(anchor="w")
-        self.task_list = tk.Listbox(self.pair_page, height=5, selectmode="extended", exportselection=False)
+        ttk.Label(permission_row, text="控制权限可发送、暂停和审批任务。",
+                  style="Surface.Muted.TLabel").pack(side="left")
+        ttk.Label(self.pair_page, text="允许访问的任务（可多选）",
+                  style="Surface.TLabel").pack(anchor="w", pady=(6, 0))
+        self.task_list = tk.Listbox(self.pair_page, height=4, selectmode="extended", exportselection=False,
+                                    background=SURFACE, foreground=INK, selectbackground=ACCENT,
+                                    selectforeground=SURFACE, relief="flat", borderwidth=0,
+                                    highlightthickness=1, highlightbackground=BORDER,
+                                    highlightcolor=ACCENT, font=("Segoe UI", 10))
         self.task_list.pack(fill="x", pady=(3, 8))
         self.task_list.bind("<<ListboxSelect>>", self._pairing_choices_changed)
         self.task_ids = []
         self._sync_tasks()
-        buttons = ttk.Frame(self.pair_page)
+        buttons = ttk.Frame(self.pair_page, style="Surface.TFrame")
         buttons.pack(fill="x")
-        self.enable_button = ttk.Button(buttons, text="开启手机连接", command=self.enable)
-        self.pair_button = ttk.Button(buttons, text="按所选权限生成配对信息", command=self.pair)
-        self.pairing_panel = ttk.Frame(self.pair_page)
-        self.pairing = tk.Text(self.pairing_panel, height=3, wrap="char", state="disabled")
+        self.enable_button = ttk.Button(buttons, text="开启手机连接", command=self.enable, style="Primary.TButton")
+        self.pair_button = ttk.Button(buttons, text="按所选权限生成配对信息", command=self.pair, style="Primary.TButton")
+        self.pairing_panel = ttk.Frame(self.pair_page, style="Surface.TFrame")
+        self.pairing = tk.Text(self.pairing_panel, height=3, wrap="char", state="disabled", relief="flat",
+                               background=SURFACE, foreground=INK, borderwidth=0, highlightthickness=1,
+                               highlightbackground=BORDER, selectbackground=ACCENT, padx=8, pady=8,
+                               font=("Segoe UI", 9))
         self.pairing.pack(fill="x", pady=(10, 4))
-        self.copy_button = ttk.Button(self.pairing_panel, text="复制配对信息（5 分钟内有效，仅一次）", command=self.copy)
+        self.copy_button = ttk.Button(self.pairing_panel, text="复制配对信息（5 分钟内有效，仅一次）",
+                                      command=self.copy, style="Primary.TButton")
         self.copy_button.pack(anchor="w")
-        ttk.Label(self.device_page, text="已配对设备").pack(anchor="w", pady=(0, 4))
-        self.device_list = tk.Listbox(self.device_page, height=4, exportselection=False)
+        ttk.Label(self.device_page, text="已配对设备", style="Surface.TLabel").pack(anchor="w", pady=(0, 4))
+        self.device_list = tk.Listbox(self.device_page, height=4, exportselection=False,
+                                      background=SURFACE, foreground=INK, selectbackground=ACCENT,
+                                      selectforeground=SURFACE, relief="flat", borderwidth=0,
+                                      highlightthickness=1, highlightbackground=BORDER,
+                                      highlightcolor=ACCENT, font=("Segoe UI", 10))
         self.device_list.pack(fill="both", expand=True)
-        actions = ttk.Frame(self.device_page)
+        actions = ttk.Frame(self.device_page, style="Surface.TFrame")
         actions.pack(fill="x", pady=(8, 0))
         self.refresh_button = ttk.Button(actions, text="刷新设备", command=lambda: self.submit("remote_status"))
         self.refresh_button.pack(side="left")
@@ -207,7 +232,7 @@ class PhoneDialog(tk.Toplevel):
         self.revoke_button.pack(side="left", padx=8)
         self.stop_button = ttk.Button(actions, text="关闭手机连接", command=lambda: self.submit("remote_disable"))
         self.stop_button.pack(side="right")
-        help_row = ttk.Frame(self.device_page)
+        help_row = ttk.Frame(self.device_page, style="Surface.TFrame")
         help_row.pack(fill="x", pady=(8, 0))
         self.network_button = ttk.Button(help_row, text="异地连接检查", command=lambda: self.submit("remote_network"))
         self.network_button.pack(side="left")

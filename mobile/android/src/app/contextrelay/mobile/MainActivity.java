@@ -7,10 +7,12 @@ import android.content.Intent;
 import android.content.ClipData;
 import android.content.ClipDescription;
 import android.content.ClipboardManager;
+import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.Rect;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.RippleDrawable;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -24,10 +26,12 @@ import android.text.SpannableStringBuilder;
 import android.text.Spanned;
 import android.text.style.StyleSpan;
 import android.text.style.RelativeSizeSpan;
+import android.text.style.ForegroundColorSpan;
 import android.util.Base64;
 import android.view.View;
 import android.view.Gravity;
 import android.view.WindowManager;
+import android.view.accessibility.AccessibilityNodeInfo;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
@@ -55,6 +59,13 @@ public final class MainActivity extends Activity {
     // Operate: familiar native chat, real completed messages, a stable composer, and explicit approvals.
     // White reading surface, neutral user bubbles, system type; no invented streaming or decorations.
     private static final int UNLOCK_REQUEST = 701;
+    private static final int INK = Color.rgb(23, 33, 43);
+    private static final int MUTED = Color.rgb(96, 109, 125);
+    private static final int SURFACE = Color.rgb(245, 247, 250);
+    private static final int OUTLINE = Color.rgb(221, 227, 235);
+    private static final int ACCENT = Color.rgb(36, 87, 214);
+    // Custom action IDs must not collide with standard actions such as ACTION_FOCUS (1).
+    private static final int COPY_MESSAGE = 0x02000000 | View.generateViewId();
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final List<Button> actions = new ArrayList<>();
@@ -107,6 +118,9 @@ public final class MainActivity extends Activity {
         super.onCreate(state);
         getWindow().setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE);
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+        getWindow().setStatusBarColor(Color.WHITE);
+        getWindow().setNavigationBarColor(Color.WHITE);
+        getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
         readIntent(getIntent());
         showLocked("请验证手机锁屏身份后继续。");
     }
@@ -120,9 +134,12 @@ public final class MainActivity extends Activity {
 
     private void showLocked(String reason) {
         LinearLayout box = column(); box.setPadding(dp(24), dp(32), dp(24), dp(24));
-        text(box, "Context Relay 已锁定", 24);
-        text(box, reason + "\n离开 App 后再次进入需要重新验证。未确认的操作仍保留，不会自动重发。", 17);
+        box.setBackgroundColor(Color.WHITE);
+        text(box, "Context Relay", 26).setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        text(box, "验证身份后继续对话", 18);
+        text(box, reason + "\n离开 App 后需要重新验证；未确认的操作保留，不会自动重发。", 15).setTextColor(MUTED);
         Button unlock = new Button(this); unlock.setText("验证手机身份");
+        styleButton(unlock, true);
         unlock.setOnClickListener(v -> requestUnlock()); box.addView(unlock);
         setContentView(box);
     }
@@ -173,10 +190,10 @@ public final class MainActivity extends Activity {
         }
         root = column();
         root.setBackgroundColor(Color.WHITE);
-        root.setPadding(dp(14), dp(12), dp(14), dp(8));
+        root.setPadding(dp(16), dp(8), dp(16), dp(8));
         root.setOnApplyWindowInsetsListener((view, insets) -> {
-            view.setPadding(dp(14) + insets.getSystemWindowInsetLeft(), dp(8) + insets.getSystemWindowInsetTop(),
-                    dp(14) + insets.getSystemWindowInsetRight(), dp(8) + insets.getSystemWindowInsetBottom());
+            view.setPadding(dp(16) + insets.getSystemWindowInsetLeft(), dp(4) + insets.getSystemWindowInsetTop(),
+                    dp(16) + insets.getSystemWindowInsetRight(), dp(8) + insets.getSystemWindowInsetBottom());
             return insets;
         });
         header = column(); root.addView(header);
@@ -191,6 +208,7 @@ public final class MainActivity extends Activity {
         scroll.setFillViewport(true);
         scroll.setOnScrollChangeListener((view, x, y, oldX, oldY) -> updateLatestButton());
         content = column();
+        content.setPadding(0, dp(8), 0, dp(12));
         scroll.addView(content);
         root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
         composer = column(); root.addView(composer);
@@ -273,17 +291,33 @@ public final class MainActivity extends Activity {
 
     private int dp(int value) { return Math.round(value * getResources().getDisplayMetrics().density); }
     private LinearLayout column() { LinearLayout box = new LinearLayout(this); box.setOrientation(LinearLayout.VERTICAL); return box; }
+    private GradientDrawable surface(int color, int radius) {
+        GradientDrawable shape = new GradientDrawable(); shape.setColor(color); shape.setCornerRadius(dp(radius)); return shape;
+    }
+    private void styleButton(Button view, boolean primary) {
+        view.setAllCaps(false); view.setTextSize(14); view.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        view.setMinHeight(dp(48)); view.setMinimumHeight(dp(48)); view.setMinWidth(0); view.setMinimumWidth(dp(48));
+        view.setPadding(dp(12), dp(8), dp(12), dp(8)); view.setStateListAnimator(null);
+        int[][] states = new int[][] {new int[] {-android.R.attr.state_enabled}, new int[] {}};
+        view.setTextColor(new ColorStateList(states, new int[] {MUTED, primary ? Color.WHITE : INK}));
+        GradientDrawable fill = surface(Color.TRANSPARENT, 12);
+        fill.setColor(new ColorStateList(states, new int[] {primary ? OUTLINE : Color.TRANSPARENT, primary ? ACCENT : Color.TRANSPARENT}));
+        view.setBackground(new RippleDrawable(ColorStateList.valueOf(Color.argb(28, 36, 87, 214)), fill, null));
+    }
     private TextView text(LinearLayout parent, String value, int size) {
         TextView view = new TextView(this);
         view.setText(value); view.setTextSize(size); view.setTextIsSelectable(true);
-        view.setTextColor(Color.rgb(28, 31, 36));
-        view.setPadding(0, dp(5), 0, dp(5));
+        view.setTextColor(INK); view.setIncludeFontPadding(false);
+        view.setPadding(0, dp(4), 0, dp(4));
         parent.addView(view, new LinearLayout.LayoutParams(-1, -2));
         return view;
     }
     private EditText input(LinearLayout parent, String hint, String value, boolean multiline) {
         EditText view = new ScrollingEditText(this);
-        view.setHint(hint); view.setText(value); view.setTextSize(18);
+        view.setHint(hint); view.setText(value); view.setTextSize(16);
+        view.setTextColor(INK); view.setHintTextColor(MUTED);
+        view.setBackground(surface(SURFACE, 12)); view.setPadding(dp(14), dp(12), dp(14), dp(12));
+        view.setMinHeight(dp(48));
         view.setInputType(InputType.TYPE_CLASS_TEXT | (multiline ? InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES : 0));
         view.setMinLines(1); view.setMaxLines(multiline ? 3 : 2);
         parent.addView(view, new LinearLayout.LayoutParams(-1, -2));
@@ -292,6 +326,7 @@ public final class MainActivity extends Activity {
     private void compactStatus(TextView view) {
         view.setMaxLines(2);
         view.setEllipsize(TextUtils.TruncateAt.END);
+        view.setTextSize(13); view.setTextColor(MUTED);
         view.setOnClickListener(v -> {
             if (view.getText().length() == 0) return;
             popup = true;
@@ -303,7 +338,7 @@ public final class MainActivity extends Activity {
     }
     private Button button(LinearLayout parent, String label, boolean enabled, Runnable callback) {
         Button view = new Button(this);
-        view.setText(label); view.setAllCaps(false); view.setTextSize(16);
+        view.setText(label); styleButton(view, false);
         view.setEnabled(enabled && !busy && !storageFailed && authorized());
         view.setMinHeight(dp(48));
         view.setTag(enabled);
@@ -519,7 +554,7 @@ public final class MainActivity extends Activity {
                 showProgress("已粘贴。点“核对并配对”检查电脑身份；尚未建立连接。");
             } catch (Exception ex) { error(ex); }
         });
-        button(content, "核对并配对", true, () -> {
+        Button pair = button(content, "核对并配对", true, () -> {
             try {
                 JSONObject info = pairingInfo(Protocol.pairingUri(code.getText()));
                 String endpoint = Protocol.endpoint(info.getString("endpoint"));
@@ -541,6 +576,7 @@ public final class MainActivity extends Activity {
                     }));
             } catch (Exception ex) { error(ex); }
         });
+        styleButton(pair, true);
         if (connection() != null) button(content, "返回已有连接", true, this::showTasks);
     }
 
@@ -560,8 +596,10 @@ public final class MainActivity extends Activity {
         clearPage(); selectedId = null; task = null; pairingView = false;
         header.removeAllViews();
         LinearLayout navigation = new LinearLayout(this); navigation.setGravity(Gravity.CENTER_VERTICAL); header.addView(navigation);
-        TextView title = text(navigation, "我的任务", 22); title.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
-        Button more = button(navigation, "更多", true, this::showDetails); more.setLayoutParams(new LinearLayout.LayoutParams(dp(72), -2));
+        TextView title = text(navigation, "我的任务", 22); title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        title.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
+        Button more = button(navigation, "⋯", true, this::showDetails); more.setContentDescription("更多操作");
+        more.setTextSize(24); more.setLayoutParams(new LinearLayout.LayoutParams(dp(48), -2));
         renderOperation();
         int visible = 0;
         for (int i = 0; i < tasks.length(); i++) {
@@ -574,10 +612,19 @@ public final class MainActivity extends Activity {
                 selectedId = id; task = item; showTask(); refresh();
             });
             row.setGravity(Gravity.START | Gravity.CENTER_VERTICAL); row.setPadding(dp(12), dp(10), dp(12), dp(10));
+            SpannableStringBuilder label = new SpannableStringBuilder(row.getText());
+            int end = label.toString().indexOf('\n');
+            label.setSpan(new StyleSpan(Typeface.BOLD), 0, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            label.setSpan(new RelativeSizeSpan(0.86f), end + 1, label.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            label.setSpan(new ForegroundColorSpan(MUTED), end + 1, label.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            row.setText(label); row.setTextSize(17); row.setLineSpacing(dp(5), 1);
             row.setMaxLines(5); row.setEllipsize(TextUtils.TruncateAt.END);
+            View divider = new View(this); divider.setBackgroundColor(OUTLINE);
+            content.addView(divider, new LinearLayout.LayoutParams(-1, dp(1)));
         }
         if (visible == 0) {
-            text(content, "暂无获授权的任务。请在电脑选择要连接的任务后重新配对。", 17);
+            text(content, offline ? "还没有读取到任务" : "暂无获授权的任务", 20).setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+            text(content, offline ? "连接电脑后刷新，已有授权不会因此改变。" : "在电脑选择允许手机访问的任务，再生成配对信息。", 15).setTextColor(MUTED);
             button(content, "刷新列表", connection() != null, this::refresh);
         }
         listSignature = tasks.toString();
@@ -609,8 +656,9 @@ public final class MainActivity extends Activity {
                     if (item == null || !item.optBoolean("summary_only"))
                         throw new IllegalArgumentException("请先更新并重新打开电脑端 Context Relay，再刷新任务。");
                 }
-                tasks = listed;
-                if (!tasks.toString().equals(listSignature)) showTasks();
+                boolean redraw = offline || !listed.toString().equals(listSignature);
+                tasks = listed; offline = false;
+                if (redraw) showTasks();
             }
             else if (id.equals(selectedId)) {
                 if (!id.equals(result.optString("id")) || !fullTask(result))
@@ -645,13 +693,16 @@ public final class MainActivity extends Activity {
         header.removeAllViews();
         LinearLayout navigation = new LinearLayout(this); navigation.setGravity(Gravity.CENTER_VERTICAL);
         header.addView(navigation);
-        Button back = button(navigation, "返回", true, () -> { selectedId = null; task = null; showTasks(); refresh(); });
-        back.setLayoutParams(new LinearLayout.LayoutParams(dp(72), -2));
-        TextView title = text(navigation, task.optString("title", "对话"), 19);
-        title.setMaxLines(2); title.setEllipsize(TextUtils.TruncateAt.END);
+        Button back = button(navigation, "‹", true, () -> { selectedId = null; task = null; showTasks(); refresh(); });
+        back.setContentDescription("返回任务列表"); back.setTextSize(28);
+        back.setLayoutParams(new LinearLayout.LayoutParams(dp(48), -2));
+        TextView title = text(navigation, task.optString("title", "对话"), 18);
+        title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        title.setMaxLines(1); title.setEllipsize(TextUtils.TruncateAt.END);
         title.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
-        Button more = button(navigation, "更多", fullTask(task), this::showDetails);
-        more.setLayoutParams(new LinearLayout.LayoutParams(dp(72), -2));
+        Button more = button(navigation, "⋯", fullTask(task), this::showDetails);
+        more.setContentDescription("更多操作与完整任务名称"); more.setTextSize(24);
+        more.setLayoutParams(new LinearLayout.LayoutParams(dp(48), -2));
         taskStatus = text(header, "", 14); compactStatus(taskStatus);
         requestsAction = button(header, "处理请求", true, this::showRequests);
         requestsAction.setVisibility(View.GONE);
@@ -663,8 +714,7 @@ public final class MainActivity extends Activity {
             taskStatus.setVisibility(View.VISIBLE);
             text(timeline, "可先写草稿，读到最新状态后再发送。", 17);
             composer.setPadding(0, dp(8), 0, 0);
-            draftInput(id, "可先写草稿；完整任务读取成功后才能发送");
-            text(composer, "草稿只保存在手机，不会在详情加载前发送。", 13);
+            draftInput(composer, id, "写下消息，连接后再发送");
             controls();
             return;
         }
@@ -674,10 +724,13 @@ public final class MainActivity extends Activity {
             else { scroll.scrollTo(0, Math.max(0, content.getHeight() - scroll.getHeight())); updateLatestButton(); }
         });
         latest.setVisibility(View.GONE);
-        draftInput(id, "发送消息给电脑上的 Codex");
-        LinearLayout commands = new LinearLayout(this); composer.addView(commands);
+        LinearLayout entry = new LinearLayout(this); entry.setGravity(Gravity.BOTTOM);
+        entry.setBackground(surface(SURFACE, 16)); entry.setPadding(dp(4), dp(4), dp(4), dp(4)); composer.addView(entry);
+        draftInput(entry, id, "发送消息…");
+        message.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
+        message.setBackgroundColor(Color.TRANSPARENT);
+        LinearLayout commands = column(); entry.addView(commands, new LinearLayout.LayoutParams(dp(80), -2));
         pause = button(commands, "暂停", false, () -> command(task, "pause", new JSONObject(), "暂停任务", "请求电脑暂停；收到原生终态之前不能假定已停止。", null));
-        pause.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
         send = button(commands, "发送", false, () -> {
             try {
                 String value = Protocol.messageInput(draft(id));
@@ -685,13 +738,13 @@ public final class MainActivity extends Activity {
                 command(task, "start", payload, "发送给电脑", "提交到任务：" + task.optString("title") + "\n" + value, draft(id));
             } catch (Exception ex) { error(ex); }
         });
-        send.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
+        styleButton(send, true);
         updateTask();
     }
 
-    private void draftInput(String id, String hint) {
-        message = input(composer, hint, draft(id), true);
-        message.setMaxLines(4); message.setContentDescription("消息草稿，不会自动发送");
+    private void draftInput(LinearLayout parent, String id, String hint) {
+        message = input(parent, hint, draft(id), true);
+        message.setMaxLines(3); message.setContentDescription("消息草稿，不会自动发送");
         message.addTextChangedListener(new TextWatcher() {
             public void beforeTextChanged(CharSequence s, int start, int count, int after) { }
             public void onTextChanged(CharSequence s, int start, int before, int count) {
@@ -724,7 +777,8 @@ public final class MainActivity extends Activity {
         boolean waitingBrief = !"direct".equals(task.optString("connection_mode"))
                 && task.optBoolean("brief_required") && candidate(task.optJSONObject("brief"));
         send.setTag(mutable && Protocol.quiet(task.optString("state")) && !waitingBrief);
-        send.setText(!control ? "仅查看" : "direct".equals(task.optString("connection_mode")) ? "原话发送" : task.optBoolean("brief_required") ? "整理简报" : "发送 / 继续");
+        send.setText(!control ? "仅查看" : task.optBoolean("brief_required") && !"direct".equals(task.optString("connection_mode")) ? "整理简报" : "发送");
+        send.setContentDescription(control && "direct".equals(task.optString("connection_mode")) ? "原话发送" : send.getText());
         pause.setTag(mutable && (Protocol.active(task.optString("state")) || "blocked".equals(task.optString("state"))));
         pause.setText(!control ? "仅查看" : Protocol.quiet(task.optString("state")) ? "未运行" : "暂停");
         pause.setVisibility(control && Protocol.active(task.optString("state")) ? View.VISIBLE : View.GONE);
@@ -762,7 +816,7 @@ public final class MainActivity extends Activity {
         taskStatus.setMaxLines(keyboardOpen ? 1 : 2);
         status.setMaxLines(keyboardOpen ? 1 : 2);
         operation.setMaxLines(keyboardOpen ? 1 : 2);
-        message.setMaxLines(keyboardOpen ? 2 : 4);
+        message.setMaxLines(keyboardOpen ? 2 : 3);
         JSONArray requests = task == null ? null : task.optJSONArray("pending");
         requestsAction.setVisibility(requests != null && requests.length() > 0 ? View.VISIBLE : View.GONE);
         updateLatestButton();
@@ -779,15 +833,26 @@ public final class MainActivity extends Activity {
         showProgress("已复制" + label + "。粘贴到其他应用前请核对接收方。");
     }
 
-    private void copyMenu(TextView label, String value, String kind) {
-        label.setTextIsSelectable(false);
-        label.setMinHeight(dp(48));
-        label.setGravity(Gravity.CENTER_VERTICAL);
-        label.setContentDescription(label.getText() + "，长按复制" + kind);
-        label.setOnCreateContextMenuListener((menu, view, info) -> {
-            if (authorized()) menu.add("复制" + kind).setOnMenuItemClickListener(item -> {
+    private void copyMenu(View target, String value, String kind) {
+        target.setMinimumHeight(dp(48));
+        target.setFocusable(true);
+        target.setAccessibilityDelegate(new View.AccessibilityDelegate() {
+            @Override public void onInitializeAccessibilityNodeInfo(View view, AccessibilityNodeInfo info) {
+                super.onInitializeAccessibilityNodeInfo(view, info);
+                info.addAction(new AccessibilityNodeInfo.AccessibilityAction(COPY_MESSAGE, "复制" + kind));
+            }
+            @Override public boolean performAccessibilityAction(View view, int action, Bundle arguments) {
+                if (action == COPY_MESSAGE && authorized()) { copyText(value, kind); return true; }
+                return super.performAccessibilityAction(view, action, arguments);
+            }
+        });
+        target.setOnLongClickListener(view -> {
+            if (!authorized()) return false;
+            android.widget.PopupMenu menu = new android.widget.PopupMenu(this, view);
+            menu.getMenu().add("复制" + kind).setOnMenuItemClickListener(item -> {
                 copyText(value, kind); return true;
             });
+            menu.show(); return true;
         });
     }
 
@@ -819,10 +884,12 @@ public final class MainActivity extends Activity {
             String language = block[1].length() > 24 ? block[1].substring(0, 24) + "…" : block[1];
             TextView label = text(bar, language.isEmpty() ? "代码" : "代码 · " + language, 13);
             label.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
-            copyMenu(label, block[2], "代码");
+            label.setTextIsSelectable(false); label.setTextColor(MUTED);
+            Button copy = button(bar, "复制", true, () -> copyText(block[2], "代码"));
+            copy.setLayoutParams(new LinearLayout.LayoutParams(dp(64), -2));
             HorizontalScrollView viewport = new HorizontalScrollView(this); viewport.setFillViewport(true);
             TextView code = new TextView(this); code.setText(block[2]); code.setTextSize(15); code.setTypeface(Typeface.MONOSPACE);
-            code.setTextColor(Color.rgb(28, 31, 36)); code.setBackgroundColor(Color.rgb(244, 246, 248));
+            code.setTextColor(INK); code.setBackgroundColor(SURFACE);
             code.setPadding(dp(10), dp(10), dp(10), dp(10)); code.setTextIsSelectable(true); code.setHorizontallyScrolling(true);
             viewport.addView(code, new android.widget.FrameLayout.LayoutParams(-2, -2));
             parent.addView(viewport, new LinearLayout.LayoutParams(-1, -2));
@@ -837,15 +904,15 @@ public final class MainActivity extends Activity {
         boolean mine = "user".equals(role);
         LinearLayout bubble = column();
         LinearLayout.LayoutParams layout = new LinearLayout.LayoutParams(-1, -2);
-        layout.setMargins(mine ? dp(32) : 0, dp(8), mine ? 0 : dp(8), dp(12));
-        bubble.setPadding(dp(12), dp(8), dp(12), dp(8));
-        if (mine) { GradientDrawable background = new GradientDrawable(); background.setColor(Color.rgb(238, 242, 246)); background.setCornerRadius(dp(14)); bubble.setBackground(background); }
+        layout.setMargins(mine ? dp(32) : 0, dp(8), 0, dp(12));
+        bubble.setPadding(mine ? dp(14) : 0, dp(8), mine ? dp(14) : 0, dp(8));
+        if (mine) bubble.setBackground(surface(SURFACE, 16));
         timeline.addView(bubble, layout);
         LinearLayout caption = new LinearLayout(this); caption.setGravity(Gravity.CENTER_VERTICAL); bubble.addView(caption);
-        TextView label = text(caption, (mine ? "你" : "Codex") + (at.isEmpty() ? "" : " · " + timeLabel(at)), 13);
+        TextView label = text(caption, (mine ? "你" : "Codex") + (at.isEmpty() ? "" : " · " + timeLabel(at)), 12);
         label.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
-        label.setTextColor(Color.rgb(78, 87, 98));
-        copyMenu(label, value, "完整消息");
+        label.setTextColor(MUTED); label.setTextIsSelectable(false);
+        copyMenu(bubble, value, "完整消息");
         if (!notice.isEmpty()) text(bubble, notice, 13);
         if (verbatim) { TextView body = text(bubble, value, 17); body.setLineSpacing(dp(3), 1); }
         else messageBody(bubble, value);
@@ -993,6 +1060,7 @@ public final class MainActivity extends Activity {
             return;
         }
         final JSONObject displayed = task;
+        text(box, displayed.optString("title", "对话"), 20).setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         button(box, "刷新当前对话", true, () -> { dismissDialogs(); refresh(); });
         button(box, originalView ? "查看管理记录" : "查看原始对话", true, () -> {
             dismissDialogs(); generation++; originalChoice = true; originalView = !originalView;
@@ -1019,7 +1087,7 @@ public final class MainActivity extends Activity {
         if (pending() != null) button(box, "查看待核对操作", true, () -> { dismissDialogs(); showOperationDetails(); });
         text(box, stateLabel(displayed.optString("state")) + " · " + ("workspace-write".equals(displayed.optString("mode")) ? "项目可写" : "项目只读")
                 + " · " + (controlAllowed(displayed) ? "手机可控制" : "手机仅查看"), 14);
-        text(box, "长按消息标题可复制完整原文；正文可选中文字复制。代码长行可左右滑动，长按代码标题可复制代码。", 14);
+        text(box, "长按消息边缘可复制完整原文；正文可选中文字复制。代码长行可左右滑动，标题旁可复制代码。无障碍操作中也提供完整复制。", 14);
         text(box, "目标\n" + displayed.optString("goal", "待整理简报"), 17);
         text(box, "累计记录 Token：" + pretty(displayed.opt("usage")) + "\n软预算：" + displayed.optLong("max_tokens")
                 + " Token / " + displayed.optDouble("max_minutes", 0) + " 分钟（0 为不限；不是当前上下文占用）", 14);
