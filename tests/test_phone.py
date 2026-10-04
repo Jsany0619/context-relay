@@ -15,6 +15,42 @@ class PhoneUiTests(unittest.TestCase):
     tearDown = base_ui.TkSmokeTests.tearDown
     wait_for = base_ui.TkSmokeTests.wait_for
 
+    def test_pairing_only_shows_current_step_and_settings_remain_reachable(self):
+        self.root.deiconify()
+        with mock.patch("relay.phone.local_addresses", return_value=["127.0.0.1"]):
+            self.app.phone_button.invoke()
+        dialog = self.app.phone_dialog
+        self.wait_for(lambda: not self.app.busy)
+        self.root.update()
+        self.assertTrue(dialog.enable_button.winfo_ismapped())
+        self.assertFalse(dialog.pair_button.winfo_ismapped())
+        self.assertFalse(dialog.pairing.winfo_ismapped())
+        self.assertFalse(dialog.network_button.winfo_ismapped())
+        self.assertFalse(dialog.port_box.winfo_ismapped())
+        dialog.sections.select(dialog.device_page)
+        self.root.update()
+        self.assertTrue(dialog.network_button.winfo_ismapped())
+        self.assertTrue(dialog.port_box.winfo_ismapped())
+        dialog.sections.select(dialog.pair_page)
+        dialog.deliver({"enabled": True, "endpoint": "https://127.0.0.1:8765", "devices": []})
+        dialog.task_list.selection_set(0)
+        with mock.patch.object(dialog, "submit", return_value=True):
+            dialog.pair()
+        dialog.deliver({"enabled": True, "endpoint": "https://127.0.0.1:8765", "devices": [],
+                        "pairing_uri": "contextrelay://pair#synthetic",
+                        "pairing_expires_at": time.time() + 300})
+        self.root.update()
+        self.assertFalse(dialog.enable_button.winfo_ismapped())
+        self.assertTrue(dialog.pair_button.winfo_ismapped())
+        self.assertTrue(dialog.pairing.winfo_ismapped())
+        self.assertTrue(dialog.copy_button.winfo_ismapped())
+        dialog.scope.set("查看与控制")
+        dialog._pairing_choices_changed()
+        self.root.update()
+        self.assertFalse(dialog.pairing.winfo_ismapped())
+        self.assertIn("选择已变化", dialog.info.get())
+        self.assertFalse(self.fake.starts)
+
     def test_phone_reply_cannot_clear_desktop_busy_or_unsent_draft(self):
         self.fake.root = Path(self.temp.name)
         self.fake.recovery_info = None
@@ -85,6 +121,16 @@ class PhoneUiTests(unittest.TestCase):
         self.assertEqual(dialog.task_ids, ["task-1"])
         self.assertIn(task["title"], dialog.task_list.get(0))
         self.assertEqual(dialog.task_list.cget("state"), "normal")
+        self.assertNotIn("task-1", dialog.task_list.get(0))
+        dialog.task_list.selection_set(0)
+        self.app.tasks["task-two"] = dict(task, id="task-two")
+        dialog.controls()
+        self.assertIn("task-1", dialog.task_list.get(0))
+        self.assertIn("task-two", dialog.task_list.get(1))
+        self.app.tasks["task-two"]["title"] = "不同名称"
+        dialog.controls()
+        self.assertEqual((task["title"], "不同名称"), dialog.task_list.get(0, "end"))
+        self.assertEqual((0,), dialog.task_list.curselection())
 
     def test_changed_choices_discard_late_pairing_reply(self):
         with mock.patch("relay.phone.local_addresses", return_value=["127.0.0.1"]):

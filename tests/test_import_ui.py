@@ -132,6 +132,11 @@ class ImportUiTests(unittest.TestCase):
 
     def test_preview_is_explicit_and_import_requires_fresh_goal_confirmation(self):
         dialog = self.open_import()
+        self.assertFalse(dialog.advanced_frame.winfo_ismapped())
+        dialog.advanced_open.set(True)
+        dialog.toggle_advanced()
+        self.root.update()
+        self.assertTrue(dialog.advanced_frame.winfo_ismapped())
         self.select(dialog)
         self.assertFalse(any(method == "preview_import" for method, _ in self.fake.calls))
         self.preview(dialog)

@@ -53,6 +53,8 @@ The Windows single-user Codex core is implemented; the full remote/multi-tool pl
 
 The native Android app (Android 8.0 / API 26+) can select existing managed tasks, read replies, explicitly send drafts, pause, reconcile, answer current requests, and use briefs and stage reviews. Open **手机连接 / Phone connection** on the PC, select its actual private-network address, and pair using the short-lived, single-use text. HTTPS pins the paired computer's certificate; phone credentials and pending request identities are sealed with Android Keystore. The PC must stay awake with the manager running. This controls managed tasks, not a concurrently active official Codex Desktop chat.
 
+The interface keeps the task list beside the conversation on Windows and focuses on one conversation on Android. Less frequent actions live under **More**, with task details and advanced settings opened on demand. Pending approvals, errors and recovery blockers remain visible. The desktop phone dialog separates **Pair phone** from **Devices and settings**; pairing text appears only after it is generated. These are native Tk/Android controls, with no web runtime or GSAP dependency added.
+
 Start with the same Wi-Fi. An independently configured private network may carry the connection, but its account login and cross-network operation are not verified here. APK installation requires Android's own confirmation; the APK uses a local test signature, not an app-store release identity. See the [Chinese phone setup and recovery guide](docs/mobile.md), [downloadable preview APKs](https://github.com/Jsany0619/context-relay/releases), and [version-bound validation record](docs/mobile-validation.md).
 
 ## Standalone skill triggers

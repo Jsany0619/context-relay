@@ -1,6 +1,7 @@
 """Explicit, same-process phone connection and its small desktop dialog."""
 
 import ipaddress
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 import socket
@@ -144,14 +145,21 @@ class PhoneDialog(tk.Toplevel):
         self._pairing_serial = 0
         self.title("手机连接 · Context Relay")
         self.transient(app.root)
-        self.geometry(f"{min(720, self.winfo_screenwidth() - 80)}x{min(580, self.winfo_screenheight() - 120)}")
+        self.geometry(f"{min(720, self.winfo_screenwidth() - 80)}x{min(600, self.winfo_screenheight() - 120)}")
         body = ttk.Frame(self, padding=16)
         body.pack(fill="both", expand=True)
-        ttk.Label(body, text="在手机 App 里查看和控制这里的任务", font=("Segoe UI", 13, "bold")).pack(anchor="w")
-        ttk.Label(body, text="电脑需保持开机且此管理器运行。先在电脑创建或导入任务，再在手机选择。\n"
-                  "同一 Wi-Fi 使用局域网地址；异地使用已连接的私有网络地址。",
-                  wraplength=650, justify="left").pack(fill="x", pady=8)
-        address_row = ttk.Frame(body)
+        self.info = tk.StringVar(value="连接未开启。配对信息只发给自己的手机。")
+        ttk.Label(body, textvariable=self.info, wraplength=650, justify="left").pack(fill="x", pady=(0, 10))
+        ttk.Button(body, text="关闭此窗口", command=self.destroy).pack(side="bottom", anchor="e", pady=(8, 0))
+        self.sections = ttk.Notebook(body)
+        self.sections.pack(fill="both", expand=True)
+        self.pair_page = ttk.Frame(self.sections, padding=12)
+        self.device_page = ttk.Frame(self.sections, padding=12)
+        self.sections.add(self.pair_page, text="配对手机")
+        self.sections.add(self.device_page, text="设备与设置")
+        ttk.Label(self.pair_page, text="选择任务和权限，再生成配对信息。电脑需保持开机且管理器运行。",
+                  wraplength=610, justify="left").pack(fill="x", pady=(0, 10))
+        address_row = ttk.Frame(self.device_page)
         address_row.pack(fill="x")
         ttk.Label(address_row, text="本机地址").pack(side="left")
         addresses = local_addresses()
@@ -162,9 +170,9 @@ class PhoneDialog(tk.Toplevel):
         self.port = tk.StringVar(value="8765")
         self.port_box = ttk.Entry(address_row, textvariable=self.port, width=8)
         self.port_box.pack(side="left", padx=8)
-        self.info = tk.StringVar(value="连接未开启。配对信息只发给自己的手机，不要公开分享。")
-        ttk.Label(body, textvariable=self.info, wraplength=650, justify="left").pack(fill="x", pady=10)
-        permission_row = ttk.Frame(body)
+        ttk.Label(self.device_page, text="同一 Wi-Fi 选局域网地址；异地选已连接的私有网络地址。",
+                  wraplength=610, justify="left").pack(fill="x", pady=(4, 12))
+        permission_row = ttk.Frame(self.pair_page)
         permission_row.pack(fill="x", pady=(0, 6))
         ttk.Label(permission_row, text="手机权限").pack(side="left")
         self.scope = tk.StringVar(value="仅查看")
@@ -173,37 +181,37 @@ class PhoneDialog(tk.Toplevel):
         self.scope_box.pack(side="left", padx=8)
         self.scope_box.bind("<<ComboboxSelected>>", self._pairing_choices_changed)
         ttk.Label(permission_row, text="控制权限可发送、暂停和审批任务。").pack(side="left")
-        ttk.Label(body, text="选择这台手机可访问的任务（默认全不选）").pack(anchor="w")
-        self.task_list = tk.Listbox(body, height=4, selectmode="extended", exportselection=False)
+        ttk.Label(self.pair_page, text="允许访问的任务（可多选）").pack(anchor="w")
+        self.task_list = tk.Listbox(self.pair_page, height=5, selectmode="extended", exportselection=False)
         self.task_list.pack(fill="x", pady=(3, 8))
         self.task_list.bind("<<ListboxSelect>>", self._pairing_choices_changed)
         self.task_ids = []
         self._sync_tasks()
-        buttons = ttk.Frame(body)
+        buttons = ttk.Frame(self.pair_page)
         buttons.pack(fill="x")
         self.enable_button = ttk.Button(buttons, text="开启手机连接", command=self.enable)
-        self.enable_button.pack(side="left")
         self.pair_button = ttk.Button(buttons, text="按所选权限生成配对信息", command=self.pair)
-        self.pair_button.pack(side="left", padx=6)
-        self.stop_button = ttk.Button(buttons, text="关闭手机连接", command=lambda: self.submit("remote_disable"))
-        self.stop_button.pack(side="left")
-        self.pairing = tk.Text(body, height=4, wrap="char", state="disabled")
+        self.pairing_panel = ttk.Frame(self.pair_page)
+        self.pairing = tk.Text(self.pairing_panel, height=3, wrap="char", state="disabled")
         self.pairing.pack(fill="x", pady=(10, 4))
-        self.copy_button = ttk.Button(body, text="复制配对信息（5 分钟内有效，仅一次）", command=self.copy)
+        self.copy_button = ttk.Button(self.pairing_panel, text="复制配对信息（5 分钟内有效，仅一次）", command=self.copy)
         self.copy_button.pack(anchor="w")
-        ttk.Label(body, text="已配对设备").pack(anchor="w", pady=(12, 4))
-        self.device_list = tk.Listbox(body, height=4, exportselection=False)
+        ttk.Label(self.device_page, text="已配对设备").pack(anchor="w", pady=(0, 4))
+        self.device_list = tk.Listbox(self.device_page, height=4, exportselection=False)
         self.device_list.pack(fill="both", expand=True)
-        actions = ttk.Frame(body)
+        actions = ttk.Frame(self.device_page)
         actions.pack(fill="x", pady=(8, 0))
         self.refresh_button = ttk.Button(actions, text="刷新设备", command=lambda: self.submit("remote_status"))
         self.refresh_button.pack(side="left")
-        self.network_button = ttk.Button(actions, text="异地连接检查", command=lambda: self.submit("remote_network"))
-        self.network_button.pack(side="left", padx=8)
         self.revoke_button = ttk.Button(actions, text="撤销所选设备", command=self.revoke)
-        self.revoke_button.pack(side="left")
-        ttk.Button(actions, text="使用说明 / 费用", command=self.open_help).pack(side="left", padx=8)
-        ttk.Button(actions, text="关闭此窗口", command=self.destroy).pack(side="right")
+        self.revoke_button.pack(side="left", padx=8)
+        self.stop_button = ttk.Button(actions, text="关闭手机连接", command=lambda: self.submit("remote_disable"))
+        self.stop_button.pack(side="right")
+        help_row = ttk.Frame(self.device_page)
+        help_row.pack(fill="x", pady=(8, 0))
+        self.network_button = ttk.Button(help_row, text="异地连接检查", command=lambda: self.submit("remote_network"))
+        self.network_button.pack(side="left")
+        ttk.Button(help_row, text="使用说明 / 费用", command=self.open_help).pack(side="left", padx=8)
         self.controls()
         self.submit("remote_status")
 
@@ -223,16 +231,18 @@ class PhoneDialog(tk.Toplevel):
                     if index < len(self.task_ids)}
         tasks = [task for task in self.app.tasks.values() if not task.get("archived")]
         ids = [task["id"] for task in tasks]
-        if ids == self.task_ids and self.task_list.size():
+        titles = Counter(task.get("title", "未命名任务") for task in tasks)
+        labels = [task.get("title", "未命名任务") +
+                  (f" · {task['id'][:8]}" if titles[task.get("title", "未命名任务")] > 1 else "")
+                  for task in tasks] or ["暂无可授权任务；请先在主窗口新建或导入任务。"]
+        if ids == self.task_ids and tuple(labels) == self.task_list.get(0, "end"):
             return
         self.task_ids = ids
         # A native Tk Listbox ignores content edits while disabled.
         self.task_list.configure(state="normal")
         self.task_list.delete(0, "end")
-        if not tasks:
-            self.task_list.insert("end", "暂无可授权任务；请先在主窗口新建或导入任务。")
+        self.task_list.insert("end", *labels)
         for index, task in enumerate(tasks):
-            self.task_list.insert("end", f"{task.get('title', '未命名任务')} · {task['id'][:8]}")
             if task["id"] in selected:
                 self.task_list.selection_set(index)
         if self._pairing_snapshot is not None and self._choice_snapshot() != self._pairing_snapshot:
@@ -260,6 +270,7 @@ class PhoneDialog(tk.Toplevel):
         self.pairing.configure(state="normal")
         self.pairing.delete("1.0", "end")
         self.pairing.configure(state="disabled")
+        self.pairing_panel.pack_forget()
         if message:
             self.info.set(message)
 
@@ -277,6 +288,7 @@ class PhoneDialog(tk.Toplevel):
         self.pairing.configure(state="normal")
         self.pairing.insert("1.0", value)
         self.pairing.configure(state="disabled")
+        self.pairing_panel.pack(fill="x")
         serial = self._pairing_serial
         delay = max(1, int((deadline - time.time()) * 1000))
         self._pairing_timer = self.after(delay, self._expire_pairing, serial)
@@ -363,8 +375,7 @@ class PhoneDialog(tk.Toplevel):
                                                f"{scope} · "
                                                f"{len(device.get('task_ids', []))} 个任务"
                                                + (f" · 到期 {expiry}" if expiry else ""))
-            self.info.set((f"连接已开启：{result['endpoint']}\n"
-                           "若无法连接，核对同一网络及 Windows 防火墙。关闭窗口不会关闭连接。")
+            self.info.set((f"连接已开启：{result['endpoint']}\n关闭此窗口不会关闭手机连接。")
                           if self.enabled else "手机连接已关闭；不会再接收手机指令。")
             if "pairing_uri" in result:
                 requested, self._pairing_request = self._pairing_request, None
@@ -380,6 +391,11 @@ class PhoneDialog(tk.Toplevel):
 
     def controls(self):
         self._sync_tasks()
+        for widget, visible in ((self.enable_button, not self.enabled), (self.pair_button, self.enabled)):
+            if visible:
+                widget.pack(side="left")
+            else:
+                widget.pack_forget()
         available = self.app.ready and not self.app.busy and not self.app.closing and self.app.recovery_info is None
         selected = bool(self._choice_snapshot()[0])
         for widget, enabled in ((self.enable_button, not self.enabled),

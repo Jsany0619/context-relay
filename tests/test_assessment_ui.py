@@ -104,6 +104,8 @@ class AssessmentUiTests(unittest.TestCase):
 
     def test_brief_generation_and_adoption_are_explicit_and_bound_to_task(self):
         dialog = self.open_assessment()
+        self.assertEqual(dialog.heading_label.cget("text"), "测试任务")
+        self.assertNotIn("task-1", dialog.heading_label.cget("text"))
         self.assertFalse(self.fake.assessment_calls)
         dialog.generate_brief.invoke()
         self.wait_for(lambda: not self.app.busy and bool(self.app.tasks["task-1"].get("brief")))
@@ -181,6 +183,8 @@ class AssessmentUiTests(unittest.TestCase):
         self.fake.tasks[0].update(brief_required=True, brief=brief_record())
         self.wait_for(lambda: bool(self.app.tasks["task-1"].get("brief_required")))
         self.assertTrue(self.app.buttons["start"].instate(["disabled"]))
+        self.assertIn("更多 → 简报 / 审核", self.app.task_alert.get())
+        self.assertEqual(self.app.more_menu.entrycget(self.app.more_entries["assessment"], "state"), "normal")
         self.fake.existing = dict(self.fake.tasks[0], thread_id=None, work_turns=0, state="idle", usage=900,
                                  history=[{"thread_id": "analysis-old", "role": "analysis"}])
         self.app.import_button.invoke()

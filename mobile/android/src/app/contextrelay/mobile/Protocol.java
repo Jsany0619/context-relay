@@ -47,6 +47,18 @@ public final class Protocol {
                 || "briefing".equals(state) || "reviewing".equals(state);
     }
 
+    public static boolean taskNoticeNeeded(String state, boolean control, boolean offline, boolean attention) {
+        return !control || offline || attention || !quiet(state);
+    }
+
+    public static String originalNotice(int part, int parts, String state, String phase) {
+        List<String> notices = new ArrayList<>();
+        if (parts > 1) notices.add("第 " + part + " / " + parts + " 段");
+        if (!"completed".equals(state)) notices.add("轮次状态：" + state);
+        if (phase != null && !phase.isEmpty() && !"final".equals(phase) && !"final_answer".equals(phase)) notices.add("阶段：" + phase);
+        return String.join(" · ", notices);
+    }
+
     public static boolean terminalReceipt(String state) {
         return "succeeded".equals(state) || "failed".equals(state);
     }

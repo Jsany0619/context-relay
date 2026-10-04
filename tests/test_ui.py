@@ -445,6 +445,13 @@ class TkSmokeTests(unittest.TestCase):
         dialog = self.open_settings()
         self.assertEqual(dialog.fields["title"].get(), "测试任务")
         self.assertEqual(dialog.fields["max_minutes"].get(), "2.5")
+        self.assertEqual(dialog.advanced_frame.winfo_manager(), "")
+        dialog.advanced_open.set(True)
+        dialog.toggle_advanced()
+        self.root.update()
+        self.assertEqual(dialog.advanced_frame.winfo_manager(), "grid")
+        self.assertNotIn("task-1", " ".join(str(child.cget("text")) for child in dialog.winfo_children()
+                                             if "text" in child.keys()))
         self.assertEqual(self.root.grab_current(), dialog)
         self.select_task("task-other")
         dialog.fields["title"].set("新名称")
@@ -542,6 +549,11 @@ class TkSmokeTests(unittest.TestCase):
         dialog.fields["title"].set("小预算任务")
         dialog.fields["cwd"].set(self.temp.name)
         dialog.goal.insert("1.0", "只读核对")
+        self.assertEqual(dialog.advanced_frame.winfo_manager(), "")
+        dialog.advanced_open.set(True)
+        dialog.toggle_advanced()
+        self.root.update()
+        self.assertEqual(dialog.advanced_frame.winfo_manager(), "grid")
         for value in ("nan", "inf"):
             dialog.fields["max_minutes"].set(value)
             with mock.patch("relay.ui.messagebox.showwarning") as warning:
@@ -564,6 +576,7 @@ class TkSmokeTests(unittest.TestCase):
         self.app.search.set("no matches")
         self.assertIsNone(self.app.selected_id)
         self.assertEqual(self.app.goal_text.get("1.0", "end-1c"), "")
+        self.assertTrue(self.app.details_button.instate(["disabled"]))
         self.assertTrue(self.app.buttons["start"].instate(["disabled"]))
         self.app._action("start")
         self.assertFalse(self.fake.starts)
@@ -777,6 +790,49 @@ class TkSmokeTests(unittest.TestCase):
         self.assertEqual(self.fake.answers[0], ("task-1", 17, {"decision": "accept"}))
         self.app._answer_approval("accept")
         self.assertEqual(len(self.fake.answers), 1)
+
+    def test_pending_and_details_use_progressive_disclosure_without_stale_task_state(self):
+        self.assertEqual(self.app.pending_frame.winfo_manager(), "")
+        self.assertEqual(self.app.details_panel.winfo_manager(), "")
+        self.app.details_button.invoke()
+        self.root.update()
+        self.assertEqual(self.app.details_panel.winfo_manager(), "pack")
+        other = self.add_task(state="paused")
+        self.select_task(other["id"])
+        self.root.update()
+        self.assertEqual(self.app.details_panel.winfo_manager(), "")
+        self.assertEqual(self.app.details_button.cget("text"), "显示任务详情")
+        self.select_task("task-1")
+        self.set_pending({"id": 3, "method": "item/commandExecution/requestApproval",
+                          "params": {"command": "echo synthetic"}})
+        self.root.update()
+        self.assertEqual(self.app.pending_frame.winfo_manager(), "pack")
+        self.fake.tasks[0]["pending"] = []
+        self.wait_for(lambda: not self.app.pending_requests)
+        self.assertEqual(self.app.pending_frame.winfo_manager(), "")
+
+    def test_more_menu_uses_existing_button_guards_and_keeps_primary_action_clear(self):
+        self.root.deiconify()
+        self.root.update()
+        self.assertEqual(self.app.buttons["start"].cget("text"), "发送 / 继续")
+        self.assertTrue(self.app.buttons["start"].winfo_ismapped())
+        for widget in (self.app.phone_button, self.app.backup_button, self.app.diagnostics_button,
+                       self.app.assessment_button, self.app.buttons["update_settings"],
+                       self.app.buttons["prepare_snapshot"]):
+            self.assertFalse(widget.winfo_ismapped())
+        for key, widget in (("phone", self.app.phone_button), ("backup", self.app.backup_button),
+                            ("diagnostics", self.app.diagnostics_button),
+                            ("assessment", self.app.assessment_button),
+                            ("update_settings", self.app.buttons["update_settings"]),
+                            ("prepare_snapshot", self.app.buttons["prepare_snapshot"]),
+                            ("reconcile", self.app.buttons["reconcile"])):
+            expected = "disabled" if widget.instate(["disabled"]) else "normal"
+            self.assertEqual(self.app.more_menu.entrycget(self.app.more_entries[key], "state"), expected)
+        self.assertEqual(self.app.more_menu.entrycget(self.app.more_entries["reconcile"], "state"), "normal")
+        self.fake.tasks[0].update(max_minutes=1, elapsed_seconds=60)
+        self.wait_for(lambda: "已达到预算" in self.app.task_alert.get())
+        self.assertTrue(self.app.task_alert_label.winfo_ismapped())
+        self.assertEqual(self.app.more_menu.entrycget(self.app.more_entries["handoff"], "state"), "disabled")
 
     def test_prepare_snapshot_uses_worker_and_displays_only_a_draft(self):
         self.assertNotIn("draft", self.app.tasks["task-1"])
@@ -1001,9 +1057,10 @@ class TkLayoutTests(unittest.TestCase):
                     self.assertIn("get_task", app.buttons)
                     self.assertIn("update_settings", app.buttons)
                     self.assertIn("已达预算", app.budget_details.get())
-                    widgets = dict(app.buttons, budget_label=app.budget_label, attention_button=app.attention_button,
-                                   diagnostics_button=app.diagnostics_button,
-                                   backup_button=app.backup_button, backup_notice=app.backup_notice)
+                    widgets = {"new": app.new_button, "import": app.import_button, "more": app.more_button,
+                               "tree": app.task_tree, "details": app.details_button,
+                               "latest": app.latest_text, "message": app.message_text,
+                               "attention": app.attention_button, "primary": app.buttons["start"]}
                     if inspection:
                         widgets["recovery_banner"] = app.recovery_banner
                     for method, button in widgets.items():
@@ -1017,6 +1074,12 @@ class TkLayoutTests(unittest.TestCase):
                             self.assertLessEqual(button.winfo_rooty() + button.winfo_height(),
                                                  parent.winfo_rooty() + parent.winfo_height(), method)
                             parent = parent.master
+                    self.assertFalse(app.details_panel.winfo_ismapped())
+                    self.assertTrue(app.task_alert_label.winfo_ismapped())
+                    for widget in (app.diagnostics_button, app.backup_button, app.backup_notice,
+                                   app.buttons["get_task"], app.buttons["prepare_snapshot"]):
+                        self.assertFalse(widget.winfo_ismapped())
+                    self.assertEqual(app.more_menu.entrycget(app.more_entries["diagnostics"], "state"), "normal")
                     app.diagnostics_button.invoke()
                     deadline = time.monotonic() + 4
                     while app.busy and time.monotonic() < deadline:

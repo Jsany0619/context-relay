@@ -30,7 +30,21 @@ public final class ProtocolCheck {
         check(!Protocol.sameEndpointHost("", ""));
         check(Protocol.quiet("queued")); check(Protocol.quiet("paused")); check(Protocol.quiet("idle"));
         check(!Protocol.quiet("running")); check(!Protocol.quiet("needs_reconcile")); check(!Protocol.quiet("completed"));
+        check(Protocol.originalNotice(1, 1, "completed", "final").isEmpty());
+        check(Protocol.originalNotice(1, 1, "completed", "final_answer").isEmpty());
+        check(Protocol.originalNotice(1, 2, "completed", "final").equals("第 1 / 2 段"));
+        check(Protocol.originalNotice(1, 1, "inProgress", null).contains("inProgress"));
+        check(Protocol.originalNotice(1, 1, "unknown", "").contains("unknown"));
+        check(Protocol.originalNotice(1, 1, "completed", "commentary").contains("commentary"));
         check(Protocol.active("briefing")); check(Protocol.active("reviewing")); check(Protocol.active("pausing"));
+        for (String state : new String[] {"idle", "queued", "paused"}) {
+            check(!Protocol.taskNoticeNeeded(state, true, false, false));
+            check(Protocol.taskNoticeNeeded(state, false, false, false));
+            check(Protocol.taskNoticeNeeded(state, true, true, false));
+            check(Protocol.taskNoticeNeeded(state, true, false, true));
+        }
+        for (String state : new String[] {"running", "blocked", "needs_reconcile", "completed", "future_state"})
+            check(Protocol.taskNoticeNeeded(state, true, false, false));
         check(Protocol.terminalReceipt("succeeded")); check(Protocol.terminalReceipt("failed"));
         check(!Protocol.terminalReceipt("accepted")); check(!Protocol.terminalReceipt("running")); check(!Protocol.terminalReceipt("unknown"));
         check(Protocol.knownReceipt("unknown")); check(!Protocol.knownReceipt("made_up"));

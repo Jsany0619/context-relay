@@ -242,29 +242,45 @@ class NewTaskDialog(tk.Toplevel):
         body.pack(fill="both", expand=True)
         body.columnconfigure(1, weight=1)
         for row, (key, label, value) in enumerate((
-                ("title", "任务名称", ""), ("cwd", "工作目录", str(Path.cwd())),
-                ("max_tokens", "Token 上限（留空不限）", ""),
-                ("max_minutes", "分钟上限（留空不限）", ""))):
+                ("title", "任务名称", ""), ("cwd", "工作目录", str(Path.cwd())))):
             ttk.Label(body, text=label).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=5)
             variable = tk.StringVar(value=value)
             self.fields[key] = variable
             ttk.Entry(body, textvariable=variable, width=54).grid(row=row, column=1, sticky="ew", pady=5)
         ttk.Button(body, text="选择…", command=self.choose_directory).grid(row=1, column=2, padx=(8, 0))
-        ttk.Label(body, text="权限上限").grid(row=4, column=0, sticky="w", pady=5)
+        ttk.Label(body, text="权限上限").grid(row=2, column=0, sticky="w", pady=5)
         self.mode = tk.StringVar(value="只读")
         ttk.Combobox(body, textvariable=self.mode, values=("只读", "允许修改工作区"),
-                     state="readonly").grid(row=4, column=1, sticky="w", pady=5)
-        self.auto_handoff = tk.BooleanVar(value=False)
-        ttk.Checkbutton(body, text="允许上下文风险达到条件时自动交接此任务",
-                        variable=self.auto_handoff).grid(row=5, column=0, columnspan=3, sticky="w", pady=8)
-        ttk.Label(body, text="任务目标与完成标准").grid(row=6, column=0, columnspan=3, sticky="w")
+                     state="readonly").grid(row=2, column=1, sticky="w", pady=5)
+        ttk.Label(body, text="任务目标与完成标准").grid(row=3, column=0, columnspan=3, sticky="w")
         self.goal = tk.Text(body, height=7, width=68, wrap="word")
-        self.goal.grid(row=7, column=0, columnspan=3, sticky="ew", pady=6)
+        self.goal.grid(row=4, column=0, columnspan=3, sticky="ew", pady=6)
+        self.advanced_open = tk.BooleanVar(value=False)
+        ttk.Checkbutton(body, text="显示预算与自动交接", variable=self.advanced_open,
+                        command=self.toggle_advanced).grid(row=5, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        self.advanced_frame = ttk.Frame(body)
+        self.advanced_frame.grid(row=6, column=0, columnspan=3, sticky="ew")
+        self.advanced_frame.columnconfigure(1, weight=1)
+        for row, (key, label) in enumerate((("max_tokens", "Token 上限（留空不限）"),
+                                            ("max_minutes", "分钟上限（留空不限）"))):
+            variable = tk.StringVar()
+            self.fields[key] = variable
+            ttk.Label(self.advanced_frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=4)
+            ttk.Entry(self.advanced_frame, textvariable=variable, width=32).grid(row=row, column=1, sticky="ew", pady=4)
+        self.auto_handoff = tk.BooleanVar(value=False)
+        ttk.Checkbutton(self.advanced_frame, text="允许上下文风险达到条件时自动交接此任务",
+                        variable=self.auto_handoff).grid(row=2, column=0, columnspan=2, sticky="w", pady=6)
+        ttk.Label(self.advanced_frame, text="预算是软上限，当前调用可能超出；已记录用时包含等待。",
+                  foreground="#555555").grid(row=3, column=0, columnspan=2, sticky="w")
+        self.advanced_frame.grid_remove()
         buttons = ttk.Frame(body)
-        buttons.grid(row=8, column=0, columnspan=3, sticky="e", pady=(8, 0))
+        buttons.grid(row=7, column=0, columnspan=3, sticky="e", pady=(8, 0))
         ttk.Button(buttons, text="取消", command=self.destroy).pack(side="left", padx=5)
         ttk.Button(buttons, text="创建", command=self.save).pack(side="left")
         self.grab_set()
+
+    def toggle_advanced(self):
+        (self.advanced_frame.grid if self.advanced_open.get() else self.advanced_frame.grid_remove)()
 
     def choose_directory(self):
         directory = filedialog.askdirectory(parent=self, initialdir=self.fields["cwd"].get())
@@ -305,30 +321,42 @@ class TaskSettingsDialog(tk.Toplevel):
         body = ttk.Frame(self, padding=16)
         body.pack(fill="both", expand=True)
         body.columnconfigure(1, weight=1)
-        ttk.Label(body, text=f"任务 ID：{self.task_id}").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
         self.fields = {}
-        for row, (key, label) in enumerate((("title", "任务名称"), ("max_tokens", "Token 上限（留空或 0 不限）"),
-                                           ("max_minutes", "分钟上限（可小数，0 不限）")), 1):
-            value = task.get(key) or ""
-            self.fields[key] = tk.StringVar(value=str(value))
-            ttk.Label(body, text=label).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=5)
-            ttk.Entry(body, textvariable=self.fields[key], width=44).grid(row=row, column=1, sticky="ew", pady=5)
+        self.fields["title"] = tk.StringVar(value=str(task.get("title") or ""))
+        ttk.Label(body, text="任务名称").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=5)
+        ttk.Entry(body, textvariable=self.fields["title"], width=44).grid(row=0, column=1, sticky="ew", pady=5)
+        self.advanced_open = tk.BooleanVar(value=False)
+        ttk.Checkbutton(body, text="显示预算与自动交接", variable=self.advanced_open,
+                        command=self.toggle_advanced).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.advanced_frame = ttk.Frame(body)
+        self.advanced_frame.grid(row=2, column=0, columnspan=2, sticky="ew")
+        self.advanced_frame.columnconfigure(1, weight=1)
+        for row, (key, label) in enumerate((("max_tokens", "Token 上限（留空或 0 不限）"),
+                                            ("max_minutes", "分钟上限（可小数，0 不限）"))):
+            self.fields[key] = tk.StringVar(value=str(task.get(key) or ""))
+            ttk.Label(self.advanced_frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=5)
+            ttk.Entry(self.advanced_frame, textvariable=self.fields[key], width=36).grid(row=row, column=1, sticky="ew", pady=5)
         self.auto_handoff = tk.BooleanVar(value=bool(task.get("auto_handoff")) and self.auto_allowed)
-        self.auto_check = ttk.Checkbutton(body, text="允许按上下文风险自动预备与交接此任务", variable=self.auto_handoff,
+        self.auto_check = ttk.Checkbutton(self.advanced_frame, text="允许按上下文风险自动预备与交接此任务", variable=self.auto_handoff,
                                          state="normal" if self.auto_allowed else "disabled")
-        self.auto_check.grid(row=4, column=0, columnspan=2, sticky="w", pady=8)
-        text = ("权限、目录和原始目标不在此修改。预算是软上限，已记录用时包括活动轮次的等待，"
-                "运行中调用可能超出预算。保存变更后，原预备快照与检查点失效；保存不会启动任务。")
+        self.auto_check.grid(row=2, column=0, columnspan=2, sticky="w", pady=8)
+        ttk.Label(self.advanced_frame, text="预算是软上限，当前调用可能超出；已记录用时包含等待。",
+                  foreground="#555555").grid(row=3, column=0, columnspan=2, sticky="w")
+        self.advanced_frame.grid_remove()
+        text = "保存会使原预备快照与检查点失效；不会启动任务。权限、目录和原始目标保持不变。"
         if not self.auto_allowed:
             text += "\n模型口径无效，不能开启自动交接，请先核对遥测。"
         self.notice = ttk.Label(body, text=text, wraplength=580, justify="left")
-        self.notice.grid(row=5, column=0, columnspan=2, sticky="w", pady=6)
+        self.notice.grid(row=3, column=0, columnspan=2, sticky="w", pady=6)
         buttons = ttk.Frame(body)
-        buttons.grid(row=6, column=0, columnspan=2, sticky="e", pady=(8, 0))
+        buttons.grid(row=4, column=0, columnspan=2, sticky="e", pady=(8, 0))
         ttk.Button(buttons, text="取消", command=self.destroy).pack(side="left", padx=5)
         self.save_button = ttk.Button(buttons, text="保存设置", command=self.save)
         self.save_button.pack(side="left")
         self.grab_set()
+
+    def toggle_advanced(self):
+        (self.advanced_frame.grid if self.advanced_open.get() else self.advanced_frame.grid_remove)()
 
     def save(self):
         try:
@@ -384,7 +412,7 @@ class ImportDialog(tk.Toplevel):
         self.connect_button.pack(side="right", padx=8)
         top = ttk.Frame(self, padding=10)
         top.pack(fill="x")
-        ttk.Label(top, text="连接原聊天：保留会话编号，消息原样发送；原桌面需停止操作，窗口未必实时同步。导入为新任务：整理资料后另起执行。两种方式均需重新选择权限，不自动开始工作。",
+        ttk.Label(top, text="连接原聊天会原话接续，但原桌面窗口未必实时同步；导入会另建任务。请先停止原聊天操作并重新选择权限，两者都不会自动开始。",
                   wraplength=820, justify="left").pack(fill="x", pady=(0, 8))
         search = ttk.Frame(top)
         search.pack(fill="x")
@@ -429,15 +457,30 @@ class ImportDialog(tk.Toplevel):
         options.pack(fill="x", pady=4)
         ttk.Label(options, text="权限").grid(row=0, column=0, sticky="w")
         ttk.Combobox(options, textvariable=self.mode, values=("read-only", "workspace-write"), state="readonly", width=18).grid(row=0, column=1, padx=6)
-        ttk.Label(options, text="Token 上限").grid(row=0, column=2)
-        ttk.Entry(options, textvariable=self.tokens, width=10).grid(row=0, column=3, padx=6)
-        ttk.Label(options, text="分钟上限").grid(row=0, column=4)
-        ttk.Entry(options, textvariable=self.minutes, width=8).grid(row=0, column=5, padx=6)
-        ttk.Label(body, text="0 表示不限；预算是软边界，当前调用可能超出。", foreground="#555555").pack(anchor="w")
-        ttk.Checkbutton(body, text="允许满足阈值后自动交接（可选）", variable=self.auto).pack(anchor="w", pady=6)
-        ttk.Checkbutton(body, text="我确认原聊天及同项目的其他操作已停止", variable=self.source_stopped,
-                        command=self.controls).pack(anchor="w", pady=6)
+        self.advanced_open = tk.BooleanVar(value=False)
+        ttk.Checkbutton(body, text="显示预算与自动交接", variable=self.advanced_open,
+                        command=self.toggle_advanced).pack(anchor="w", pady=(4, 0))
+        self.advanced_frame = ttk.Frame(body)
+        self.advanced_frame.pack(fill="x")
+        ttk.Label(self.advanced_frame, text="Token 上限").grid(row=0, column=0)
+        ttk.Entry(self.advanced_frame, textvariable=self.tokens, width=10).grid(row=0, column=1, padx=6)
+        ttk.Label(self.advanced_frame, text="分钟上限").grid(row=0, column=2)
+        ttk.Entry(self.advanced_frame, textvariable=self.minutes, width=8).grid(row=0, column=3, padx=6)
+        ttk.Label(self.advanced_frame, text="0 表示不限；预算是软边界，当前调用可能超出。",
+                  foreground="#555555").grid(row=1, column=0, columnspan=4, sticky="w")
+        ttk.Checkbutton(self.advanced_frame, text="允许满足阈值后自动交接（可选）",
+                        variable=self.auto).grid(row=2, column=0, columnspan=4, sticky="w", pady=6)
+        self.advanced_frame.pack_forget()
+        self.source_confirm = ttk.Checkbutton(body, text="我确认原聊天及同项目的其他操作已停止",
+                                              variable=self.source_stopped, command=self.controls)
+        self.source_confirm.pack(anchor="w", pady=6)
         self.controls()
+
+    def toggle_advanced(self):
+        if self.advanced_open.get():
+            self.advanced_frame.pack(fill="x", before=self.source_confirm)
+        else:
+            self.advanced_frame.pack_forget()
 
     def reset_preview(self):
         self.generation += 1
@@ -670,7 +713,8 @@ class AssessmentDialog(tk.Toplevel):
         self.title(f"简报 / 审核 · {task['title']}")
         self.geometry(f"{min(900, self.winfo_screenwidth() - 80)}x{min(800, self.winfo_screenheight() - 140)}")
         self.transient(app.root)
-        ttk.Label(self, text=f"{task['title']} · {self.task_id}", wraplength=820, justify="left").pack(fill="x", padx=12, pady=(10, 4))
+        self.heading_label = ttk.Label(self, text=task["title"], wraplength=820, justify="left")
+        self.heading_label.pack(fill="x", padx=12, pady=(10, 4))
         ttk.Label(self, textvariable=self.task_status, wraplength=820, justify="left").pack(fill="x", padx=12)
         footer = ttk.Frame(self, padding=10)
         footer.pack(side="bottom", fill="x")
@@ -826,7 +870,10 @@ class RelayApp:
         self.status = tk.StringVar(value="正在读取本机任务…")
         self.root.report_callback_exception = self._callback_error
         self.details = tk.StringVar(value="选择左侧任务查看详情。")
+        self.task_heading = tk.StringVar(value="请选择任务")
+        self.task_alert = tk.StringVar()
         self.budget_details = tk.StringVar()
+        self.details_expanded = False
         self.search = tk.StringVar()
         self.state_filter = tk.StringVar(value=FILTERS[0])
         self._build()
@@ -843,10 +890,19 @@ class RelayApp:
         ttk.Label(header, text="Context Relay", font=("Segoe UI", 17, "bold")).pack(side="left")
         self.import_button = ttk.Button(header, text="导入已有 Codex 聊天", command=self._open_import)
         self.import_button.pack(side="right")
-        self.assessment_button = ttk.Button(header, text="简报 / 审核", command=self._open_assessment)
-        self.assessment_button.pack(side="right", padx=8)
-        self.phone_button = ttk.Button(header, text="手机连接", command=self._open_phone)
-        self.phone_button.pack(side="right")
+        self.more_button = ttk.Menubutton(header, text="更多")
+        self.more_button.pack(side="right", padx=8)
+        self.more_menu = tk.Menu(self.more_button, tearoff=False)
+        self.more_button.configure(menu=self.more_menu)
+        self.more_entries = {}
+        self._action_proxies = ttk.Frame(self.root)
+        self.phone_button = ttk.Button(self._action_proxies, text="手机连接", command=self._open_phone)
+        self.backup_button = ttk.Button(self._action_proxies, text="备份管理器", command=self._backup)
+        self.backup_notice = ttk.Label(
+            self._action_proxies,
+            text="本地明文记录，含导入摘录；不含项目文件、登录信息或完整原生聊天。")
+        self.diagnostics_button = ttk.Button(self._action_proxies, text="诊断信息", command=self._open_diagnostics)
+        self.assessment_button = ttk.Button(self._action_proxies, text="简报 / 审核", command=self._open_assessment)
         ttk.Label(self.root, text="仅管理这里创建或主动导入的任务；导入不会修改原聊天。", foreground="#555555").pack(anchor="w", padx=16, pady=(0, 8))
         self.recovery_banner = ttk.Label(self.root, wraplength=1140, justify="left", foreground="#8a3b00")
         panes = ttk.Panedwindow(self.root, orient="horizontal")
@@ -857,13 +913,6 @@ class RelayApp:
         panes.add(right, weight=4)
         self.new_button = ttk.Button(left, text="新建任务", command=lambda: NewTaskDialog(self.root, self.submit))
         self.new_button.pack(fill="x", pady=(0, 8))
-        self.backup_button = ttk.Button(left, text="备份管理器", command=self._backup)
-        self.backup_button.pack(fill="x", pady=(0, 4))
-        self.backup_notice = ttk.Label(left, text="本地明文记录，含导入摘录；不含项目文件、登录信息或完整原生聊天。",
-                                       wraplength=240, justify="left", foreground="#555555")
-        self.backup_notice.pack(fill="x", pady=(0, 8))
-        self.diagnostics_button = ttk.Button(left, text="诊断信息", command=self._open_diagnostics)
-        self.diagnostics_button.pack(fill="x", pady=(0, 8))
         ttk.Label(left, text="搜索名称、目标或目录").pack(anchor="w")
         self.search_entry = ttk.Entry(left, textvariable=self.search)
         self.search_entry.pack(fill="x", pady=(2, 6))
@@ -871,17 +920,12 @@ class RelayApp:
         self.filter_choice.pack(fill="x", pady=(0, 6))
         self.attention_button = ttk.Button(left, command=self._show_attention)
         self.attention_button.pack(fill="x", pady=(0, 8))
-        organize = ttk.Frame(left)
-        organize.pack(fill="x", pady=(0, 8))
         self.buttons = {}
         for label, method in (("操作记录", "get_task"), ("归档", "set_archived")):
-            button = ttk.Button(organize, text=label, command=lambda action=method: self._action(action))
-            button.pack(side="left", expand=True, fill="x", padx=(0, 4))
+            button = ttk.Button(self._action_proxies, text=label, command=lambda action=method: self._action(action))
             self.buttons[method] = button
-        self.buttons["update_settings"] = ttk.Button(left, text="任务设置", command=lambda: self._action("update_settings"))
-        self.buttons["update_settings"].pack(fill="x", pady=(0, 8))
-        self.buttons["reopen_task"] = ttk.Button(left, text="重新打开", command=lambda: self._action("reopen_task"))
-        self.buttons["reopen_task"].pack(fill="x", pady=(0, 8))
+        self.buttons["update_settings"] = ttk.Button(self._action_proxies, text="任务设置", command=lambda: self._action("update_settings"))
+        self.buttons["reopen_task"] = ttk.Button(self._action_proxies, text="重新打开", command=lambda: self._action("reopen_task"))
         task_list = ttk.Frame(left)
         task_list.pack(fill="both", expand=True)
         self.task_tree = ttk.Treeview(task_list, columns=("state",), show="tree headings", selectmode="browse")
@@ -894,42 +938,78 @@ class RelayApp:
         self.task_tree.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
         self.task_tree.bind("<<TreeviewSelect>>", self._select_task)
-        ttk.Label(right, textvariable=self.details, wraplength=820, justify="left").pack(fill="x", pady=(0, 6))
-        self.budget_label = ttk.Label(right, textvariable=self.budget_details, wraplength=820, justify="left")
+        ttk.Label(right, textvariable=self.task_heading, font=("Segoe UI", 13, "bold"),
+                  wraplength=820, justify="left").pack(fill="x", pady=(0, 3))
+        self.task_alert_label = ttk.Label(right, textvariable=self.task_alert, wraplength=820,
+                                          justify="left", foreground="#8a3b00")
+        self.details_button = ttk.Button(right, text="显示任务详情", command=self._toggle_details)
+        self.details_button.pack(anchor="w", pady=(0, 5))
+        self.details_panel = ttk.Frame(right)
+        ttk.Label(self.details_panel, textvariable=self.details, wraplength=820, justify="left").pack(fill="x", pady=(0, 6))
+        self.budget_label = ttk.Label(self.details_panel, textvariable=self.budget_details, wraplength=820, justify="left")
         self.budget_label.pack(fill="x", pady=(0, 6))
-        goal = ttk.LabelFrame(right, text="目标")
+        goal = ttk.LabelFrame(self.details_panel, text="目标")
         goal.pack(fill="x")
         self.goal_text = text_area(goal, 2 if compact else 3)
-        latest = ttk.LabelFrame(right, text="最新回复")
-        latest.pack(fill="both", expand=True, pady=6)
-        ttk.Button(latest, text="查看 Codex 原始对话", command=self.open_chat).pack(anchor="e", padx=6)
-        self.latest_text = text_area(latest, 6 if compact else 8)
-        pending = ttk.LabelFrame(right, text="等待审批 / 回答")
-        pending.pack(fill="x", pady=(0, 6))
-        self.pending_choice = ttk.Combobox(pending, state="disabled")
+        self.latest_frame = ttk.LabelFrame(right, text="最新回复")
+        self.latest_frame.pack(fill="both", expand=True, pady=6)
+        self.latest_text = text_area(self.latest_frame, 6 if compact else 8)
+        workflow = ttk.Frame(right)
+        workflow.pack(side="bottom", fill="x")
+        self.pending_frame = ttk.LabelFrame(workflow, text="需要审批 / 回答")
+        self.pending_choice = ttk.Combobox(self.pending_frame, state="disabled")
         self.pending_choice.pack(fill="x", padx=6, pady=(6, 0))
         self.pending_choice.bind("<<ComboboxSelected>>", lambda event: self._render_request())
-        self.request_text = text_area(pending, 3 if compact else 4)
-        self.answer_frame = ttk.Frame(pending, padding=(6, 0, 6, 6))
+        self.request_text = text_area(self.pending_frame, 3 if compact else 4)
+        self.answer_frame = ttk.Frame(self.pending_frame, padding=(6, 0, 6, 6))
         self.answer_frame.pack(fill="x")
         self.approval_allow = ttk.Button(self.answer_frame, text="仅此一次允许", command=lambda: self._answer_approval("accept"))
         self.approval_decline = ttk.Button(self.answer_frame, text="拒绝", command=lambda: self._answer_approval("decline"))
-        controls = ttk.Frame(right)
-        controls.pack(side="bottom", fill="x", before=goal)
-        pending.pack_configure(side="bottom", before=goal)
-        ttk.Label(controls, text="补充指令（可留空）").pack(anchor="w")
-        self.message_text = tk.Text(controls, height=2, wrap="word")
+        self.controls_frame = ttk.Frame(workflow)
+        self.controls_frame.pack(fill="x")
+        ttk.Label(self.controls_frame, text="发给 Codex（可留空继续）").pack(anchor="w")
+        self.message_text = tk.Text(self.controls_frame, height=2, wrap="word")
         self.message_text.pack(fill="x", pady=(2, 6))
-        actions = ttk.Frame(controls)
-        actions.pack(fill="x")
-        for label, method in (("启动 / 继续", "start"), ("暂停", "pause"), ("核对恢复", "reconcile"),
-                              ("预备快照", "prepare_snapshot"), ("交接", "handoff"),
-                              ("标记完成", "finish"), ("导出", "export_task")):
-            button = ttk.Button(actions, text=label, command=lambda action=method: self._action(action))
+        self.primary_actions = ttk.Frame(self.controls_frame)
+        self.primary_actions.pack(fill="x")
+        for label, method in (("发送 / 继续", "start"), ("暂停", "pause"), ("核对恢复", "reconcile")):
+            button = ttk.Button(self.primary_actions, text=label, command=lambda action=method: self._action(action))
             button.pack(side="left", padx=(0, 5))
             self.buttons[method] = button
+        for label, method in (("预备快照", "prepare_snapshot"), ("交接", "handoff"),
+                              ("标记完成", "finish"), ("导出", "export_task")):
+            self.buttons[method] = ttk.Button(self._action_proxies, text=label,
+                                               command=lambda action=method: self._action(action))
+        for label, key, command in (
+                ("手机连接", "phone", self.phone_button.invoke),
+                ("备份管理器", "backup", self.backup_button.invoke),
+                ("诊断信息", "diagnostics", self.diagnostics_button.invoke),
+                ("任务设置", "update_settings", self.buttons["update_settings"].invoke),
+                ("查看 Codex 原始对话", "open_chat", self.open_chat),
+                ("操作记录", "get_task", self.buttons["get_task"].invoke),
+                ("核对恢复", "reconcile", self.buttons["reconcile"].invoke),
+                ("简报 / 审核", "assessment", self.assessment_button.invoke),
+                ("预备快照", "prepare_snapshot", self.buttons["prepare_snapshot"].invoke),
+                ("交接", "handoff", self.buttons["handoff"].invoke),
+                ("标记完成", "finish", self.buttons["finish"].invoke),
+                ("重新打开", "reopen_task", self.buttons["reopen_task"].invoke),
+                ("归档", "set_archived", self.buttons["set_archived"].invoke),
+                ("导出", "export_task", self.buttons["export_task"].invoke)):
+            if key in ("update_settings", "prepare_snapshot", "finish"):
+                self.more_menu.add_separator()
+            self.more_menu.add_command(label=label, command=command)
+            self.more_entries[key] = self.more_menu.index("end")
         ttk.Label(self.root, textvariable=self.status, wraplength=1140, justify="left").pack(fill="x", padx=16, pady=10)
         self._controls()
+
+    def _toggle_details(self):
+        self.details_expanded = not self.details_expanded
+        if self.details_expanded:
+            self.details_panel.pack(fill="x", before=self.latest_frame)
+            self.details_button.configure(text="收起任务详情")
+        else:
+            self.details_panel.pack_forget()
+            self.details_button.configure(text="显示任务详情")
 
     def submit(self, method, *args, _before_enqueue=None, **kwargs):
         if not self.ready or self.busy or self.closing:
@@ -1140,8 +1220,15 @@ class RelayApp:
                 self.message_drafts[self.rendered_task_id] = self.message_text.get("1.0", "end-1c")
             self.message_text.delete("1.0", "end")
             self.message_text.insert("1.0", self.message_drafts.get(self.selected_id, ""))
+            if self.details_expanded:
+                self.details_expanded = False
+                self.details_panel.pack_forget()
+                self.details_button.configure(text="显示任务详情")
         self.rendered_task_id = self.selected_id
         if not task:
+            self.task_heading.set("请选择任务")
+            self.task_alert.set("")
+            self.task_alert_label.pack_forget()
             self.details.set("选择左侧任务查看详情。")
             set_text(self.goal_text, "")
             set_text(self.latest_text, "")
@@ -1157,6 +1244,31 @@ class RelayApp:
             usage_text += f" / {task['max_tokens']}"
         draft = task.get("draft")
         source = task.get("source_snapshot")
+        state_text = STATES.get(task.get("state"), task.get("state", "未知"))
+        self.task_heading.set(f"{task['title']} · {state_text}")
+        alerts = []
+        if task.get("mode") == "read-only":
+            alerts.append("当前权限为只读；不会修改工作区。")
+        if task.get("state") == "needs_reconcile":
+            alerts.append("需要核对恢复后才能继续。")
+        if task.get("error"):
+            alerts.append(f"需要处理：{task_error(task)}")
+        brief = task.get("brief") or {}
+        if (task.get("brief_required") and brief.get("status") == "current"
+                and brief.get("decision") == "pending"):
+            alerts.append("简报待采用；请到“更多 → 简报 / 审核”核对并采用后继续。")
+        task_budget = budget_status(dict(task, run_started=None) if self.recovery_info is not None else task)
+        if task_budget["reached"]:
+            alerts.append("已达到预算；请在“更多 → 任务设置”调整，或先核对现有结果。")
+        if task.get("telemetry_model_valid", True) is False:
+            alerts.append("模型用量口径无效，自动交接不可用。")
+        if self.recovery_info is not None:
+            alerts.append("恢复库为只读检视，不能执行或修改任务。")
+        self.task_alert.set("\n".join(dict.fromkeys(alerts)))
+        if alerts:
+            self.task_alert_label.pack(fill="x", pady=(0, 5), before=self.details_button)
+        else:
+            self.task_alert_label.pack_forget()
         self.details.set(f"{task['title']} · {STATES.get(task.get('state'), task.get('state', '未知'))}\n"
                          f"{task['cwd']}\n权限：{mode}  ·  交接代次：{task.get('generation', 0)}  ·  "
                          f"上下文估算：{pressure_text}  ·  压缩：{task.get('compactions', 0)} 次  ·  累计 Token：{usage_text}"
@@ -1179,10 +1291,12 @@ class RelayApp:
         self.pending_choice.configure(values=[f"{item.get('method')} · {item.get('id')}" for item in pending],
                                       state="readonly" if pending else "disabled")
         if pending:
+            self.pending_frame.pack(fill="x", pady=(0, 6), before=self.controls_frame)
             index = next((i for i, item in enumerate(pending) if item.get("id") == previous_id), 0)
             self.pending_choice.current(index)
         else:
-            self.pending_choice.set("没有待处理请求")
+            self.pending_frame.pack_forget()
+            self.pending_choice.set("")
         self._render_request()
 
     def _current_request(self):
@@ -1210,7 +1324,7 @@ class RelayApp:
         self.question_values = {}
         request = self._current_request()
         if request is None:
-            set_text(self.request_text, "没有待处理请求。")
+            set_text(self.request_text, "")
             return
         details = {"request": request.get("params", {})}
         item = self._request_item(request)
@@ -1304,6 +1418,7 @@ class RelayApp:
                 state="normal" if available and self.diagnostics_window.report_ready else "disabled")
         self.message_text.configure(state="disabled" if inspection else "normal")
         task = self.tasks.get(self.selected_id) if self.selected_id in self.visible_ids else None
+        self.details_button.configure(state="normal" if task else "disabled")
         self.assessment_button.configure(state="normal" if task and not self.closing and task.get("connection_mode") != "direct" else "disabled")
         for task_id, dialog in list(self.assessment_dialogs.items()):
             if not dialog.winfo_exists():
@@ -1341,7 +1456,7 @@ class RelayApp:
         brief = (task.get("brief") or {}) if task else {}
         if task and task.get("brief_required") and brief.get("status") == "current" and brief.get("decision") == "pending":
             allowed["start"] = False
-        self.buttons["start"].configure(text="先整理简报" if task and task.get("brief_required") else "启动 / 继续")
+        self.buttons["start"].configure(text="先整理简报" if task and task.get("brief_required") else "发送 / 继续")
         if archived:
             for method in ("start", "pause", "prepare_snapshot", "handoff", "finish", "reconcile"):
                 allowed[method] = False
@@ -1350,6 +1465,24 @@ class RelayApp:
         self.buttons["set_archived"].configure(text="取消归档" if archived else "归档")
         for method, button in self.buttons.items():
             button.configure(state="normal" if available and allowed[method] else "disabled")
+        for method in ("start", "pause", "reconcile"):
+            self.buttons[method].pack_forget()
+        primary = ("pause",) if state in ACTIVE else (("reconcile",) if state in ("needs_reconcile", "blocked") else
+                  ("start",) if state in ("queued", "paused", "idle") else ())
+        for method in primary:
+            self.buttons[method].pack(side="left", padx=(0, 5))
+        menu_widgets = {
+            "phone": self.phone_button, "backup": self.backup_button, "diagnostics": self.diagnostics_button,
+            "assessment": self.assessment_button, **{key: value for key, value in self.buttons.items()
+                                                    if key in self.more_entries},
+        }
+        for key, widget in menu_widgets.items():
+            self.more_menu.entryconfigure(self.more_entries[key], state="disabled" if widget.instate(["disabled"]) else "normal")
+        can_open_chat = bool(task) and available and not inspection and bool(task.get("thread_id") or task.get("source_snapshot"))
+        self.more_menu.entryconfigure(self.more_entries["open_chat"], state="normal" if can_open_chat else "disabled")
+        self.more_menu.entryconfigure(self.more_entries["set_archived"],
+                                      label="取消归档" if archived else "归档")
+        self.more_button.configure(state="disabled" if self.closing else "normal")
         request = self._current_request()
         allow_approval = available and not inspection and request and request.get("method") in APPROVALS
         self.approval_decline.configure(state="normal" if allow_approval else "disabled")
